@@ -92,7 +92,12 @@ class SettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.allowed_origins, ("https://audit.example.test",))
 
-        for origin in ("*", "audit.example.test", "https://audit.example.test/path"):
+        for origin in (
+            "*",
+            "audit.example.test",
+            "https://audit.example.test/path",
+            "https://*.example.test",
+        ):
             with self.subTest(origin=origin), self.assertRaises(ValidationError):
                 Settings(
                     oidc_issuer="https://identity.example.test",

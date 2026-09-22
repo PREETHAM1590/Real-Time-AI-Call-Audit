@@ -26,6 +26,7 @@ class Settings(BaseSettings):
             if (
                 parsed.scheme not in {"http", "https"}
                 or not parsed.hostname
+                or "*" in parsed.hostname
                 or parsed.username
                 or parsed.password
                 or parsed.path
