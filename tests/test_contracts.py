@@ -1,0 +1,161 @@
+from datetime import datetime, timedelta, timezone
+import unittest
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+from app.auth import Scope, can_access
+from app.api import create_app
+from app.config import Settings
+from app.contracts import PersistedUtterance, Utterance
+
+
+class ContractTests(unittest.TestCase):
+    def test_scope_and_invalid_time(self):
+        agent = Scope("org-a", "agent-a", "AGENT", frozenset())
+        self.assertTrue(can_access(agent, "org-a", "agent-a", "team-a"))
+        self.assertFalse(can_access(agent, "org-b", "agent-a", "team-a"))
+        self.assertFalse(can_access(agent, "org-a", "agent-b", "team-a"))
+        with self.assertRaises(ValidationError):
+            Utterance(
+                id="u1",
+                role="AGENT",
+                start_ms=20,
+                end_ms=10,
+                text_redacted="Hello",
+            )
+
+    def test_utterance_rejects_untrusted_fields_and_invalid_values(self):
+        with self.assertRaises(ValidationError):
+            Utterance(
+                id="u1",
+                role="SPEAKER_0",
+                start_ms=0,
+                end_ms=10,
+                text_redacted="Hello",
+            )
+        with self.assertRaises(ValidationError):
+            Utterance(
+                id="u1",
+                role="AGENT",
+                start_ms=-1,
+                end_ms=10,
+                text_redacted="Hello",
+            )
+        with self.assertRaises(ValidationError):
+            Utterance(
+                id="u1",
+                role="AGENT",
+                start_ms=0,
+                end_ms=10,
+                text_redacted="Hello",
+                raw_text="must not persist",
+            )
+        with self.assertRaises(ValidationError):
+            Utterance(
+                id="u1",
+                role="AGENT",
+                start_ms=0,
+                end_ms=10,
+                text_redacted="x" * 10_001,
+            )
+
+    def test_persisted_utterance_carries_scope_and_local_model_provenance(self):
+        utterance = PersistedUtterance(
+            id="u1",
+            role="AGENT",
+            start_ms=0,
+            end_ms=10,
+            text_redacted="Hello",
+            organisation_id="org-a",
+            call_id="call-a",
+            revision=1,
+            segment_id="channel-0:segment-1",
+            speaker_id="channel-0",
+            model_version="local-whisper-v1",
+            confidence=0.97,
+        )
+        self.assertEqual(utterance.organisation_id, "org-a")
+        self.assertEqual(utterance.model_version, "local-whisper-v1")
+
+
+class ApiContractTests(unittest.TestCase):
+    def setUp(self):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.private_key = private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        self.settings = Settings(
+            oidc_issuer="https://identity.example.test",
+            oidc_audience="call-audit",
+            oidc_public_key=public_key,
+            allowed_origins=("https://audit.example.test",),
+        )
+        identities = {"user-a": Scope("org-a", "agent-a", "AGENT", frozenset())}
+        self.client = TestClient(
+            create_app(
+                self.settings,
+                identity_lookup=identities.get,
+                call_scopes={
+                    "call-a": ("org-a", "agent-a", "team-a"),
+                    "call-b": ("org-b", "agent-b", "team-b"),
+                },
+            )
+        )
+
+    def tearDown(self):
+        self.client.close()
+
+    def token(self, subject="user-a", key=None):
+        return jwt.encode(
+            {
+                "sub": subject,
+                "iss": self.settings.oidc_issuer,
+                "aud": self.settings.oidc_audience,
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+            },
+            key or self.private_key,
+            algorithm="RS256",
+        )
+
+    def test_health_and_call_routes_require_valid_scoped_identity(self):
+        self.assertEqual(self.client.get("/health").status_code, 200)
+        self.assertEqual(self.client.get("/v1/calls/call-a").status_code, 401)
+
+        forged_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        forged = self.token(
+            key=forged_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+        self.assertEqual(
+            self.client.get(
+                "/v1/calls/call-a", headers={"Authorization": f"Bearer {forged}"}
+            ).status_code,
+            401,
+        )
+
+        headers = {"Authorization": f"Bearer {self.token()}"}
+        self.assertEqual(self.client.get("/v1/calls/call-a", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get("/v1/calls/call-b", headers=headers).status_code, 404)
+
+    def test_forbidden_origin_is_rejected(self):
+        response = self.client.options(
+            "/v1/calls/call-a",
+            headers={
+                "Origin": "https://untrusted.example.test",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
