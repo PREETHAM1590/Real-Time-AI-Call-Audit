@@ -82,6 +82,26 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(utterance.model_version, "local-whisper-v1")
 
 
+class SettingsTests(unittest.TestCase):
+    def test_allowed_origins_require_normalized_absolute_origins(self):
+        settings = Settings(
+            oidc_issuer="https://identity.example.test",
+            oidc_audience="call-audit",
+            oidc_public_key="test-key",
+            allowed_origins=("https://audit.example.test",),
+        )
+        self.assertEqual(settings.allowed_origins, ("https://audit.example.test",))
+
+        for origin in ("*", "audit.example.test", "https://audit.example.test/path"):
+            with self.subTest(origin=origin), self.assertRaises(ValidationError):
+                Settings(
+                    oidc_issuer="https://identity.example.test",
+                    oidc_audience="call-audit",
+                    oidc_public_key="test-key",
+                    allowed_origins=(origin,),
+                )
+
+
 class ApiContractTests(unittest.TestCase):
     def setUp(self):
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
