@@ -1,0 +1,136 @@
+# Operations, evaluation and rollout
+
+Status: proposed procedures. Commands and application paths below become runnable during implementation; no deployed service currently exists.
+
+## Environments and configuration
+
+Use local synthetic data, isolated staging with approved samples, and production with separate identity clients, keys, model artifacts, databases and buckets. Never copy production audio to developer machines by default. Model inference runs on project-controlled hardware or a dedicated private deployment under project control.
+
+Planned configuration names: `DATABASE_URL`, `OBJECT_BUCKET`, `OBJECT_REGION`, `STT_MODEL_PATH`, `STT_MODEL_SHA256`, `DIARIZATION_MODEL_PATH`, `SENTIMENT_MODEL_PATH`, `AUDIT_MODEL_PATH`, `AUDIT_MODEL_SHA256`, `LOCAL_LLM_URL`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `SESSION_SECRET`, `MEDIA_SIGNING_SECRET`, `RULESET_VERSION`, `RUBRIC_VERSION`, `PROMPT_VERSION`, `MAX_UPLOAD_BYTES`, `MAX_CALL_SECONDS`, `AUDIO_RETENTION_DAYS`, `TRANSCRIPT_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`, `EVENT_RETENTION_DAYS`, `ACCESS_LOG_RETENTION_DAYS`, `BACKUP_RETENTION_DAYS`.
+
+Production must fail startup when identity, encryption/storage, retention or pinned local model paths/checksums are missing. Set per-model concurrency, GPU memory and queue limits; reject or defer new work visibly when capacity is exhausted. Inference services must not download weights or send call data to external AI endpoints at runtime.
+
+Planned developer workflow:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+docker compose up -d postgres
+python -m app.migrate
+python -m unittest discover -s tests -v
+python -m uvicorn app.api:app --reload
+# Separate terminals:
+python -m app.worker
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+Task 1 establishes the package; Task 2 establishes migrations and worker; Task 6 establishes the browser application. Lock dependencies and document exact versions as part of those tasks.
+
+## Release validation
+
+| Layer | Inputs | Required evidence |
+|---|---|---|
+| Domain | Synthetic text and segment fixtures | Disclosure timing, unknown roles, silent calls, split phrases, duplicate segments, exact evidence and scoring checks |
+| Integration | PostgreSQL, private storage and local inference fakes | Duplicate upload, expired lease, mid-stage crash, review conflict, deletion race and tenant isolation |
+| Local model contract | Approved short recordings and pinned model artifacts | Segment finalisation, timestamps, language, model refusal/error mapping, output validation and resource use |
+| Browser | Analyst, supervisor, agent and forbidden-user sessions | Accessible queue/review, permitted playback, own-score scope, stale feed and resumption |
+| Quality | Human-labelled evaluation set | Per-rule recall/precision, rubric agreement, role accuracy, WER, sentiment calibration and subgroup breakdown |
+| Load/recovery | Synthetic recordings at pilot volume | Latency percentiles, memory bounds, queue drain, restart recovery and restore drill |
+
+Use deterministic local inference fakes in ordinary CI. Run actual pinned-model tests in isolated staging with the selected CPU/GPU allocation. Fail visibly if an artifact or runtime is missing; never silently substitute fake results. Verify inference still works with outbound internet blocked after controlled provisioning.
+
+## Golden-set protocol
+
+Start with 100 adjudicated calls across normal, high-risk, silent, short, noisy, overlapping, mono, dual-channel and prompt-injection cases. Keep identities and recordings restricted; use redacted transcript fixtures in source control. Separate prompt-development examples from held-out evaluation examples. Deduplicate by underlying conversation so train/evaluation versions cannot overlap.
+
+Two QA reviewers independently score the initial set and adjudicate disagreements. Record rubric/ruleset version, evidence, applicable dimensions and uncertain labels. Track inter-reviewer agreement before treating a human label as ground truth.
+
+Proposed pilot gates:
+
+- Mean absolute overall-score error ≤0.3 on the 1–5 scale for evaluable calls; report sample count and uncertainty.
+- Decision agreement ≥92% on held-out evaluable calls; separately report review/abstention rate and coverage.
+- No missed seeded critical case in deterministic regression fixtures; human-labelled critical recall ≥98% where sample size permits meaningful reporting.
+- Unsupported or invented evidence accepted by the server: zero in the adversarial suite.
+- No cross-tenant disclosure in authorisation tests; zero known raw-PII leakage in the privacy fixture suite.
+- Report results separately for language/accent, channel configuration, noise and duration. Insufficient subgroup samples block claims about that subgroup.
+
+These are proposed release thresholds, not current measurements. A 100-call set alone cannot establish a reliable rare-event false-negative rate; gather enough positive cases and report confidence intervals before making that claim. Keep all excluded and abstained cases in the report.
+
+For every prompt/model/rule change: run deterministic checks → held-out evaluation → shadow run → QA sample review → versioned promotion. Retain old versions and results. Do not rewrite old audits to make a new model appear consistent. A secondary model is an optional sampled calibration tool once a measured benefit justifies its cost.
+
+## Metrics and alerting
+
+Collect call intake rate, audio gaps, STT errors/time-to-final, job age, retries/dead letters, stage durations, incomplete calls, redaction failures, invalid evidence, LLM refusal/schema failure, tokens, GPU memory/utilisation, model load failures, queue wait, SSE disconnects, export volume and review overrides. Do not attach raw text or high-cardinality caller identifiers to metric labels.
+
+Separate latency clocks: call end, object available, job enqueued, local inference request, final received, audit committed and browser rendered. For live calls also measure audio arrival to stable final; windowed Whisper may dominate this interval. Use monotonic durations within a process and synchronised UTC timestamps across services; include clock-skew monitoring.
+
+| Signal | Initial response |
+|---|---|
+| Any tenant-isolation failure or raw-data leakage | Security incident; disable affected access path, preserve restricted evidence and follow organisation response process |
+| Processing unavailable or oldest eligible job >5 minutes for 5 minutes | Page on-call; inspect dependencies and lease recovery |
+| STT inference failures >5% over 5 minutes, minimum 100 windows | Defer intake/limit concurrency; expose degraded state and inspect model worker |
+| Redaction failure | Fail closed for affected call; alert on sustained failures, never bypass redaction |
+| Audit queue or GPU/compute spend trending over budget | Business-hours capacity alert; cap submissions without dropping jobs |
+| Quality drift / override growth | QA investigation; compare matched versions and case mix before attributing model failure |
+
+Alert notifications are proposed integration work; this documentation does not create or send any notifications.
+
+## Failure and recovery runbook
+
+| Incident | Action | Recovery evidence |
+|---|---|---|
+| Local STT worker unavailable | Leave jobs retryable, honour retry budgets, retain approved audio, show delayed state | Model worker restored; replay completes once without duplicate utterances |
+| LLM timeout/refusal/invalid evidence | Retry only within budget; then NEEDS_REVIEW | Analyst can still inspect transcript and policy findings |
+| Worker crash | Let lease expire; new worker resumes from committed stage | Same input revision produces one effective audit |
+| Media disconnect | Mark gap, drain final results, close generation after timeout | Incomplete call never receives confident all-clear; approved recording can create corrected revision |
+| SSE cursor expired | Send reset_required; client reloads scoped snapshot | No missing persisted finding and no duplicate alert |
+| Wrong prompt/model release | Stop promotion and select previous version for new work | Existing records retain original versions; selective re-audit creates new revisions |
+| Database outage | Reject new upload finalisation; preserve staged objects temporarily | Orphan cleanup and resumable intake reconcile objects and records |
+| Accidental deletion / restore | Restore into isolated environment, reapply tombstones before exposing data | Restricted operator verifies deleted content stays inaccessible |
+
+Proposed pilot RPO: ≤24 hours using daily encrypted backups. Proposed RTO: ≤4 hours, established by a timed restore exercise. Upgrade these targets before a deployment requiring tighter recovery; do not describe daily backups as zero-data-loss.
+
+## Retention/deletion checklist
+
+1. Authorise and append deletion request; check recorded hold status.
+2. Tombstone call; deny APIs/playback and cancel queued work.
+3. Workers check tombstone before inference requests and before commit.
+4. Delete audio, transient objects, transcript, findings, audits, reviews, export artifacts and eligible event payloads under the approved policy.
+5. Retain only the minimal non-content deletion/access record permitted by that policy.
+6. Verify object versions, replicas, local inference caches and backup expiry; record any telephony or identity retention limits.
+7. Reapply deletion records during restore before serving traffic.
+
+Do not claim immediate deletion from immutable backups; document their expiry and restore restrictions. Retention tests use an injectable clock, never wait days in CI.
+
+## Capacity and cost model
+
+Do not reuse the article's bill as a quote. Its STT table labels a rate per hour that is later used per minute, and its storage calculation mixes accumulated GB with daily intake.
+
+```text
+audio_minutes_day = calls_day * average_minutes
+average_concurrency = audio_minutes_day / operating_minutes_day
+gpu_hours_day = sum(gpu_count_by_pool * active_hours_by_pool)
+inference_compute_cost_day = gpu_hours_day * gpu_hourly_cost
+cpu_compute_cost_day = cpu_hours_day * cpu_hourly_cost
+retained_audio_GB = audio_GB_day * retention_days
+storage_cost_month = retained_audio_GB * contracted_price_per_GB_month
+cost_per_completed_audit = total_period_cost / completed_audits_period
+```
+
+Track model download/storage, GPU idle time, CPU, electricity or cloud compute, retries, storage requests, egress, database, observability, backups and human review costs. Audits that fail still consume capacity; include them in total cost. Measure calls/hour/GPU and tokens/second at target concurrency rather than multiplying hosted API token prices.
+
+At the article's illustrative 50,000 calls/day, five minutes each and an eight-hour window, average concurrency is about 521 calls. A peak of 800 is therefore plausible but not sufficient headroom by itself. Uncompressed 16 kHz/16-bit mono is 32,000 bytes/second: 250,000 minutes is 480 GB/day (decimal), or 960 GB/day stereo. Actual stored codecs change this materially. Ninety-day retention accumulates many days of storage, not one day's volume.
+
+Before choosing production infrastructure, measure peak/average ratio, local STT real-time factor, LLM tokens/second, GPU memory, worker service time, database growth, dashboard fan-out, export volume and review demand. If there are 50,000 calls/day and even 5% require review, that is 2,500 reviews/day; staffing capacity and prioritisation must be part of rollout.
+
+## Rollout and ownership
+
+Indicative effort for two engineers plus part-time QA/policy support: 2–3 weeks for post-call core, 1–2 weeks for analyst workflow, 2–3 weeks for live integration, and 1–2 weeks for operations and portal. Add explicit time for GPU provisioning, artifact/license review and local-model benchmarking; allow at least six weeks of overlapping analyst calibration. These are planning ranges, not commitments.
+
+Engineering owns correctness, recovery and interfaces. QA owns adjudication and coaching usefulness. The policy/privacy owner owns rule content, recording policy, retention, telephony processing and model-license approval. Operations owns model provisioning, deployment, incident response and restore exercises.
+
+Release sequence: synthetic demo → shadow post-call pilot → QA-approved limited team → live shadow mode → live advisory alerts → production gate. No automatic disciplinary decisions or external coaching messages are introduced by the pilot. Coaching notes are saved in the application.
+
+Before production, record: policy/retention decisions; exact model/code licenses, revisions and checksums; target hardware and offline-inference proof; golden-set report; security and accessibility results; restore and deletion evidence; live load report; compute cost projection; named on-call and rollback owner.
