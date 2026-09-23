@@ -45,7 +45,7 @@ Future research: Hindi/Tamil/Telugu support, predictive escalation, fine-tuned a
 
 | Role | Permitted access |
 |---|---|
-| Agent | Own reviewed scores, feedback, trends, assigned checklist and coaching notes; no raw audio |
+| Agent | Own reviewed scores, feedback, trends, assigned checklist and redacted latest human review reason/coaching notes; no raw audio |
 | Team leader | Team calls, redacted evidence, live alerts and team trends; no raw audio by default |
 | QA analyst | Assigned organisation's review queue, redacted transcripts, separately authorised audio, score overrides and coaching notes |
 | Compliance officer | Organisation policy findings, confirmation/rejection, redacted exports, access history; audio requires separate grant |
@@ -53,7 +53,7 @@ Future research: Hindi/Tamil/Telugu support, predictive escalation, fine-tuned a
 
 All access is scoped by organisation, team and/or agent on the server. An opaque call ID is not authorisation. Audio access, export, review, policy modification and deletion are recorded in a restricted append-only access log. The roles above resolve the article's inconsistent statement that there are four roles while listing five.
 
-Analyst flow: sign in → risk-sorted queue → call details → evidence and optional permitted playback → accept or override with reason → save review → coaching note visible to the appropriate agent/team leader. Keep machine output and human review as separate versions.
+Analyst flow: sign in → risk-sorted queue → call details → evidence and optional permitted playback → accept or override with reason → save review → latest redacted review reason visible to the appropriate agent. Keep machine output and human review as separate versions; superseded review reasons are not returned by the own-score report.
 
 Supervisor flow: sign in → active team calls → provisional signals → verified transcript evidence → acknowledge alert. Acknowledgement means seen, not resolved or legally confirmed.
 
@@ -229,7 +229,7 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 | GET /v1/calls/{id}/audio | Authenticated byte-range stream; rechecks role, tenant, call permission and tombstone for each request |
 | POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE/TRIAGE, base_review_version, reason and changed dimension scores; 201, or 409 on stale evidence/review |
 | GET /v1/events | Scoped SSE; Last-Event-ID resumes; expired cursor yields reset_required and client fetches snapshot |
-| GET /v1/me/scores | Agent's own current-transcript reviewed scores, machine/reviewed checklist, and redacted saved coaching notes; agent identity derives from server scope |
+| GET /v1/me/scores | Agent's own current-transcript reviewed scores, machine/reviewed checklist, redacted machine coaching notes, and latest ACCEPT/OVERRIDE reason; agent identity derives from server scope |
 | GET /v1/reports/team | Server-authorized team aggregates, separately versioned by rubric/model runtime; cohorts below five distinct agents suppress counts and scores |
 | GET /v1/exports/findings | Compliance-officer-only current-revision policy findings; redacted, bounded CSV (92-day / 10,000-row maximum), formula-safe cells, and immutable access event before response |
 | DELETE /v1/calls/{id} | Privileged deletion request; 202 tombstone; legal hold conflict is 409 |

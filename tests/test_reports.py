@@ -68,14 +68,34 @@ class ReportPersistenceIntegrationTests(unittest.TestCase):
                 )
                 connection.execute(
                     "INSERT INTO reviews(organisation_id,id,audit_id,call_id,audit_revision,version,base_review_version,reviewer_id,action,changed_scores_json,effective_scores_json,effective_score,effective_decision,reason) "
-                    "VALUES (%s,%s,%s,%s,1,1,0,'qa-reviewer','ACCEPT','{}'::jsonb,%s::jsonb,3,'PASS','Verified synthetic evidence')",
-                    (organisation_id, review_id, audit_id, call_id, json.dumps(scores)),
+                    "VALUES (%s,%s,%s,%s,1,1,0,'qa-reviewer','ACCEPT','{}'::jsonb,%s::jsonb,3,'PASS',%s)",
+                    (organisation_id, review_id, audit_id, call_id, json.dumps(scores), "Older private note PREVIOUS_PRIVATE_SECRET" if index == 0 else "Out of scope note PRIVATE_AGENT_ONE"),
                 )
+                if index == 0:
+                    latest_scores = dict(scores)
+                    latest_scores["clarity"] = 4
+                    connection.execute(
+                        "INSERT INTO reviews(organisation_id,id,audit_id,call_id,audit_revision,version,base_review_version,reviewer_id,action,changed_scores_json,effective_scores_json,effective_score,effective_decision,reason) "
+                        "VALUES (%s,%s,%s,%s,1,2,1,'qa-reviewer-2','OVERRIDE',%s::jsonb,%s::jsonb,3.1,'PASS',%s)",
+                        (organisation_id, uuid4(), audit_id, call_id, json.dumps({"clarity": 4}), json.dumps(latest_scores), "Latest stale audit review note: Alice Example, 5550100199."),
+                    )
+                    connection.execute("UPDATE calls SET transcript_revision=2 WHERE organisation_id=%s AND id=%s", (organisation_id, call_id))
+                    current_audit_id = uuid4()
+                    connection.execute(
+                        "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms,pass_threshold) "
+                        "VALUES (%s,%s,%s,2,2,%s,'local-v1','prompt-v2',%s,%s,%s,'[]'::jsonb,%s,%s::jsonb,3,'PASS',%s::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,1,10,3)",
+                        (organisation_id, current_audit_id, call_id, artifact, "1" * 64, rubric_version, "2" * 64, "3" * 64, json.dumps(dimensions), json.dumps({"text": "Current audit coaching note.", "evidence": []})),
+                    )
+                    connection.execute(
+                        "INSERT INTO reviews(organisation_id,id,audit_id,call_id,audit_revision,version,base_review_version,reviewer_id,action,changed_scores_json,effective_scores_json,effective_score,effective_decision,reason) "
+                        "VALUES (%s,%s,%s,%s,2,1,0,'qa-reviewer-3','ACCEPT','{}'::jsonb,%s::jsonb,3,'PASS',%s)",
+                        (organisation_id, uuid4(), current_audit_id, call_id, json.dumps(scores), "Current audit review reason: Alice Example, 5550100199."),
+                    )
                 rule_id = "=HYPERLINK(\"synthetic\")" if index == 0 else "disclosure_opening"
                 connection.execute(
                     "INSERT INTO findings(organisation_id,id,call_id,transcript_revision,rule_id,ruleset_version,ruleset_hash,policy_text_version,status,severity,evidence_ids,evidence_fingerprint,deadline_ms,remediation) "
-                    "VALUES (%s,%s,%s,1,%s,'rules-v1',%s,'policy-v1','UNKNOWN','MEDIUM','[]'::jsonb,%s,30000,%s)",
-                    (organisation_id, uuid4(), call_id, rule_id, "e" * 64, "f" * 64 if index == 0 else (hex(index + 15)[2:] * 64)[:64], "Contact Alice Example at 5550100199. Review the approved procedure." if index == 0 else "Review the approved procedure."),
+                    "VALUES (%s,%s,%s,%s,%s,'rules-v1',%s,'policy-v1','UNKNOWN','MEDIUM','[]'::jsonb,%s,30000,%s)",
+                    (organisation_id, uuid4(), call_id, 2 if index == 0 else 1, rule_id, "e" * 64, "f" * 64 if index == 0 else (hex(index + 15)[2:] * 64)[:64], "Contact Alice Example at 5550100199. Review the approved procedure." if index == 0 else "Review the approved procedure."),
                 )
                 ids.append((str(call_id), agent, team, created_at))
         return organisation_id, ids
@@ -92,7 +112,14 @@ class ReportPersistenceIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0]["rubric_version"], "rubric-v1")
         self.assertNotIn("Alice Example", json.dumps(rows))
         self.assertNotIn("5550100199", json.dumps(rows))
+        self.assertNotIn("PREVIOUS_PRIVATE_SECRET", json.dumps(rows))
+        self.assertNotIn("PRIVATE_AGENT_ONE", json.dumps(rows))
         self.assertEqual(rows[0]["checklist"][0]["id"], "greeting")
+        review_notes = [note for note in rows[0]["coaching_notes"] if note["kind"] == "human_review"]
+        self.assertEqual(review_notes, [{"kind": "human_review", "source": "latest_review", "text": "Current audit review reason: [REDACTED], [REDACTED]."}])
+        self.assertEqual(rows[0]["review_version"], 1)
+        self.assertEqual(rows[0]["audit_revision"], 2)
+        self.assertEqual(rows[0]["transcript_revision"], 2)
         with connect() as connection:
             with self.assertRaises(ReportForbidden):
                 own_scores(connection, Scope(str(organisation_id), "qa", "QA_ANALYST", frozenset()), redact=redact_synthetic)

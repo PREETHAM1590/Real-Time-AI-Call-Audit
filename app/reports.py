@@ -70,9 +70,9 @@ def own_scores(connection, scope: Scope, *, redact: Callable[[str], str] = redac
         "SELECT c.id,c.agent_id,c.team_id,c.created_at,c.processing_state,a.revision,a.transcript_revision,"
         "a.rubric_version,a.rubric_hash,a.model_artifact,a.inference_runtime,a.overall_score,a.decision,"
         "a.dimensions_json,a.coaching_narrative,a.highlights,a.improvement_areas,"
-        "r.version,r.action,r.effective_scores_json,r.effective_score,r.effective_decision "
+        "r.version,r.action,r.effective_scores_json,r.effective_score,r.effective_decision,r.reason "
         "FROM calls c JOIN audits a ON a.organisation_id=c.organisation_id AND a.call_id=c.id "
-        "JOIN LATERAL (SELECT version,action,effective_scores_json,effective_score,effective_decision "
+        "JOIN LATERAL (SELECT version,action,effective_scores_json,effective_score,effective_decision,reason "
         "FROM reviews latest_review WHERE latest_review.organisation_id=a.organisation_id AND latest_review.audit_id=a.id "
         "ORDER BY version DESC LIMIT 1) r ON TRUE "
         "WHERE c.organisation_id=%s AND c.agent_id=%s AND c.tombstoned_at IS NULL "
@@ -107,6 +107,8 @@ def own_scores(connection, scope: Scope, *, redact: Callable[[str], str] = redac
             for item in values:
                 if isinstance(item, dict) and item.get("text"):
                     notes.append({"kind": kind, "source": "machine_audit", "text": _redact_note(item["text"], redact)})
+        if row[22]:
+            notes.append({"kind": "human_review", "source": "latest_review", "text": _redact_note(row[22], redact)})
         result.append({
             "call_id": str(row[0]), "agent_id": row[1], "team_id": row[2], "created_at": row[3].isoformat(),
             "processing_state": row[4], "audit_revision": row[5], "transcript_revision": row[6],

@@ -398,6 +398,7 @@ class ApiContractTests(unittest.TestCase):
         with patch("app.api.connect"), patch("app.api.own_scores", return_value=[{"call_id": "synthetic-call"}]) as own:
             self.assertEqual(self.client.get("/v1/me/scores", headers=agent_headers).json(), {"items": [{"call_id": "synthetic-call"}]})
             self.assertEqual(own.call_args.args[1], identities["agent-report"])
+            self.assertTrue(callable(own.call_args.kwargs["redact"]))
 
         qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-report')}"}
         with patch("app.api.connect") as connect:

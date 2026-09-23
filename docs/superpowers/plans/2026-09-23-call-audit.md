@@ -485,7 +485,7 @@ def csv_cell(value):
     return "'" + value if stripped.startswith(("=", "+", "-", "@")) else value
 ```
 
-- [x] **4. Implement scoped reports:** own-score endpoint derives agent identity; team query uses the server-authorized team set. Report reviewed vs machine scores separately, count and group by rubric/model versions; suppress cohort metrics below five distinct agents. Include checklist and redacted saved coaching notes in the own view.
+- [x] **4. Implement scoped reports:** own-score endpoint derives agent identity; team query uses the server-authorized team set. Report reviewed vs machine scores separately, count and group by rubric/model versions; suppress cohort metrics below five distinct agents. Include checklist, redacted machine coaching text and only the latest redacted human review reason in the own view.
 - [x] **5. Add bounded redacted CSV export** restricted to the compliance role, with immutable access-event logging, safe filenames, a 92-day window and a 10,000-row cap. Integration assertions cover own-only data, team scope, empty periods, version separation, export bounds, redaction and formula-safe cells.
 - [x] **6. Run module and browser checks** with synthetic agent/team views. The pilot uses the existing dependency-free vanilla HTML/CSS/JS approach instead of the originally proposed React/TypeScript build because no frontend build scaffold exists; replace it when a product frontend is selected. `tests.test_browser_reports` uses the optional pinned Playwright extra and Chromium, so there is no npm build command for this slice. Commit `feat: add scoped quality reporting`.
 
