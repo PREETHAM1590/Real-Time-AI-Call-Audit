@@ -1,0 +1,157 @@
+import json
+import hashlib
+import os
+from pathlib import Path
+import unittest
+from urllib.parse import urlparse
+from uuid import uuid4
+
+from app.compliance import disclosure_state, evaluate_rules, scan_sensitive_numbers
+from app.contracts import Utterance
+from app.db import connect
+from app.ingest import finish_job, persist_policy_findings
+from app.migrate import migrate
+
+
+def u(uid, role, start, end, text, *, final=True):
+    return Utterance(id=uid, role=role, start_ms=start, end_ms=end, text_redacted=text, is_final=final)
+
+
+def context(**changes):
+    value = {
+        "organisation_id": "org-synthetic",
+        "call_id": "call-synthetic",
+        "transcript_revision": 1,
+        "call_type": "synthetic",
+        "agent_connected_ms": 0,
+        "call_duration_ms": 31_000,
+        "holds": [],
+        "complete": True,
+        "timing_reliable": True,
+    }
+    value.update(changes)
+    return value
+
+
+class DisclosureStateTests(unittest.TestCase):
+    def test_deadline_short_call_and_unreliable_role_states(self):
+        self.assertEqual(disclosure_state([], 29_000, ended=False, reliable=True), "PENDING")
+        self.assertEqual(disclosure_state([], 30_000, ended=False, reliable=True), "POTENTIAL_VIOLATION")
+        self.assertEqual(disclosure_state([], 10_000, ended=True, reliable=True), "UNKNOWN")
+        self.assertEqual(disclosure_state([], 30_000, ended=True, reliable=False), "UNKNOWN")
+        customer = u("u1", "CUSTOMER", 0, 2_000, "This call may be recorded.")
+        self.assertEqual(disclosure_state([customer], 30_000, ended=True, reliable=True), "POTENTIAL_VIOLATION")
+
+    def test_final_agent_phrase_can_span_adjacent_segments(self):
+        rows = [
+            u("a1", "AGENT", 1_000, 1_500, "This call may be"),
+            u("a2", "AGENT", 1_501, 2_000, " recorded for quality purposes."),
+        ]
+        self.assertEqual(disclosure_state(rows, 5_000, ended=True, reliable=True), "SATISFIED")
+        partial = [u("p1", "AGENT", 1_000, 2_000, "This call may be", final=False)]
+        self.assertEqual(disclosure_state(partial, 30_000, ended=True, reliable=True), "UNKNOWN")
+        interrupted = [
+            u("a1", "AGENT", 1_000, 1_500, "This call may be"),
+            u("c1", "CUSTOMER", 1_501, 1_700, "Okay."),
+            u("a2", "AGENT", 1_701, 2_000, "recorded."),
+        ]
+        self.assertEqual(disclosure_state(interrupted, 30_000, ended=True, reliable=True), "POTENTIAL_VIOLATION")
+
+
+class PolicyWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ruleset = json.loads(Path(__file__).resolve().parent.parent.joinpath("config", "rules.v1.json").read_text(encoding="utf-8"))
+
+    def test_caller_clips_late_phrase_and_extends_deadline_for_tagged_hold(self):
+        rows = [
+            u("late", "AGENT", 40_001, 40_500, "This call may be recorded."),
+            u("in_hold", "AGENT", 10_500, 11_000, "This call may be recorded."),
+        ]
+        result = evaluate_rules(rows, context(call_duration_ms=45_000, holds=[{"start_ms": 10_000, "end_ms": 15_000, "tag": "HOLD"}]), self.ruleset)
+        disclosure = next(item for item in result if item["rule_id"] == "opening_disclosure")
+        self.assertEqual(disclosure["status"], "POTENTIAL_VIOLATION")
+        self.assertEqual(disclosure["deadline_ms"], 35_000)
+
+    def test_phrase_inside_extended_window_satisfies_and_unknown_role_abstains(self):
+        rows = [u("good", "AGENT", 34_000, 34_500, "This call may be recorded.")]
+        result = evaluate_rules(rows, context(call_duration_ms=45_000, holds=[{"start_ms": 10_000, "end_ms": 15_000, "tag": "HOLD"}]), self.ruleset)
+        self.assertEqual(next(item for item in result if item["rule_id"] == "opening_disclosure")["status"], "SATISFIED")
+        unknown = [u("unknown", "UNKNOWN", 1_000, 2_000, "This call may be recorded.")]
+        result = evaluate_rules(unknown, context(), self.ruleset)
+        disclosure = next(item for item in result if item["rule_id"] == "opening_disclosure")
+        self.assertEqual(disclosure["status"], "UNKNOWN")
+
+    def test_incomplete_audio_short_calls_and_independent_call_state(self):
+        short = evaluate_rules([], context(call_duration_ms=10_000), self.ruleset)
+        self.assertEqual(next(item for item in short if item["rule_id"] == "opening_disclosure")["status"], "UNKNOWN")
+        incomplete = evaluate_rules([], context(call_duration_ms=40_000, complete=False), self.ruleset)
+        self.assertEqual(next(item for item in incomplete if item["rule_id"] == "opening_disclosure")["status"], "UNKNOWN")
+        satisfied = evaluate_rules([u("one", "AGENT", 1_000, 2_000, "This call may be recorded.")], context(call_id="call-one"), self.ruleset)
+        missing = evaluate_rules([], context(call_id="call-two"), self.ruleset)
+        self.assertEqual(next(item for item in satisfied if item["rule_id"] == "opening_disclosure")["status"], "SATISFIED")
+        self.assertNotEqual(next(item for item in missing if item["rule_id"] == "opening_disclosure")["status"], "SATISFIED")
+
+    def test_closing_check_runs_after_drain_and_sensitive_flags_never_keep_values(self):
+        rows = [u("closing", "AGENT", 29_000, 30_000, "Thank you for your time.")]
+        findings = evaluate_rules(rows, context(call_duration_ms=31_000), self.ruleset)
+        self.assertEqual(next(item for item in findings if item["rule_id"] == "closing_farewell")["status"], "SATISFIED")
+        sensitive = scan_sensitive_numbers([{"segment_id": "seg-1", "start_ms": 2_000, "end_ms": 4_000, "text": "My number is 415-555-0199."}], self.ruleset)
+        self.assertEqual(len(sensitive), 1)
+        self.assertEqual(sensitive[0]["rule_id"], "sensitive_number_advisory")
+        self.assertNotIn("415-555-0199", json.dumps(sensitive))
+
+
+@unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
+class PolicyPersistenceIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not os.environ.get("DATABASE_URL") or not (urlparse(os.environ["DATABASE_URL"]).path or "").lstrip("/").endswith("_test"):
+            raise RuntimeError("Refusing policy integration test without isolated DATABASE_URL ending in _test")
+        cls.ruleset_raw = json.loads(Path(__file__).resolve().parent.parent.joinpath("config", "rules.v1.json").read_text(encoding="utf-8"))
+        migrate()
+
+    def test_versioned_findings_are_lease_scoped_upserted_and_tenant_isolated(self):
+        from app.worker import make_policy_processor
+
+        organisation_id, call_id, job_id = uuid4(), uuid4(), uuid4()
+        other_organisation = uuid4()
+        token = uuid4()
+        with connect() as connection:
+            connection.execute("INSERT INTO organisations(id) VALUES (%s),(%s)", (organisation_id, other_organisation))
+            connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state,transcript_revision) VALUES (%s,%s,%s,%s,%s,'agent','team','en','ANALYSING',1)", (organisation_id, call_id, f"policy-{call_id}", f"policy-{call_id}", "c" * 64))
+            connection.execute("INSERT INTO audio_objects(organisation_id,id,call_id,private_key,checksum,codec,sample_rate,channels,duration_ms) VALUES (%s,%s,%s,%s,%s,'wav',16000,1,31000)", (organisation_id, uuid4(), call_id, f"policy-{call_id}.audio", "d" * 64))
+            evidence_id = hashlib.sha256(b"seg-policy").hexdigest()[:32]
+            connection.execute("INSERT INTO transcript_utterances(organisation_id,call_id,revision,id,segment_id,speaker_id,role,start_ms,end_ms,text_redacted,confidence,model_version,is_final) VALUES (%s,%s,1,%s,'seg-policy','channel-0','UNKNOWN',0,1000,'Uncertain role.',0.5,'synthetic-asr',true)", (organisation_id, call_id, evidence_id))
+            connection.execute("INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state,attempts,lease_token,lease_until) VALUES (%s,%s,%s,'POLICY',1,'RUNNING',1,%s,now()+interval '1 minute')", (organisation_id, job_id, call_id, token))
+        job = {"id": str(job_id), "organisation_id": str(organisation_id), "call_id": str(call_id), "input_revision": 1}
+        findings = make_policy_processor(self.ruleset_raw)(job)["findings"]
+        self.assertEqual(next(item for item in findings if item["rule_id"] == "opening_disclosure")["status"], "UNKNOWN")
+        with connect() as connection:
+            self.assertTrue(finish_job(connection, str(job_id), str(token), {"findings": findings}))
+            migration = connection.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone()
+            stored = connection.execute("SELECT status,ruleset_version,ruleset_hash,policy_text_version,evidence_ids,remediation FROM findings WHERE organisation_id=%s AND call_id=%s ORDER BY rule_id", (organisation_id, call_id)).fetchall()
+            self.assertIsNotNone(migration)
+            self.assertEqual(len(stored), 2)
+            self.assertEqual(connection.execute("SELECT count(*) FROM findings WHERE organisation_id=%s", (other_organisation,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT processing_state FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id)).fetchone()[0], "ANALYSING")
+            updated = dict(findings[0]); updated["status"] = "POTENTIAL_VIOLATION"
+            persist_policy_findings(connection, organisation_id, call_id, 1, [updated])
+            self.assertEqual(connection.execute("SELECT count(*) FROM findings WHERE organisation_id=%s AND call_id=%s AND rule_id=%s", (organisation_id, call_id, updated["rule_id"])).fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT status FROM findings WHERE organisation_id=%s AND call_id=%s AND rule_id=%s", (organisation_id, call_id, updated["rule_id"])).fetchone()[0], "POTENTIAL_VIOLATION")
+            flag = scan_sensitive_numbers([{"segment_id": "seg-policy", "start_ms": 100, "end_ms": 900, "text": "Call 415-555-0199"}], self.ruleset_raw)[0]
+            flag.update({"organisation_id": str(organisation_id), "call_id": str(call_id), "transcript_revision": 1})
+            persist_policy_findings(connection, organisation_id, call_id, 1, [flag])
+            sensitive_row = connection.execute("SELECT evidence_ids,remediation FROM findings WHERE organisation_id=%s AND call_id=%s AND rule_id='sensitive_number_advisory'", (organisation_id, call_id)).fetchone()
+            self.assertEqual(sensitive_row[0], [evidence_id])
+            self.assertNotIn("415-555-0199", str(sensitive_row))
+            bad_scope = dict(flag, organisation_id=str(other_organisation))
+            with self.assertRaises(ValueError):
+                persist_policy_findings(connection, organisation_id, call_id, 1, [bad_scope])
+            bad_evidence = dict(flag, evidence_ids=["not-in-this-transcript"])
+            with self.assertRaises(ValueError):
+                persist_policy_findings(connection, organisation_id, call_id, 1, [bad_evidence])
+
+
+if __name__ == "__main__":
+    unittest.main()

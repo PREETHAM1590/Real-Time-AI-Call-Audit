@@ -15,6 +15,7 @@ from app.contracts import Utterance
 from app.db import connect
 from app.ingest import MAX_AUDIO_BYTES, MAX_DURATION_MS
 from app.privacy import redact_text
+from app.compliance import scan_sensitive_numbers
 from app.storage import LocalPrivateStorage
 
 MAX_TRANSCRIPTION_WORKERS = 1
@@ -278,6 +279,7 @@ def make_transcription_processor(
     transcriber: Callable[..., list[dict]] = transcribe_recording,
     redact: Callable[[str], str] = redact_text,
     model_version: str | None = None,
+    ruleset: dict | None = None,
 ):
     """Build a TRANSCRIBE stage handler; output contains redacted text only."""
     def process(job: dict) -> dict:
@@ -301,6 +303,9 @@ def make_transcription_processor(
             expected_sha256=expected_sha256,
             channels=channels,
         )
+        # This restricted in-memory pass records only an advisory type, time
+        # and canonical evidence ID; it never returns the matched value.
+        policy_flags = scan_sensitive_numbers(raw_segments, ruleset)
         if redact is redact_text:
             redactor = lambda text: redact(text, language=language)
         else:
@@ -313,5 +318,6 @@ def make_transcription_processor(
             "processing_state": "ANALYSING" if prepared else "NEEDS_REVIEW",
             "model_version": version,
             "utterances": [item.model_dump() for item in prepared],
+            "policy_flags": policy_flags,
         }
     return process

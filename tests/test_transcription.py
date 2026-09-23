@@ -287,6 +287,7 @@ class TranscriptPersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(persisted, ("My email is [REDACTED]", True, 1))
             self.assertEqual(connection.execute("SELECT transcript_revision FROM calls WHERE id=%s", (self.call_id,)).fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT stage,state,input_revision FROM jobs WHERE call_id=%s AND stage='ANALYSE'", (self.call_id,)).fetchone(), ("ANALYSE", "QUEUED", 1))
+            self.assertEqual(connection.execute("SELECT stage,state,input_revision FROM jobs WHERE call_id=%s AND stage='POLICY'", (self.call_id,)).fetchone(), ("POLICY", "QUEUED", 1))
 
     def test_expired_lease_cannot_commit_transcript(self):
         with connect() as connection:

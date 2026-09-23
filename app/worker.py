@@ -10,6 +10,7 @@ from app.ingest import claim_job, defer_job, finish_job, renew_job, retry_job
 from app.storage import LocalPrivateStorage
 from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
+from app.compliance import evaluate_rules, load_ruleset
 
 Processor = Callable[[dict], str | dict]
 LEASE_SECONDS = 60
@@ -41,6 +42,39 @@ def make_disposition_processor(adapter):
         output = decision.as_dict()
         output["transcript_revision"] = job["input_revision"]
         return {"disposition": output}
+    return process
+
+
+def make_policy_processor(ruleset):
+    """Build the deterministic POLICY stage over final redacted utterances."""
+    def process(job: dict) -> dict:
+        with connect() as connection:
+            call = connection.execute(
+                "SELECT c.transcript_revision,c.call_type,c.agent_connected_ms,c.tagged_intervals,c.call_complete,c.timing_reliable,a.duration_ms "
+                "FROM calls c LEFT JOIN audio_objects a ON a.organisation_id=c.organisation_id AND a.call_id=c.id "
+                "WHERE c.organisation_id=%s AND c.id=%s AND c.tombstoned_at IS NULL",
+                (job["organisation_id"], job["call_id"]),
+            ).fetchone()
+            if call is None or call[0] != job["input_revision"]:
+                raise RuntimeError("policy transcript revision is stale or unavailable")
+            rows = connection.execute(
+                "SELECT id,role,start_ms,end_ms,text_redacted,is_final FROM transcript_utterances "
+                "WHERE organisation_id=%s AND call_id=%s AND revision=%s ORDER BY start_ms,id",
+                (job["organisation_id"], job["call_id"], job["input_revision"]),
+            ).fetchall()
+        utterances = [{"id": row[0], "role": row[1], "start_ms": row[2], "end_ms": row[3], "text_redacted": row[4], "is_final": row[5]} for row in rows]
+        context = {
+            "organisation_id": str(job["organisation_id"]),
+            "call_id": str(job["call_id"]),
+            "transcript_revision": job["input_revision"],
+            "call_type": call[1],
+            "agent_connected_ms": call[2],
+            "holds": call[3],
+            "complete": call[4],
+            "timing_reliable": call[5],
+            "call_duration_ms": call[6] or 0,
+        }
+        return {"findings": evaluate_rules(utterances, context, ruleset)}
     return process
 
 
@@ -100,8 +134,16 @@ if __name__ == "__main__":
     from app.transcription import make_transcription_processor
 
     processors = {}
+    policy_ruleset = None
+    policy_path = os.environ.get("POLICY_RULESET_PATH")
+    policy_digest = os.environ.get("POLICY_RULESET_SHA256")
+    if policy_path or policy_digest:
+        if not policy_path or not policy_digest:
+            raise RuntimeError("Both POLICY_RULESET_PATH and POLICY_RULESET_SHA256 are required")
+        policy_ruleset = load_ruleset(policy_path, policy_digest)
+        processors["POLICY"] = make_policy_processor(policy_ruleset)
     if os.environ.get("FASTER_WHISPER_MODEL_PATH") and os.environ.get("FASTER_WHISPER_MODEL_SHA256") and os.environ.get("FASTER_WHISPER_MODEL_VERSION"):
-        processors["TRANSCRIBE"] = make_transcription_processor()
+        processors["TRANSCRIBE"] = make_transcription_processor(ruleset=policy_ruleset)
     if os.environ.get("DISPOSITION_MODEL_SHA256"):
         from app.local_disposition_adapter import LocalVllmDispositionAdapter
 

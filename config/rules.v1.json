@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.0",
+  "ruleset_id": "synthetic_policy_example",
+  "version": 1,
+  "policy_text_version": "synthetic_only_v1",
+  "rules": [
+    {
+      "id": "opening_disclosure",
+      "type": "OPENING_DISCLOSURE",
+      "call_types": ["*"],
+      "severity": "HIGH",
+      "opportunity_ms": 30000,
+      "phrase_variants": ["This call may be recorded"],
+      "remediation": "Review the call against the organisation's approved disclosure policy."
+    },
+    {
+      "id": "closing_farewell",
+      "type": "CLOSING_PHRASE",
+      "call_types": ["*"],
+      "severity": "LOW",
+      "window_ms": 15000,
+      "phrase_variants": ["Thank you for your time", "Goodbye"],
+      "remediation": "Review the closing against the organisation's approved call-handling policy."
+    },
+    {
+      "id": "sensitive_number_advisory",
+      "type": "SENSITIVE_NUMBER_ADVISORY",
+      "call_types": ["*"],
+      "severity": "LOW",
+      "remediation": "Review the redacted evidence and confirm that sensitive-number handling followed approved policy."
+    }
+  ]
+}

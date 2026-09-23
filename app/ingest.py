@@ -136,7 +136,7 @@ def claim_job(connection, worker_id: str, lease_seconds: int = 60, supported_sta
 
 def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
     with connection.transaction():
-        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at,c.transcript_revision FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
+        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at,c.transcript_revision,j.stage,j.input_revision FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
         if locked is None or locked[2] is not None:
             return False
         changed = connection.execute("UPDATE jobs SET state='DONE',lease_token=NULL,lease_until=NULL WHERE organisation_id=%s AND id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (locked[0], job_id, lease_token)).rowcount
@@ -168,6 +168,13 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                         "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'ANALYSE',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
                         (locked[0], uuid4(), locked[1], revision),
                     )
+                    connection.execute(
+                        "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'POLICY',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
+                        (locked[0], uuid4(), locked[1], revision),
+                    )
+                policy_flags = result.get("policy_flags", [])
+                if policy_flags:
+                    persist_policy_findings(connection, locked[0], locked[1], revision, policy_flags)
                 connection.execute("UPDATE calls SET processing_state=%s,transcript_revision=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, revision, locked[0], locked[1]))
             elif "disposition" in result:
                 disposition = result["disposition"]
@@ -185,9 +192,56 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                 # ANALYSE is disposition-only in this slice. Never mark a call READY;
                 # QA policy/audit stages have not been implemented yet.
                 connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+            elif "findings" in result:
+                if locked[4] != "POLICY" or locked[5] != locked[3]:
+                    raise ValueError("stale or misrouted policy result")
+                persist_policy_findings(connection, locked[0], locked[1], locked[3], result["findings"])
             else:
                 connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
     return changed == 1
+
+
+def persist_policy_findings(connection, organisation_id, call_id, transcript_revision: int, findings: list[dict]) -> None:
+    """Tenant-scope and idempotently upsert only redacted policy metadata."""
+    if not isinstance(findings, list) or len(findings) > 1024:
+        raise ValueError("invalid policy finding batch")
+    allowed = {"organisation_id", "call_id", "transcript_revision", "rule_id", "ruleset_version", "ruleset_hash", "policy_text_version", "status", "severity", "evidence_ids", "evidence_fingerprint", "deadline_ms", "remediation"}
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) - allowed:
+            raise ValueError("invalid policy finding fields")
+        required = {"rule_id", "ruleset_version", "ruleset_hash", "policy_text_version", "status", "severity", "evidence_ids", "remediation"}
+        if required - set(finding):
+            raise ValueError("policy finding is missing required fields")
+        if finding.get("organisation_id", str(organisation_id)) != str(organisation_id) or finding.get("call_id", str(call_id)) != str(call_id):
+            raise ValueError("policy finding scope mismatch")
+        if finding.get("transcript_revision", transcript_revision) != transcript_revision:
+            raise ValueError("policy finding revision mismatch")
+        text_fields = (finding["rule_id"], finding["ruleset_version"], finding["policy_text_version"], finding["remediation"])
+        if any(not isinstance(value, str) or not value.strip() for value in text_fields) or len(finding["rule_id"]) > 128 or len(finding["ruleset_version"]) > 64 or len(finding["policy_text_version"]) > 128 or len(finding["remediation"]) > 500:
+            raise ValueError("invalid policy finding text")
+        if not isinstance(finding["ruleset_hash"], str) or len(finding["ruleset_hash"]) != 64 or any(c not in "0123456789abcdef" for c in finding["ruleset_hash"]):
+            raise ValueError("invalid policy ruleset hash")
+        if not isinstance(finding["status"], str) or finding["status"] not in {"PENDING", "SATISFIED", "POTENTIAL_VIOLATION", "UNKNOWN", "ADVISORY"} or not isinstance(finding["severity"], str) or finding["severity"] not in {"LOW", "MEDIUM", "HIGH"}:
+            raise ValueError("invalid policy finding state")
+        evidence_ids = finding["evidence_ids"]
+        if not isinstance(evidence_ids, list) or len(evidence_ids) > 1024 or any(not isinstance(value, str) or not value or len(value) > 128 for value in evidence_ids):
+            raise ValueError("invalid policy evidence references")
+        if evidence_ids:
+            present = {row[0] for row in connection.execute("SELECT id FROM transcript_utterances WHERE organisation_id=%s AND call_id=%s AND revision=%s AND id = ANY(%s)", (organisation_id, call_id, transcript_revision, evidence_ids)).fetchall()}
+            if present != set(evidence_ids):
+                raise ValueError("policy evidence is outside the final transcript revision")
+        deadline = finding.get("deadline_ms")
+        if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, int) or not 0 <= deadline <= 2**31 - 1):
+            raise ValueError("invalid policy deadline")
+        fingerprint = hashlib.sha256(json.dumps(sorted(set(evidence_ids)), separators=(",", ":")).encode()).hexdigest()
+        if finding.get("evidence_fingerprint", fingerprint) != fingerprint:
+            raise ValueError("invalid policy evidence fingerprint")
+        connection.execute(
+            "INSERT INTO findings(organisation_id,id,call_id,transcript_revision,rule_id,ruleset_version,ruleset_hash,policy_text_version,status,severity,evidence_ids,evidence_fingerprint,deadline_ms,remediation) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s) "
+            "ON CONFLICT (organisation_id,call_id,transcript_revision,ruleset_hash,rule_id,evidence_fingerprint) DO UPDATE SET status=EXCLUDED.status,severity=EXCLUDED.severity,evidence_ids=EXCLUDED.evidence_ids,deadline_ms=EXCLUDED.deadline_ms,remediation=EXCLUDED.remediation,updated_at=now()",
+            (organisation_id, uuid4(), call_id, transcript_revision, finding["rule_id"], finding["ruleset_version"], finding["ruleset_hash"], finding["policy_text_version"], finding["status"], finding["severity"], json.dumps(sorted(set(evidence_ids))), fingerprint, deadline, finding["remediation"]),
+        )
 
 
 def defer_job(connection, job_id: str, lease_token: str) -> bool:
