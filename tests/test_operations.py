@@ -149,6 +149,18 @@ class RetentionPostgresTests(unittest.TestCase):
     def test_tombstone_precedes_bounded_purge_and_is_idempotent(self):
         organisation_id, call_id, job_id, storage, storage_key = self.make_call()
         with connect() as connection:
+            audit_id = connection.execute("SELECT id FROM audits WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0]
+            audio_id = connection.execute("SELECT id FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0]
+            connection.execute(
+                "INSERT INTO access_events(organisation_id,id,actor_id,action,resource_type,resource_id,outcome) "
+                "VALUES (%s,%s,'qa-reviewer','REVIEW_SAVED','AUDIT_REVIEW',%s,'SUCCESS')",
+                (organisation_id, uuid4(), audit_id),
+            )
+            connection.execute(
+                "INSERT INTO access_events(organisation_id,id,actor_id,action,resource_type,resource_id,outcome) "
+                "VALUES (%s,%s,'qa-reviewer','AUDIO_ACCESS_GRANTED','AUDIO_OBJECT',%s,'SUCCESS')",
+                (organisation_id, uuid4(), audio_id),
+            )
             requested = request_call_deletion(connection, str(organisation_id), str(call_id), "admin-user", now=datetime(2026, 9, 23, tzinfo=timezone.utc))
             self.assertEqual(requested["status"], "TOMBSTONED")
             row = connection.execute("SELECT tombstoned_at,processing_state FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id)).fetchone()
@@ -176,7 +188,13 @@ class RetentionPostgresTests(unittest.TestCase):
             ).fetchall()
             event_details = {row[0]: row[1] for row in events}
             self.assertEqual(set(event_details), {"CALL_DELETION_REQUESTED", "CALL_CONTENT_PURGED"})
-            self.assertEqual(event_details["CALL_CONTENT_PURGED"], {"retained_immutable_history": {"audits": 1, "reviews": 1, "dispositions": 0, "access_events": 2}})
+            self.assertEqual(event_details["CALL_CONTENT_PURGED"], {"retained_immutable_history": {"audits": 1, "reviews": 1, "dispositions": 0, "access_events": 4}})
+            related_event_count = connection.execute(
+                "SELECT count(*) FROM access_events e WHERE e.organisation_id=%s AND ((e.resource_type='CALL' AND e.resource_id=%s) "
+                "OR (e.resource_type='AUDIT_REVIEW' AND e.resource_id=%s) OR (e.resource_type='AUDIO_OBJECT' AND e.resource_id=%s))",
+                (organisation_id, call_id, audit_id, audio_id),
+            ).fetchone()[0]
+            self.assertEqual(related_event_count, 4)
 
     def test_hold_and_not_due_calls_are_not_physically_purged(self):
         organisation_id, call_id, _, storage, storage_key = self.make_call(held=True, expires_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
@@ -229,12 +247,18 @@ class RetentionPostgresTests(unittest.TestCase):
     def test_no_audit_purge_still_reports_retained_call_access_history(self):
         organisation_id, call_id, _, storage, _ = self.make_call(with_audit=False)
         with connect() as connection:
+            audio_id = connection.execute("SELECT id FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0]
+            connection.execute(
+                "INSERT INTO access_events(organisation_id,id,actor_id,action,resource_type,resource_id,outcome) "
+                "VALUES (%s,%s,'qa-reviewer','AUDIO_ACCESS_GRANTED','AUDIO_OBJECT',%s,'SUCCESS')",
+                (organisation_id, uuid4(), audio_id),
+            )
             request_call_deletion(connection, str(organisation_id), str(call_id), "admin-user")
             result = purge_call(connection, str(organisation_id), str(call_id), storage)
         self.assertEqual(result["status"], "PARTIAL_IMMUTABLE_HISTORY")
         self.assertEqual(
             result["immutable_records_retained"],
-            {"audits": 0, "reviews": 0, "dispositions": 0, "access_events": 2},
+            {"audits": 0, "reviews": 0, "dispositions": 0, "access_events": 3},
         )
 
     def test_running_worker_cannot_commit_after_deletion_tombstone(self):

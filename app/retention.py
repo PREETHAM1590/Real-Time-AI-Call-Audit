@@ -137,11 +137,15 @@ def purge_call(connection, organisation_id: str, call_id: str, storage, *, now: 
             counts[table] = connection.execute(
                 f"SELECT count(*) FROM {table} WHERE organisation_id=%s AND call_id=%s", (org, call)
             ).fetchone()[0]
-        # Count the immutable purge event about to be inserted as well as all
-        # pre-existing call-scoped provenance events in the same transaction.
+        # Access-event resource IDs point to a call, an audit review, or an
+        # audio object. Count all three kinds of call-related provenance, plus
+        # the purge event about to be inserted in this transaction.
         counts["access_events"] = connection.execute(
-            "SELECT count(*) FROM access_events WHERE organisation_id=%s AND resource_type='CALL' AND resource_id=%s",
-            (org, call),
+            "SELECT count(*) FROM access_events e WHERE e.organisation_id=%s AND ("
+            "(e.resource_type='CALL' AND e.resource_id=%s) OR "
+            "(e.resource_type='AUDIT_REVIEW' AND EXISTS (SELECT 1 FROM audits a WHERE a.organisation_id=e.organisation_id AND a.call_id=%s AND a.id=e.resource_id)) OR "
+            "(e.resource_type='AUDIO_OBJECT' AND EXISTS (SELECT 1 FROM audio_objects o WHERE o.organisation_id=e.organisation_id AND o.call_id=%s AND o.id=e.resource_id)))",
+            (org, call, call, call),
         ).fetchone()[0] + 1
 
         # Keep the call row locked from hold verification through object deletion,
