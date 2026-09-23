@@ -276,9 +276,13 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
             elif isinstance(signal_name, str) and signal_name in questions and operator.startswith("SCORE_") and questions[signal_name].get("type") != "score": errors.append(_err(path, "SCORE operator requires a score question"))
             elif operator in {"NOUL_GTE", "NOUL_LTE", "SCORE_GTE", "SCORE_LTE", "CHOICE_CONFIDENCE_GTE"}:
                 _bounded_number(node.get("value"), f"{path}.value", errors)
-            elif operator == "CHOICE_EQ" and isinstance(signal_name, str) and signal_name in questions and (not isinstance(node.get("value"), str) or node.get("value") not in questions[signal_name].get("criteria", {})): errors.append(_err(f"{path}.value", "must be a configured choice"))
+            elif operator == "CHOICE_EQ" and isinstance(signal_name, str) and signal_name in questions:
+                criteria = questions[signal_name].get("criteria")
+                if not isinstance(criteria, dict) or not isinstance(node.get("value"), str) or node.get("value") not in criteria:
+                    errors.append(_err(f"{path}.value", "must be a configured choice"))
             elif operator == "CHOICE_IN" and isinstance(signal_name, str) and signal_name in questions:
-                if not isinstance(node.get("value"), list) or not node["value"] or any(not isinstance(choice, str) or choice not in questions[signal_name].get("criteria", {}) for choice in node["value"]): errors.append(_err(f"{path}.value", "must be a nonempty list of configured choices"))
+                criteria = questions[signal_name].get("criteria")
+                if not isinstance(criteria, dict) or not isinstance(node.get("value"), list) or not node["value"] or any(not isinstance(choice, str) or choice not in criteria for choice in node["value"]): errors.append(_err(f"{path}.value", "must be a nonempty list of configured choices"))
         else: errors.append(_err(path, "unsupported condition shape"))
 
     for i, rule in enumerate(rules_raw):

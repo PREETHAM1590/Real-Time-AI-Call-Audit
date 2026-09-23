@@ -97,6 +97,10 @@ class DispositionUnitTests(unittest.TestCase):
     def test_compiler_bounds_config_size_depth_types_and_persisted_integer_ranges(self):
         config = sample_config(); config["questions"]["committed"]["criteria"] = ["wrong-container"]
         with self.assertRaises(ConfigError): compile_disposition_config(config)
+        for invalid_criteria in (7, None):
+            config = sample_config(); config["questions"]["next_step"]["criteria"] = invalid_criteria
+            with self.subTest(invalid_criteria=invalid_criteria), self.assertRaises(ConfigError):
+                compile_disposition_config(config)
         config = sample_config(); config["version"] = 2**31
         with self.assertRaises(ConfigError): compile_disposition_config(config)
         config = sample_config(); config["version"] = 10**1000
@@ -398,6 +402,10 @@ class DispositionPostgresTests(unittest.TestCase):
             candidate = sample_config()
             config_id = candidate["config_id"]
             self.assertEqual(client.post("/v1/disposition-configs/validate", json=candidate, headers=headers()).status_code, 200)
+            malformed = sample_config(); malformed["questions"]["next_step"]["criteria"] = 7
+            self.assertEqual(client.post("/v1/disposition-configs/validate", json=malformed, headers=headers()).status_code, 422)
+            malformed["questions"]["next_step"]["criteria"] = None
+            self.assertEqual(client.post("/v1/disposition-configs", json=malformed, headers=headers()).status_code, 422)
             self.assertEqual(client.post("/v1/disposition-configs", json=candidate, headers=headers()).status_code, 201)
             compiled = compile_disposition_config(candidate)
             call_id = uuid4()
