@@ -442,7 +442,7 @@ class LiveTests(unittest.TestCase):
 ```
 
 - [x] **2. Run:** `python -m unittest tests.test_live -v`; the test-first run failed because `app.sentiment` did not exist, then passed after implementation.
-- [x] **3. Implement the calibrated-window predicate:** `app.sentiment.sentiment_drop` validates signed finite scores in [-1, 1], requires at least three values on each side and returns true for an average drop of at least 0.4. This helper accepts already selected windows; upstream final-customer selection, 30-second adjacency, confidence and cooldown logic are still pending.
+- [x] **3. Implement sentiment eligibility and window logic:** `app.sentiment.sentiment_drop` validates signed finite scores in [-1, 1], requires at least three values on each side and returns true for an average drop of at least 0.4. `sentiment_alert_times` accepts already-inferred signals using `signed_score = p_positive - p_negative` and `top_class_probability`; it validates eligible final CUSTOMER offsets and values, groups by `start_ms` into adjacent fixed 30-second windows, requires three samples per window, a mean drop of at least 0.4 and an average top-class probability of at least 0.7, then applies a 90-second alert cooldown. It returns the later window's end offset. This is pure decision logic; model inference, sentiment aggregation and event delivery remain pending.
 
 ```python
 from statistics import mean
@@ -452,14 +452,14 @@ def sentiment_drop(previous, current):
             and mean(previous) - mean(current) >= 0.4)
 ```
 
-Caller selects adjacent 30-second windows using utterance event time, enforces confidence ≥0.7, customer role and 90-second cooldown. Validate finite score range before calling. Record model version and expose insufficient data explicitly.
+The pure helper applies these eligibility rules to already-inferred synthetic signals. Model selection/inference, probability generation, model-version provenance and live event delivery remain pending.
 - [ ] **4. Integrate one evaluated sentiment model** for utterance probabilities; compute turn and call aggregates as specified. Warm it before readiness. An unavailable sentiment model does not block deterministic policy checks; show unknown sentiment.
 - [x] **5. Implement scoped post-call SSE state refresh:** migration 015 adds a tenant-local transactional sequence and a `call.updated` outbox containing only processing state and transcript revision. Intake, committed worker stages, retries, exhausted-job failures, and ACCEPT/OVERRIDE/TRIAGE review commits append in the same transaction. SSE revalidates the signed token and current server-owned membership/team scope before each event; the outbox retains at most 10,000 events per tenant, and call purge removes its events and advances the cursor floor so older clients receive `reset_required`. `GET /v1/events` resumes by `Last-Event-ID`, rejects future/invalid cursors, reads at most one row per authorized pull, and stops on disconnect. This is a post-call refresh feed only: live media, sentiment events, supervisor cards, and browser reconnect behavior are not implemented.
 - [ ] **6. Build active-call cards** with textual policy/sentiment state, evidence, acknowledgement and stale indicator. Browser test disconnects feed, expects “Reconnecting”, reconnects with previous cursor and asserts one finding after a replayed event. Backend test attempts another organisation's cursor/call and receives no data.
 - [ ] **7. Run backend checks and browser live check**, measure final-arrival-to-render latency, then commit `feat: add live supervisor monitoring`.
 - [ ] Re-run disposition only after the live finalisation barrier on the final transcript revision; late corrections create a new immutable disposition revision and emit `disposition.ready`. Partial transcripts never create durable dispositions. Test normal completion, timeout/NEEDS_REVIEW, late correction and reconnect.
 
-**Task 8 status:** only Step 5's provider-independent post-call state feed is implemented. No live media/event workflow or UI is claimed by this slice.
+**Task 8 status:** provider-independent Steps 1–3 and Step 5's post-call state feed are implemented. No sentiment model integration, live media/event workflow, supervisor cards or browser reconnect behavior is implemented by these slices.
 
 ## Task 9: Deliver agent scores, trends and safe exports
 

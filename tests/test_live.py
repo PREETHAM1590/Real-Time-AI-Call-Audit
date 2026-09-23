@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from app.sentiment import sentiment_drop
+from app.sentiment import sentiment_alert_times, sentiment_drop
 
 
 class SentimentDropTests(unittest.TestCase):
@@ -29,6 +29,64 @@ class SentimentDropTests(unittest.TestCase):
         ):
             with self.subTest(previous=previous, current=current), self.assertRaises(ValueError):
                 sentiment_drop(previous, current)
+
+
+class SentimentAlertTests(unittest.TestCase):
+    @staticmethod
+    def signal(start_ms, score, *, role="CUSTOMER", is_final=True, probability=0.8, end_ms=None):
+        return {
+            "role": role,
+            "start_ms": start_ms,
+            "end_ms": start_ms if end_ms is None else end_ms,
+            "is_final": is_final,
+            "signed_score": score,
+            "top_class_probability": probability,
+        }
+
+    def test_uses_only_final_customer_signals_in_adjacent_windows(self):
+        signals = [
+            *(self.signal(i * 100, 0.8) for i in range(2)),
+            self.signal(200, 0.8, is_final=False),
+            self.signal(300, 0.8, role="AGENT"),
+            *(self.signal(30_000 + i * 100, 0.0) for i in range(3)),
+        ]
+        self.assertEqual(sentiment_alert_times(signals), [])
+
+        signals = [self.signal(i * 100, 0.8) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.0) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [60_000])
+
+    def test_requires_adjacent_windows_and_average_probability_threshold(self):
+        signals = [self.signal(i * 100, 0.8) for i in range(3)]
+        signals.extend(self.signal(60_000 + i * 100, 0.0) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [])
+
+        signals = [self.signal(i * 100, 0.8, probability=0.69) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.0, probability=0.69) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [])
+        signals = [self.signal(i * 100, 0.8, probability=0.7) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.0, probability=0.7) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [60_000])
+
+    def test_enforces_ninety_second_cooldown(self):
+        scores = [0.8, 0.0, 0.8, 0.8, 0.0]
+        signals = [self.signal(i * 30_000 + j, scores[i])
+                   for i in range(5) for j in range(3)]
+        self.assertEqual(sentiment_alert_times(signals), [60_000, 150_000])
+
+    def test_rejects_invalid_eligible_offsets_and_scores(self):
+        for changes in (
+            {"start_ms": True},
+            {"end_ms": 1.5},
+            {"end_ms": -1},
+            {"signed_score": math.nan},
+            {"top_class_probability": 1.01},
+        ):
+            with self.subTest(changes=changes):
+                signal = self.signal(0, 0.5)
+                signal.update(changes)
+                with self.assertRaises(ValueError):
+                    sentiment_alert_times([signal])
 
 
 if __name__ == "__main__":
