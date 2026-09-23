@@ -101,7 +101,9 @@ class PostgresIngestTests(unittest.TestCase):
                 call_ids = [UUID(value) for value in self.created_call_ids]
                 connection.execute("DELETE FROM jobs WHERE organisation_id=%s AND call_id=ANY(%s)", (self.organisation_id, call_ids))
                 connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=ANY(%s)", (self.organisation_id, call_ids))
+                connection.execute("DELETE FROM events WHERE organisation_id=%s AND call_id=ANY(%s)", (self.organisation_id, call_ids))
                 connection.execute("DELETE FROM calls WHERE organisation_id=%s AND id=ANY(%s)", (self.organisation_id, call_ids))
+                connection.execute("DELETE FROM event_counters WHERE organisation_id=%s", (self.organisation_id,))
         if self.created_organisation:
             with connect() as connection:
                 connection.execute("DELETE FROM organisations WHERE id=%s", (self.organisation_id,))

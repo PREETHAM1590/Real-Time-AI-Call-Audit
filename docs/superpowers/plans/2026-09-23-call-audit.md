@@ -452,10 +452,12 @@ def sentiment_drop(previous, current):
 
 Caller selects adjacent 30-second windows using utterance event time, enforces confidence ≥0.7, customer role and 90-second cooldown. Validate finite score range before calling. Record model version and expose insufficient data explicitly.
 - [ ] **4. Integrate one evaluated sentiment model** for utterance probabilities; compute turn and call aggregates as specified. Warm it before readiness. An unavailable sentiment model does not block deterministic policy checks; show unknown sentiment.
-- [ ] **5. Implement scoped SSE:** commit final events in the same transaction as state changes; order by durable sequence; resume after Last-Event-ID; detect expired cursor and request snapshot. Never write raw or interim text to the durable outbox. Bound per-client buffers and disconnect slow clients with recovery instructions.
+- [x] **5. Implement scoped post-call SSE state refresh:** migration 015 adds a tenant-local transactional sequence and a `call.updated` outbox containing only processing state and transcript revision. Intake, every successfully committed worker stage (including findings/audit/disposition output when those fields stay unchanged), retry transitions, and exhausted-job failure transitions append in the same transaction. `GET /v1/events` resumes by `Last-Event-ID`, rejects future/invalid cursors, emits `reset_required` for expired history, reads at most 100 rows per pull, and stops on disconnect. This is a post-call refresh feed only: event types remain `call.updated`; live media, sentiment events, supervisor cards, and browser reconnect behavior are not implemented.
 - [ ] **6. Build active-call cards** with textual policy/sentiment state, evidence, acknowledgement and stale indicator. Browser test disconnects feed, expects “Reconnecting”, reconnects with previous cursor and asserts one finding after a replayed event. Backend test attempts another organisation's cursor/call and receives no data.
 - [ ] **7. Run backend checks and browser live check**, measure final-arrival-to-render latency, then commit `feat: add live supervisor monitoring`.
 - [ ] Re-run disposition only after the live finalisation barrier on the final transcript revision; late corrections create a new immutable disposition revision and emit `disposition.ready`. Partial transcripts never create durable dispositions. Test normal completion, timeout/NEEDS_REVIEW, late correction and reconnect.
+
+**Task 8 status:** only Step 5's provider-independent post-call state feed is implemented. No live media/event workflow or UI is claimed by this slice.
 
 ## Task 9: Deliver agent scores, trends and safe exports
 

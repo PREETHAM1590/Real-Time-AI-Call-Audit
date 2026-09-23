@@ -299,6 +299,8 @@ class AuditPersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(stored[4], 1)
             self.assertGreaterEqual(stored[5], 0)
             self.assertEqual(connection.execute("SELECT processing_state FROM calls WHERE organisation_id=%s AND id=%s", (org, call_id)).fetchone()[0], "NEEDS_REVIEW")
+            latest_event = connection.execute("SELECT payload FROM events WHERE organisation_id=%s AND call_id=%s ORDER BY sequence DESC LIMIT 1", (org, call_id)).fetchone()[0]
+            self.assertEqual(latest_event, {"processing_state": "NEEDS_REVIEW", "transcript_revision": 1})
             from app.audit import persist_audit
             rerun = copy.deepcopy(output["audit"])
             rerun["coaching_narrative"]["text"] = "Changed rerun must not rewrite the original."

@@ -12,6 +12,7 @@ from uuid import uuid4
 from app.db import connect
 from app.auth import Scope
 from app.contracts import PersistedUtterance
+from app.events import append_call_updated
 from app.storage import LocalPrivateStorage
 
 MAX_AUDIO_BYTES = 250 * 1024 * 1024
@@ -107,6 +108,7 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
                 else:
                     connection.execute("INSERT INTO audio_objects(organisation_id,id,call_id,private_key,checksum,codec,sample_rate,channels,duration_ms) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (scope.organisation_id, audio_id, call_id, key, checksum, codec, rate, channels, duration))
                     connection.execute("INSERT INTO jobs(organisation_id,id,call_id,stage,state) VALUES (%s,%s,%s,'TRANSCRIBE','QUEUED')", (scope.organisation_id, job_id, call_id))
+                    append_call_updated(connection, str(scope.organisation_id), str(call_id), "QUEUED", 0)
     except Exception:
         storage.delete(key)
         raise
@@ -125,7 +127,11 @@ def claim_job(connection, worker_id: str, lease_seconds: int = 60, supported_sta
     params = (MAX_JOB_ATTEMPTS, list(supported_stages), uuid4(), lease_seconds) if supported_stages is not None else (MAX_JOB_ATTEMPTS, uuid4(), lease_seconds)
     with connection.transaction():
         connection.execute("UPDATE jobs SET state='FAILED',lease_token=NULL,lease_until=NULL,last_error_code='RETRIES_EXHAUSTED' WHERE state='RUNNING' AND attempts >= %s AND lease_until < now()", (MAX_JOB_ATTEMPTS,))
-        connection.execute("UPDATE calls c SET processing_state='FAILED' FROM jobs j WHERE j.organisation_id=c.organisation_id AND j.call_id=c.id AND j.state='FAILED' AND j.last_error_code='RETRIES_EXHAUSTED' AND c.tombstoned_at IS NULL")
+        failed_calls = connection.execute(
+            "UPDATE calls c SET processing_state='FAILED' FROM jobs j WHERE j.organisation_id=c.organisation_id AND j.call_id=c.id AND j.state='FAILED' AND j.last_error_code='RETRIES_EXHAUSTED' AND c.tombstoned_at IS NULL AND c.processing_state<>'FAILED' RETURNING c.organisation_id,c.id,c.processing_state,c.transcript_revision"
+        ).fetchall()
+        for organisation_id, call_id, state, revision in failed_calls:
+            append_call_updated(connection, str(organisation_id), str(call_id), state, revision)
         query = f"WITH selected AS (SELECT j.organisation_id,j.id FROM jobs j JOIN calls c ON c.organisation_id=j.organisation_id AND c.id=j.call_id WHERE c.tombstoned_at IS NULL AND j.attempts < %s {stage_filter} AND ((j.state IN ('QUEUED','WAITING_HANDLER','RETRY_WAIT') AND j.available_at<=now()) OR (j.state='RUNNING' AND j.lease_until<now())) ORDER BY j.available_at,j.id LIMIT 1 FOR UPDATE OF j,c SKIP LOCKED) UPDATE jobs j SET state='RUNNING',lease_token=%s,lease_until=now()+make_interval(secs=>%s),attempts=attempts+1 FROM selected s WHERE j.organisation_id=s.organisation_id AND j.id=s.id RETURNING j.*"
         row = connection.execute(query, params).fetchone()
     if row is None:
@@ -136,7 +142,7 @@ def claim_job(connection, worker_id: str, lease_seconds: int = 60, supported_sta
 
 def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
     with connection.transaction():
-        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at,c.transcript_revision,j.stage,j.input_revision FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
+        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at,c.transcript_revision,j.stage,j.input_revision,c.processing_state FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
         if locked is None or locked[2] is not None:
             return False
         changed = connection.execute("UPDATE jobs SET state='DONE',lease_token=NULL,lease_until=NULL WHERE organisation_id=%s AND id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (locked[0], job_id, lease_token)).rowcount
@@ -210,6 +216,14 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                 connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
             else:
                 connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
+            current = connection.execute(
+                "SELECT processing_state,transcript_revision FROM calls WHERE organisation_id=%s AND id=%s",
+                (locked[0], locked[1]),
+            ).fetchone()
+            # A successful stage can change findings, audit, or disposition rows
+            # while leaving the call state and transcript revision untouched.
+            if current is not None:
+                append_call_updated(connection, str(locked[0]), str(locked[1]), current[0], current[1])
     return changed == 1
 
 
@@ -271,11 +285,13 @@ def retry_job(connection, job_id: str, lease_token: str, *, max_attempts: int = 
             return False
         if locked[2] >= max_attempts:
             connection.execute("UPDATE jobs SET state='FAILED',lease_token=NULL,lease_until=NULL,last_error_code='PROCESSOR_FAILED' WHERE organisation_id=%s AND id=%s", (locked[0], job_id))
-            connection.execute("UPDATE calls SET processing_state='FAILED' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+            call = connection.execute("UPDATE calls SET processing_state='FAILED' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL RETURNING processing_state,transcript_revision", (locked[0], locked[1])).fetchone()
         else:
             delay = min(300, 2 ** max(0, locked[2] - 1))
             connection.execute("UPDATE jobs SET state='RETRY_WAIT',available_at=now()+make_interval(secs=>%s),lease_token=NULL,lease_until=NULL,last_error_code='PROCESSOR_FAILED' WHERE organisation_id=%s AND id=%s", (delay, locked[0], job_id))
-            connection.execute("UPDATE calls SET processing_state='RETRY_WAIT' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+            call = connection.execute("UPDATE calls SET processing_state='RETRY_WAIT' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL RETURNING processing_state,transcript_revision", (locked[0], locked[1])).fetchone()
+        if call is not None:
+            append_call_updated(connection, str(locked[0]), str(locked[1]), call[0], call[1])
     return True
 
 

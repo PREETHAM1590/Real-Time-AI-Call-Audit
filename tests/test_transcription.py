@@ -262,8 +262,10 @@ class TranscriptPersistenceIntegrationTests(unittest.TestCase):
         with connect() as connection:
             connection.execute("DELETE FROM transcript_utterances WHERE organisation_id=%s AND call_id=%s", (self.organisation_id, self.call_id))
             connection.execute("DELETE FROM jobs WHERE organisation_id=%s AND call_id=%s", (self.organisation_id, self.call_id))
+            connection.execute("DELETE FROM events WHERE organisation_id=%s AND call_id=%s", (self.organisation_id, self.call_id))
             connection.execute("DELETE FROM calls WHERE organisation_id=%s AND id=%s", (self.organisation_id, self.call_id))
             if self.created_organisation:
+                connection.execute("DELETE FROM event_counters WHERE organisation_id=%s", (self.organisation_id,))
                 connection.execute("DELETE FROM organisations WHERE id=%s", (self.organisation_id,))
 
     def test_final_redacted_utterances_commit_with_job_and_raw_fields_are_rejected(self):

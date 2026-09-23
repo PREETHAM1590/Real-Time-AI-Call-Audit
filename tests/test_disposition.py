@@ -341,11 +341,15 @@ class DispositionPostgresTests(unittest.TestCase):
             output = make_disposition_processor(adapter)(job)
             self.assertEqual([turn["speaker_id"] for turn in adapter.seen[0][1]], ["channel-0", "channel-1"])
             self.assertEqual([turn["utterance_ids"] for turn in adapter.seen[0][1]], [["utt1"], ["utt2"]])
+            # Disposition is durable output even when it leaves call state unchanged.
+            connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s", (self.org, self.call))
             self.assertTrue(finish_job(connection, str(job["id"]), str(job["lease_token"]), output))
             row = connection.execute("SELECT organisation_id,revision,transcript_revision,code,status,model_artifact,signals_json FROM dispositions WHERE organisation_id=%s AND call_id=%s", (self.org, self.call)).fetchone()
             self.assertEqual((str(row[0]), row[1], row[2], row[3], row[4], row[5]), (str(self.org), 1, 1, "COMMITTED", "RESOLVED", "sha256:" + "a" * 64))
             self.assertIn("committed", row[6])
             self.assertEqual(connection.execute("SELECT processing_state FROM calls WHERE organisation_id=%s AND id=%s", (self.org, self.call)).fetchone()[0], "NEEDS_REVIEW")
+            latest_event = connection.execute("SELECT payload FROM events WHERE organisation_id=%s AND call_id=%s ORDER BY sequence DESC LIMIT 1", (self.org, self.call)).fetchone()[0]
+            self.assertEqual(latest_event, {"processing_state": "NEEDS_REVIEW", "transcript_revision": 1})
         from psycopg.errors import RaiseException
         with connect() as connection:
             with self.assertRaises(RaiseException):

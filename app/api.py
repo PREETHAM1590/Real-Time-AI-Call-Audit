@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -29,6 +30,7 @@ from app.privacy import redact_text
 from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavailable, export_findings, own_scores, team_report
 from app.retention import request_call_deletion
 from app.operations import operations_summary
+from app.events import EventCursorError, EventCursorExpired, EventForbidden, encode_sse, parse_last_event_id, read_events, reset_required_event
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -239,6 +241,63 @@ def create_app(
             "model_readiness": "unknown",
         }
         return JSONResponse(payload, status_code=200 if database_available else 503)
+
+    @app.get("/v1/events")
+    def event_feed(request: Request, last_event_id: str | None = Header(default=None, alias="Last-Event-ID"), scope: Scope = Depends(get_scope)) -> StreamingResponse:
+        try:
+            cursor = parse_last_event_id(last_event_id)
+        except EventCursorError as error:
+            raise HTTPException(status_code=400, detail="Invalid event cursor") from error
+
+        def load_batch(after: int) -> list[dict]:
+            with connect() as connection:
+                return read_events(connection, scope, after, limit=100)
+
+        reset_event = None
+        try:
+            first_batch = load_batch(cursor)
+        except EventCursorExpired as error:
+            reset_event = reset_required_event(error.latest_sequence)
+            first_batch = []
+        except EventCursorError as error:
+            raise HTTPException(status_code=400, detail="Event cursor is ahead of the stream") from error
+        except EventForbidden as error:
+            raise HTTPException(status_code=403, detail="Event stream access is not permitted") from error
+
+        async def stream():
+            current_cursor = cursor
+            pending = [reset_event] if reset_event is not None else first_batch
+            for envelope in pending:
+                if await request.is_disconnected():
+                    return
+                yield encode_sse(envelope)
+                current_cursor = envelope["sequence"]
+            while True:
+                if await request.is_disconnected():
+                    return
+                try:
+                    batch = await run_in_threadpool(load_batch, current_cursor)
+                except EventCursorExpired as error:
+                    envelope = reset_required_event(error.latest_sequence)
+                    yield encode_sse(envelope)
+                    current_cursor = envelope["sequence"]
+                    continue
+                for envelope in batch:
+                    if await request.is_disconnected():
+                        return
+                    yield encode_sse(envelope)
+                    current_cursor = envelope["sequence"]
+                if not batch:
+                    await asyncio.sleep(1)
+                    if await request.is_disconnected():
+                        return
+                    yield ": keepalive\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/v1/operations/summary")
     def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict[str, int]:

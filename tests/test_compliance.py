@@ -192,7 +192,9 @@ class PolicyPersistenceIntegrationTests(unittest.TestCase):
                 connection.execute("DELETE FROM findings WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
                 connection.execute("DELETE FROM transcript_utterances WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
                 connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM events WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
                 connection.execute("DELETE FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM event_counters WHERE organisation_id=%s", (organisation_id,))
                 connection.execute("DELETE FROM organisations WHERE id=ANY(%s)", ([organisation_id, other_organisation],))
 
         self.addCleanup(cleanup)
