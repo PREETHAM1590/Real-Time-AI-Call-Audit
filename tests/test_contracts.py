@@ -10,9 +10,10 @@ from pydantic import ValidationError
 from unittest.mock import patch, MagicMock
 
 from app.auth import Scope, can_access
-from app.api import create_app
+from app.api import MULTIPART_OVERHEAD_BYTES, UploadBodyLimitMiddleware, create_app
 from app.config import Settings
 from app.contracts import PersistedUtterance, Utterance
+from app.ingest import MAX_AUDIO_BYTES
 
 
 class ContractTests(unittest.TestCase):
@@ -243,3 +244,49 @@ class ApiContractTests(unittest.TestCase):
                 data={"external_ref": "external-off-loop"},
             )
         self.assertEqual(response.status_code, 202)
+
+    def test_oversized_content_length_is_rejected_before_intake(self):
+        with patch("app.api.accept_recording") as accept:
+            response = self.client.post(
+                "/v1/calls",
+                headers={
+                    "Authorization": f"Bearer {self.token()}",
+                    "Idempotency-Key": "request-too-large",
+                    "Content-Length": str(MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES + 1),
+                },
+                content=b"not read",
+            )
+        self.assertEqual(response.status_code, 413)
+        accept.assert_not_called()
+
+    def test_chunked_or_lying_content_length_is_counted_before_parser(self):
+        async def exercise():
+            delivered = 0
+            sent = []
+
+            async def app(_scope, receive, _send):
+                nonlocal delivered
+                while True:
+                    message = await receive()
+                    delivered += len(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        return
+
+            messages = iter((
+                {"type": "http.request", "body": b"123", "more_body": True},
+                {"type": "http.request", "body": b"456", "more_body": False},
+            ))
+
+            async def receive():
+                return next(messages)
+
+            async def send(message):
+                sent.append(message)
+
+            middleware = UploadBodyLimitMiddleware(app, max_bytes=5, concurrent_requests=1)
+            await middleware({"type": "http", "method": "POST", "path": "/v1/calls", "headers": [(b"content-length", b"1")]}, receive, send)
+            return delivered, sent
+
+        delivered, sent = asyncio.run(exercise())
+        self.assertEqual(delivered, 3)
+        self.assertEqual(sent[0]["status"], 413)
