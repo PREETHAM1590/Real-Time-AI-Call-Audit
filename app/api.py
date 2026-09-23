@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import asyncio
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -41,6 +42,9 @@ MAX_DISPOSITION_CONFIG_BYTES = 1024 * 1024
 MAX_REVIEW_BODY_BYTES = 32 * 1024
 # ponytail: this is a per-worker connection cap; use shared admission control if a global cap becomes necessary.
 _EXOTEL_CONNECTIONS = threading.BoundedSemaphore(8)
+EXOTEL_HANDSHAKE_TIMEOUT_SECONDS = 10.0
+EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS = 30.0
+EXOTEL_SESSION_TIMEOUT_SECONDS = 7_230.0
 
 
 class _RequestBodyTooLarge(Exception):
@@ -655,7 +659,7 @@ def create_app(
         if credentials is None:
             return None
         username, password = credentials
-        with connect() as connection:
+        with connect(timeout_seconds=5) as connection:
             row = connection.execute("SELECT organisation_id::text,id::text,account_sid,password_salt,password_verifier FROM exotel_integrations WHERE username=%s AND is_active", (username,)).fetchone()
         # A fixed dummy verifier makes unknown usernames take the same password-check path.
         salt = row[3] if row else bytes(16)
@@ -664,7 +668,7 @@ def create_app(
         return row if row is not None and valid else None
 
     def resolve_exotel_agent(organisation_id: str, integration_id: str, agent_ref: str):
-        with connect() as connection:
+        with connect(timeout_seconds=5) as connection:
             row = connection.execute("SELECT agent_id,team_id FROM exotel_agent_mappings WHERE organisation_id=%s AND integration_id=%s AND agent_ref=%s", (organisation_id, integration_id, agent_ref)).fetchone()
             if row is None:
                 return None
@@ -674,27 +678,39 @@ def create_app(
             return Scope(organisation_id, row[0], "AGENT", frozenset({row[1]}))
 
     def next_exotel_generation(organisation_id: str, integration_id: str, call_key: str) -> int:
-        with connect() as connection:
+        with connect(timeout_seconds=5) as connection:
             row = connection.execute("INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation) VALUES (%s,%s,%s,1) ON CONFLICT (organisation_id,integration_id,call_key) DO UPDATE SET generation=exotel_sessions.generation+1,started_at=now() RETURNING generation", (organisation_id, integration_id, call_key)).fetchone()
         return row[0]
 
     @app.websocket("/v1/exotel/stream")
     async def exotel_stream(websocket: WebSocket) -> None:
-        try:
-            integration = await run_in_threadpool(authenticate_exotel, websocket.headers.get("authorization"))
-        except Exception:
-            integration = None
-        if integration is None:
-            await websocket.close(code=4401)
-            return
         if not _EXOTEL_CONNECTIONS.acquire(blocking=False):
             await websocket.close(code=4429)
             return
-        import tempfile
+        loop = asyncio.get_running_loop()
+        session_deadline = loop.time() + EXOTEL_SESSION_TIMEOUT_SECONDS
+        handshake_deadline = min(session_deadline, loop.time() + EXOTEL_HANDSHAKE_TIMEOUT_SECONDS)
+
+        async def receive_text_before(deadline: float, max_wait: float) -> str:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                return await asyncio.wait_for(websocket.receive_text(), timeout=min(remaining, max_wait))
+            except asyncio.TimeoutError as error:
+                raise TimeoutError from error
+
         try:
+            try:
+                integration = await run_in_threadpool(authenticate_exotel, websocket.headers.get("authorization"))
+            except Exception:
+                integration = None
+            if integration is None:
+                await websocket.close(code=4401)
+                return
             await websocket.accept()
-            connected = await websocket.receive_text()
-            start_raw = await websocket.receive_text()
+            connected = await receive_text_before(handshake_deadline, EXOTEL_HANDSHAKE_TIMEOUT_SECONDS)
+            start_raw = await receive_text_before(handshake_deadline, EXOTEL_HANDSHAKE_TIMEOUT_SECONDS)
             try:
                 preliminary = ExotelSession(account_sid=integration[2], call_sid="pending", generation=1)
                 preliminary.accept(connected, generation=1)
@@ -727,7 +743,7 @@ def create_app(
             expected_timestamp = 0
             with tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024) as spool:
                 while True:
-                    raw = await websocket.receive_text()
+                    raw = await receive_text_before(session_deadline, EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS)
                     try:
                         event = session.accept(raw, generation=generation)
                     except ExotelProtocolError:
@@ -755,14 +771,24 @@ def create_app(
                 spool.seek(0)
                 audio = build_wav(spool.read())
             try:
+                remaining_seconds = session_deadline - loop.time()
+                if remaining_seconds <= 0:
+                    await websocket.close(code=4408)
+                    return
                 await run_in_threadpool(
                     accept_recording, agent_scope, external_ref, audio, {"language": "und"}, idempotency_key,
-                    generation_fence=(integration[1], call_key, generation),
+                    generation_fence=(integration[1], call_key, generation, agent_ref, agent_scope.user_id, next(iter(agent_scope.team_ids))),
+                    timeout_seconds=remaining_seconds,
                 )
             except (IntakeError, ExternalReferenceConflict, IdempotencyConflict):
                 await websocket.close(code=4409)
                 return
             await websocket.close(code=1000)
+        except TimeoutError:
+            try:
+                await websocket.close(code=4408)
+            except Exception:
+                pass
         except WebSocketDisconnect:
             return
         except Exception:

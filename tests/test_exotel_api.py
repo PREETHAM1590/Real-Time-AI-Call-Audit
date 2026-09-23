@@ -1,5 +1,6 @@
 import base64
 import json
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -87,6 +88,18 @@ class ExotelWebSocketTests(unittest.TestCase):
         except WebSocketDisconnect as error:
             return {"type": "websocket.close", "code": error.code}
 
+    def _auth_header(self):
+        return "Basic " + base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+
+    def _send_start(self, ws):
+        ws.send_text(json.dumps({"event": "connected"}))
+        ws.send_text(json.dumps({
+            "event": "start", "sequence_number": 1, "stream_sid": "stream-a",
+            "start": {"stream_sid": "stream-a", "call_sid": "call-a", "account_sid": "acct-a",
+                      "custom_parameters": {"agent_ref": "external-agent"},
+                      "media_format": {"encoding": "raw", "sample_rate": 8000, "channels": 1, "bit_rate": 16}},
+        }))
+
     def test_clean_synthetic_stream_submits_only_scoped_wav_to_intake(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
             result = self._stream()
@@ -98,7 +111,7 @@ class ExotelWebSocketTests(unittest.TestCase):
         self.assertEqual((metadata, len(audio) > 44, external_ref == idempotency_key), ({"language": "und"}, True, True))
         call_key = make_audio_references("org-a", "acct-a", "call-a")[0].partition(":")[2]
         self.assertEqual(self.connection.session_params[2], call_key)
-        self.assertEqual(intake.call_args.kwargs["generation_fence"], ("integration-a", call_key, 4))
+        self.assertEqual(intake.call_args.kwargs["generation_fence"], ("integration-a", call_key, 4, "external-agent", "agent-a", "team-a"))
 
     def test_gap_and_wrong_password_never_submit_audio(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
@@ -108,6 +121,33 @@ class ExotelWebSocketTests(unittest.TestCase):
             result = self._stream(secret="wrong-secret")
             self.assertEqual(result["code"], 4401)
             self.assertEqual(intake.call_count, 0)
+
+    def test_handshake_media_idle_and_total_timeouts_close_sessions(self):
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_HANDSHAKE_TIMEOUT_SECONDS", 0.02):
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self.assertEqual(ws.receive()["code"], 4408)
+
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS", 0.02), patch("app.api.EXOTEL_SESSION_TIMEOUT_SECONDS", 1), patch("app.api.accept_recording") as intake:
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self._send_start(ws)
+                self.assertEqual(ws.receive()["code"], 4408)
+            self.assertEqual(intake.call_count, 0)
+
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS", 1), patch("app.api.EXOTEL_SESSION_TIMEOUT_SECONDS", 0.05), patch("app.api.accept_recording") as intake:
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self._send_start(ws)
+                self.assertEqual(ws.receive()["code"], 4408)
+            self.assertEqual(intake.call_count, 0)
+
+    def test_admission_rejects_before_authentication_work_when_full(self):
+        with patch("app.api._EXOTEL_CONNECTIONS", threading.Semaphore(0)), patch("app.api.connect") as connect:
+            try:
+                with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                    result = ws.receive()
+            except WebSocketDisconnect as error:
+                result = {"type": "websocket.close", "code": error.code}
+            self.assertEqual(result["code"], 4429)
+            connect.assert_not_called()
 
 
 if __name__ == "__main__":
