@@ -13,4 +13,5 @@
   .review-workspace { grid-template-columns: minmax(0, 1fr); }
   .review-rail { position: sticky; top: .5rem; grid-row: 1; max-height: 45vh; overflow-y: auto; z-index: 2; background: #fff; }
   .evidence-column { grid-row: 2; }
+  .transcript-row { scroll-margin-top: calc(45vh + 3.5rem); }
 }

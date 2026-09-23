@@ -3,18 +3,25 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Call audit review</title>
+    <title>Call review · Call Audit</title>
     <link rel="stylesheet" href="/analyst-assets/styles.css">
+    <link rel="stylesheet" href="/analyst-assets/review-fixes.css">
     <script src="/analyst-assets/app.js" defer></script>
   </head>
   <body>
     <header class="topbar">
-      <h1>Call audit review</h1>
-      <p>Review final redacted evidence and record a reasoned decision.</p>
+      <a class="brand" href="/analyst">Call Audit</a>
+      <nav aria-label="Primary navigation" class="primary-nav">
+        <a href="/analyst" aria-current="page">Review</a>
+        <a href="/quality">Quality</a>
+        <a href="/providers">Provider coverage</a>
+      </nav>
+      <a class="upload-link" href="#upload-panel">Manual upload</a>
     </header>
+    <div class="page-intro"><h1>Call review</h1><span>Final redacted evidence · Human decisions stay versioned</span></div>
     <main class="layout">
       <section aria-labelledby="queue-title" class="queue-panel">
-        <section aria-labelledby="upload-title" class="upload-panel">
+        <section id="upload-panel" aria-labelledby="upload-title" class="upload-panel">
           <h2 id="upload-title">Upload a call</h2>
           <p>Manual uploads require an AGENT account with exactly one server-resolved team. QA and administrator accounts cannot upload recordings.</p>
           <form id="call-upload-form" class="upload-form">
@@ -36,8 +43,7 @@
         <ol id="queue-list" class="queue-list"></ol>
       </section>
       <section id="call-panel" aria-labelledby="call-title" class="call-panel" aria-live="polite">
-        <h2 id="call-title" tabindex="-1">Select a call</h2>
-        <p id="call-status" class="status" role="status" aria-live="polite">Choose an item in the review queue.</p>
+        <div class="call-heading"><div><h2 id="call-title" tabindex="-1">Select a call</h2></div><p id="call-status" class="status" role="status" aria-live="polite">Choose an item in the review queue.</p></div>
         <div id="call-detail"></div>
       </section>
     </main>

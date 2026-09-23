@@ -3,15 +3,20 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Quality reports</title>
+    <title>Quality reports · Call Audit</title>
     <link rel="stylesheet" href="/analyst-assets/styles.css">
     <script src="/analyst-assets/quality.js" defer></script>
   </head>
   <body>
     <header class="topbar">
-      <h1>Quality reports</h1>
-      <p>Current reviewed scores and versioned team trends.</p>
+      <a class="brand" href="/analyst">Call Audit</a>
+      <nav aria-label="Primary navigation" class="primary-nav">
+        <a href="/analyst">Review</a>
+        <a href="/quality" aria-current="page">Quality</a>
+        <a href="/providers">Provider coverage</a>
+      </nav>
     </header>
+    <div class="page-intro"><h1>Quality reports</h1><span>Versioned scores and team trends from authorised records</span></div>
     <main class="report-layout">
       <p id="report-status" class="status" role="status" aria-live="polite">Loading your authorised report…</p>
       <section id="own-report" class="block" aria-labelledby="own-title" hidden>

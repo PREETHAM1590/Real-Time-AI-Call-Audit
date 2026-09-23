@@ -397,7 +397,7 @@ class ApiContractTests(unittest.TestCase):
             content=b"{" + b" " * 32768,
         )
         self.assertEqual(oversized.status_code, 413)
-        with patch("app.api.review_queue", return_value=[]):
+        with patch("app.api.connect"), patch("app.api.review_queue", return_value=[]):
             self.assertEqual(self.client.get("/v1/reviews/queue", headers={"Authorization": f"Bearer {self.token(subject='qa-user')}"}).json(), {"items": []})
         with patch("app.api.connect"):
             denied = self.client.get("/v1/reviews/queue", headers={"Authorization": f"Bearer {self.token(subject='agent-user')}"})

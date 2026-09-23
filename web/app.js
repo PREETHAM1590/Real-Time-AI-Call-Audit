@@ -112,7 +112,7 @@ function addEvidenceButton(container, evidence, byUtterance) {
       paragraph.append(element("mark", quote, "selected-evidence"), document.createTextNode(text.slice(start + quote.length)));
     } else paragraph.textContent = text;
     target.focus();
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.scrollIntoView({ behavior: "smooth", block: matchMedia("(max-width: 860px)").matches ? "start" : "center" });
     if (state.audioGranted) {
       const player = byId("call-audio");
       player.currentTime = selected.start_ms / 1000;

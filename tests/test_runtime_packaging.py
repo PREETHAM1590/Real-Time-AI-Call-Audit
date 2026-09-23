@@ -27,6 +27,7 @@ class RuntimePackagingTests(unittest.TestCase):
             while not hasattr(composed, "routes") and hasattr(composed, "app"):
                 composed = composed.app
             self.assertIn("/health", {route.path for route in composed.routes})
+            self.assertIn("/providers", {route.path for route in composed.routes})
             sys.modules.pop("app.main", None)
 
     def test_worker_idle_loop_waits_then_honours_shutdown(self):

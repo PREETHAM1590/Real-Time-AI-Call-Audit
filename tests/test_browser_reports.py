@@ -120,5 +120,8 @@ class QualityReportBrowserTests(unittest.TestCase):
             self.assertIn("project adapter and agent attribution remain unverified", exotel_events.inner_text())
             self.assertTrue(table.get_by_text("Other / custom integration").count())
             self.assertTrue(table.get_by_text("agent-leg coverage and role attribution for this audit remain unverified.").count())
+            myoperator_recording = table.get_by_role("row", name=re.compile("MyOperator")).locator("td").nth(1)
+            self.assertIn("valid for 24 hours", myoperator_recording.inner_text())
+            self.assertIn("account-specific entitlement and runtime behavior remain unverified", myoperator_recording.inner_text())
             page.get_by_role("link", name="Quality", exact=True).click()
             page.get_by_role("heading", name="Quality reports").wait_for()
