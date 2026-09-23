@@ -110,7 +110,9 @@
 
   (async () => {
     try {
-      const rows = await getJson("/v1/me/scores");
+      const response = await getJson("/v1/me/scores");
+      if (!response || !Array.isArray(response.items)) throw new Error("Malformed score report");
+      const rows = response.items;
       renderOwn(rows);
       status.textContent = "Your reviewed scores are loaded.";
     } catch (error) {

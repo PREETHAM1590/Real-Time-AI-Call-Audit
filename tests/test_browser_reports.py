@@ -52,13 +52,13 @@ class QualityReportBrowserTests(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_agent_report_shows_machine_and_reviewed_scores_and_safe_notes(self):
-        data = [{
+        data = {"items": [{
             "call_id": "call-1", "created_at": "2026-09-23T10:00:00+00:00", "processing_state": "NEEDS_REVIEW",
             "team_id": "team-a", "machine_score": 3.1, "machine_decision": "NEEDS_REVIEW", "reviewed_score": 4.0,
             "reviewed_decision": "PASS", "rubric_version": "rubric-v1", "model_artifact": "local-model-v1",
             "checklist": [{"id": "greeting", "status": "SCORED", "machine_score": 3, "reviewed_score": 4, "reason": "Good"}],
             "coaching_notes": [{"kind": "coaching", "text": "[REDACTED] <img src=x onerror=alert(1)>"}],
-        }]
+        }]}
 
         def handle(route):
             route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
@@ -72,6 +72,7 @@ class QualityReportBrowserTests(unittest.TestCase):
             self.assertIn("4", text)
             self.assertIn("[REDACTED]", text)
             self.assertIn("<img src=x onerror=alert(1)>", text)
+            self.assertIn("Your reviewed scores are loaded.", page.locator("#report-status").inner_text())
             self.assertEqual(page.locator("#own-items img").count(), 0)
             self.assertFalse(page.locator("#team-report").is_visible())
 
