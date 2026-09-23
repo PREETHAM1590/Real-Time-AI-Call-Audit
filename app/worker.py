@@ -2,6 +2,8 @@
 
 import os
 import logging
+import math
+import signal
 import socket
 import threading
 import time
@@ -192,7 +194,8 @@ def drain(worker_id: str | None = None, processors: Mapping[str, Processor] | No
     return completed
 
 
-if __name__ == "__main__":
+def build_processors() -> dict[str, Processor]:
+    """Build only locally configured handlers; absent model handlers stay parked."""
     from app.transcription import make_transcription_processor
 
     processors = {}
@@ -214,7 +217,11 @@ if __name__ == "__main__":
         audit_rubric = load_rubric(os.environ["AUDIT_RUBRIC_PATH"], os.environ["AUDIT_RUBRIC_SHA256"])
         audit_prompt = load_pinned_text(os.environ["AUDIT_PROMPT_PATH"], os.environ["AUDIT_PROMPT_SHA256"])
         processors["AUDIT"] = make_audit_processor(LocalVllmAuditAdapter.from_environment(), audit_rubric, audit_prompt, prompt_version=os.environ.get("AUDIT_PROMPT_VERSION", "audit_prompt_v1"))
-    if os.environ.get("FASTER_WHISPER_MODEL_PATH") and os.environ.get("FASTER_WHISPER_MODEL_SHA256") and os.environ.get("FASTER_WHISPER_MODEL_VERSION"):
+    transcription_vars = ("FASTER_WHISPER_MODEL_PATH", "FASTER_WHISPER_MODEL_SHA256", "FASTER_WHISPER_MODEL_VERSION")
+    configured_transcription = any(os.environ.get(name) for name in transcription_vars)
+    if configured_transcription and not all(os.environ.get(name) for name in transcription_vars):
+        raise RuntimeError("All FASTER_WHISPER model path, checksum and version settings are required")
+    if configured_transcription:
         processors["TRANSCRIBE"] = make_transcription_processor(ruleset=policy_ruleset)
     if os.environ.get("DISPOSITION_MODEL_SHA256"):
         from app.local_disposition_adapter import LocalVllmDispositionAdapter
@@ -222,4 +229,42 @@ if __name__ == "__main__":
         # Configuration is deployment-only and requires an immutable artifact digest.
         # Without it, ANALYSE remains parked as WAITING_HANDLER rather than using a fake.
         processors["ANALYSE"] = make_disposition_processor(LocalVllmDispositionAdapter.from_environment())
-    print(f"Drained {drain(processors=processors)} job(s); local model artifacts must be provisioned and pinned before transcription.")
+    return processors
+
+
+def run_forever(
+    worker_id: str,
+    processors: Mapping[str, Processor],
+    *,
+    idle_poll_seconds: float = 1.0,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Poll continuously, sleeping when idle, with a bounded configured interval."""
+    if isinstance(idle_poll_seconds, bool) or not math.isfinite(idle_poll_seconds) or not 0.5 <= idle_poll_seconds <= 10:
+        raise ValueError("idle poll interval must be between 0.5 and 10 seconds")
+    stop_event = stop_event or threading.Event()
+    while not stop_event.is_set():
+        if not run_once(worker_id, processors):
+            stop_event.wait(idle_poll_seconds)
+
+
+def main() -> None:
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
+    processors = build_processors()
+    with connect() as connection:
+        referenced = {row[0] for row in connection.execute("SELECT private_key FROM audio_objects")}
+    # Keep startup orphan cleanup once per process, not on every idle poll.
+    LocalPrivateStorage(os.environ.get("AUDIO_STORAGE_PATH", "./private-audio")).delete_orphans(referenced)
+
+    stop_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    try:
+        idle_poll = float(os.environ.get("WORKER_IDLE_POLL_SECONDS", "1"))
+    except ValueError as error:
+        raise RuntimeError("WORKER_IDLE_POLL_SECONDS must be a number") from error
+    run_forever(worker_id, processors, idle_poll_seconds=idle_poll, stop_event=stop_event)
+
+
+if __name__ == "__main__":
+    main()

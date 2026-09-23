@@ -4,6 +4,7 @@ services:
     environment:
       POSTGRES_DB: call_audit
       POSTGRES_USER: call_audit
+      # Disposable local development only. Never reuse this credential outside the local Compose database.
       POSTGRES_PASSWORD: local-development-only
     ports:
       - "127.0.0.1:5432:5432"

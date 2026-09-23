@@ -1,6 +1,6 @@
 # Operations, evaluation and rollout
 
-Status: proposed procedures. Commands and application paths below become runnable during implementation; no deployed service currently exists.
+Status: implementation is in progress; nothing is deployed. The locked Python runtime, API and worker entrypoints, and non-root backend Docker image exist. Local PostgreSQL is the only Compose service; there is no API/worker deployment stack or CI workflow. Model artifacts, identity secrets and database credentials remain operator-provided inputs.
 
 ## Environments and configuration
 
@@ -12,25 +12,24 @@ Current settings: `DATABASE_URL`, `AUDIO_STORAGE_PATH`, `FFPROBE`, `OIDC_ISSUER`
 
 Production must fail startup when identity, encryption/storage, retention or pinned local model paths/checksums are missing. Set per-model concurrency, GPU memory and queue limits; reject or defer new work visibly when capacity is exhausted. Inference services must not download weights or send call data to external AI endpoints at runtime. The current decoder has size, duration, timeout and concurrency bounds but lacks OS-enforced CPU and memory limits; this blocks all real-data and production use until isolated-process limits and a resource-exhaustion test are in place. Policy evaluation is available through a locally pinned ruleset: set both `POLICY_RULESET_PATH` (absolute path) and `POLICY_RULESET_SHA256`; an incomplete pair fails worker startup, and without a configured ruleset the POLICY job remains parked. Current uploads do not provide trusted agent-connection, hold, completion or call-type context, so the stored safe defaults leave timed findings `UNKNOWN`. Integrate and qualify an authenticated telephony context source before relying on opening/closing policy results; never infer reliable timing from uploaded audio or caller-supplied fields.
 
-Planned developer workflow:
+Local developer workflow:
 
-The commands below are the target developer workflow, not a claim that the full application can start today. The current project defines the `[test]` extra and `compose.yaml` provides local PostgreSQL. The API composition module (`app.main:app`) will be added with deployment packaging, so the final `uvicorn` command is not available yet. Do not use an application database for integration tests; set `DATABASE_URL` to a disposable database whose name ends in `_test`.
+The committed `uv.lock` pins the resolved Python dependencies. Copy `.env.example` to `.env`, then replace all example identity keys/secrets and set an allowed local origin before starting the API. These are local development instructions; do not use the Compose database for integration tests. Integration tests require a separate disposable database whose name ends in `_test`.
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[test]"
+uv sync --extra test
 docker compose up -d postgres
-python -m app.migrate
-python -m unittest discover -s tests -v
-python -m uvicorn app.main:app --reload
+uv run python -m app.migrate
+# For integration tests, point DATABASE_URL at a separate database ending in _test.
+uv run python -m unittest discover -s tests -v
+uv run uvicorn app.main:app --reload
 # Separate terminals:
-python -m app.worker
-npm --prefix web ci
-npm --prefix web run dev
+uv run python -m app.worker
 ```
 
-Task 1 establishes the package; Task 2 establishes migrations and durable intake/jobs; Tasks 3A and 6 establish disposition and the browser workflow. Lock dependencies and document exact versions as part of those tasks. `AGENTS.md` and the implementation plan define the current task order; proposed commands are not claims that unimplemented stages exist.
+The worker polls with an idle interval from 0.5 to 10 seconds (`WORKER_IDLE_POLL_SECONDS`, default 1 second), handles SIGINT/SIGTERM, and leaves stages parked when their local model/ruleset handler is not configured. No model artifacts are downloaded at startup. `compose.yaml` contains only local PostgreSQL and its fixed `local-development-only` password is strictly for disposable development; never reuse it outside that context.
+
+The Dockerfile builds one backend image with the locked base, transcription and privacy dependencies, includes `ffmpeg`, and runs as UID/GID 10001. It contains no model weights or secrets. Build it locally with `docker build -t call-audit:local .`; provide validated identity settings, database URL, storage mount and pinned local artifacts at runtime. The image's default command starts the API; run the worker from the same image with `docker run ... call-audit:local python -m app.worker`. This repository does not yet define Compose API/worker/migration services or CI, and a successful image build is packaging evidence only—not deployment, model readiness, or production qualification. The browser page is served by FastAPI; no npm build/dev command applies.
 
 ## Release validation
 
