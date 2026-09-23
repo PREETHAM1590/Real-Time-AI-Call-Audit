@@ -1,5 +1,8 @@
 import io
 import os
+import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 import wave
@@ -7,10 +10,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
+from unittest.mock import patch
 
 from app.auth import Scope
 from app.db import connect
-from app.ingest import IdempotencyConflict, IntakeError, accept_recording, claim_job, finish_job, inspect_audio
+from app.ingest import IdempotencyConflict, IntakeError, accept_recording, claim_job, defer_job, finish_job, inspect_audio, renew_job
 from app.migrate import migrate
 from app.storage import LocalPrivateStorage
 
@@ -33,6 +37,46 @@ class AudioValidationTests(unittest.TestCase):
         with self.assertRaises(IntakeError):
             inspect_audio(b"RIFF" + b"not an audio file")
 
+    @patch("app.ingest.subprocess.run")
+    def test_mp3_probe_uses_closed_temp_file_and_cleans_it(self, run):
+        def fake_run(args, **kwargs):
+            self.assertNotIn("shell", kwargs)
+            self.assertTrue(Path(args[args.index("-i") + 1] if "-i" in args else args[-1]).exists())
+            if "-count_frames" in args:
+                return subprocess.CompletedProcess(args, 0, json.dumps({"streams": [{"sample_rate": "16000", "channels": 1, "nb_read_frames": "28"}], "format": {"duration": "1.0"}}).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        run.side_effect = fake_run
+        before = set(Path(tempfile.gettempdir()).glob("tmp*.mp3"))
+        self.assertEqual(inspect_audio(b"ID3" + b"synthetic"), ("mp3", 16000, 1, 1000))
+        args = run.call_args_list
+        temp_path = args[0].args[0][-1]
+        self.assertEqual(len(args), 2)
+        self.assertFalse(Path(temp_path).exists())
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("tmp*.mp3")), before)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for full-decode truncation check")
+    def test_mp3_truncation_is_rejected_by_full_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory, "synthetic.mp3")
+            subprocess.run([shutil.which("ffmpeg"), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-codec:a", "libmp3lame", "-y", str(audio_path)], check=True, capture_output=True)
+            audio = audio_path.read_bytes()
+        self.assertGreater(inspect_audio(audio)[3], 0)
+        for proportion in (0.9, 0.75, 0.5):
+            with self.subTest(proportion=proportion), self.assertRaises(IntakeError):
+                inspect_audio(audio[:int(len(audio) * proportion)])
+
+    def test_intake_requires_agent_identity_and_resolved_team(self):
+        data = wav_fixture()
+        for scope in (
+            Scope("org-a", "agent-a", "AGENT", frozenset()),
+            Scope("org-a", "", "AGENT", frozenset({"team-a"})),
+            Scope("org-a", "agent-a", "AGENT", frozenset({" "})),
+            Scope("org-a", "staff-a", "QA_ANALYST", frozenset({"team-a"})),
+        ):
+            with self.subTest(scope=scope), self.assertRaises(IntakeError):
+                accept_recording(scope, "external", data, {}, "idem")
+
 
 @unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
 class PostgresIngestTests(unittest.TestCase):
@@ -44,7 +88,7 @@ class PostgresIngestTests(unittest.TestCase):
             raise RuntimeError("Refusing integration tests unless DATABASE_URL database name ends in _test")
         migrate()
         self.organisation_id, self.call_id = uuid4(), uuid4()
-        self.scope = Scope(str(self.organisation_id), "agent-test", "AGENT", frozenset())
+        self.scope = Scope(str(self.organisation_id), "agent-test", "AGENT", frozenset({"team-test"}))
         self.storage_dir = tempfile.TemporaryDirectory()
         self.storage = LocalPrivateStorage(self.storage_dir.name)
         with connect() as connection:
@@ -75,15 +119,26 @@ class PostgresIngestTests(unittest.TestCase):
         with self.assertRaises(IdempotencyConflict):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
         with connect() as connection_a, connect() as connection_b:
-            one = claim_job(connection_a, "worker-a")
+            self.assertIsNone(claim_job(connection_a, "worker-a", supported_stages=()))
+            one = claim_job(connection_a, "worker-a", supported_stages=("TRANSCRIBE",))
             self.assertIsNotNone(one)
-            self.assertIsNone(claim_job(connection_b, "worker-b"))
-            connection_a.execute("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE organisation_id=%s AND id=%s", (self.organisation_id, one["id"]))
-            two = claim_job(connection_b, "worker-b")
+            self.assertTrue(renew_job(connection_a, str(one["id"]), str(one["lease_token"])))
+            self.assertTrue(defer_job(connection_a, str(one["id"]), str(one["lease_token"])))
+            connection_a.commit()
+            self.assertIsNone(claim_job(connection_b, "worker-b", supported_stages=("ANALYSE",)))
+            connection_b.commit()
+            self.assertIsNone(claim_job(connection_b, "worker-b", supported_stages=()))
+            two = claim_job(connection_b, "worker-b", supported_stages=("TRANSCRIBE",))
             self.assertEqual(one["id"], two["id"])
             self.assertFalse(finish_job(connection_a, str(one["id"]), str(one["lease_token"]), {}))
-            connection_b.execute("UPDATE calls SET tombstoned_at=now() WHERE organisation_id=%s AND id=%s", (self.organisation_id, first["id"]))
+            connection_a.execute("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE organisation_id=%s AND id=%s", (self.organisation_id, one["id"]))
+            connection_a.commit()
+            three = claim_job(connection_a, "worker-a", supported_stages=("TRANSCRIBE",))
+            self.assertEqual(one["id"], three["id"])
             self.assertFalse(finish_job(connection_b, str(two["id"]), str(two["lease_token"]), {}))
+            connection_b.execute("UPDATE calls SET tombstoned_at=now() WHERE organisation_id=%s AND id=%s", (self.organisation_id, first["id"]))
+            connection_b.commit()
+            self.assertFalse(finish_job(connection_a, str(three["id"]), str(three["lease_token"]), {}))
 
     def test_tombstone_does_not_starve_next_job(self):
         one = accept_recording(self.scope, "ext-1", wav_fixture(), {}, "idem-1", storage=self.storage)

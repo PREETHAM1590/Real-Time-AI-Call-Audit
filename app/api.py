@@ -19,7 +19,7 @@ def create_app(
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
     )
     resolve_identity = identity_lookup or (lambda _subject: None)
     get_scope = scope_dependency(settings, resolve_identity)

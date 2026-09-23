@@ -213,3 +213,15 @@ class ApiContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_upload_preflight_allows_idempotency_header(self):
+        response = self.client.options(
+            "/v1/calls",
+            headers={
+                "Origin": "https://audit.example.test",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type,idempotency-key",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("idempotency-key", response.headers["access-control-allow-headers"].lower())

@@ -14,6 +14,7 @@ from app.storage import LocalPrivateStorage
 
 MAX_AUDIO_BYTES = 250 * 1024 * 1024
 MAX_DURATION_MS = 120 * 60 * 1000
+MAX_JOB_ATTEMPTS = 5
 
 
 class IntakeError(ValueError):
@@ -40,24 +41,42 @@ def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
         except (wave.Error, EOFError) as error:
             raise IntakeError("Invalid WAV data") from error
     if audio.startswith(b"ID3") or (len(audio) > 1 and audio[0] == 0xff and audio[1] & 0xe0 == 0xe0):
-        # ffprobe receives a private temporary file, never a shell command or user path.
-        with tempfile.NamedTemporaryFile(suffix=".mp3") as source:
-            source.write(audio)
-            source.flush()
-            try:
-                result = subprocess.run([os.environ.get("FFPROBE", "ffprobe"), "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate,channels:format=duration", "-of", "json", source.name], capture_output=True, timeout=5, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                metadata = json.loads(result.stdout)
-                stream = metadata["streams"][0]
-                rate, channels, duration = int(stream["sample_rate"]), int(stream["channels"]), round(float(metadata["format"]["duration"]) * 1000)
-            except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, json.JSONDecodeError) as error:
-                raise IntakeError("Invalid MP3 data") from error
+        # Close before child processes for Windows; never pass upload-derived paths or shell text.
+        source_name = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as source:
+                source_name = source.name
+                source.write(audio)
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run([os.environ.get("FFPROBE", "ffprobe"), "-v", "error", "-select_streams", "a:0", "-count_frames", "-show_entries", "stream=sample_rate,channels,nb_read_frames:format=duration", "-of", "json", source_name], capture_output=True, timeout=30, check=True, creationflags=flags)
+            metadata = json.loads(result.stdout)
+            stream = metadata["streams"][0]
+            rate, channels, duration = int(stream["sample_rate"]), int(stream["channels"]), round(float(metadata["format"]["duration"]) * 1000)
             if not 0 < channels <= 2 or rate <= 0 or duration <= 0 or duration > MAX_DURATION_MS:
                 raise IntakeError("Unsupported MP3 properties")
+            frame_samples = 1152 if rate > 24000 else 576
+            expected_frames = (duration * rate + frame_samples * 1000 - 1) // (frame_samples * 1000)
+            if int(stream["nb_read_frames"]) + 2 < expected_frames:
+                raise IntakeError("Truncated MP3 data")
+            decode_timeout = min(MAX_DURATION_MS // 1000, max(30, duration // 1000 * 3 + 10))
+            subprocess.run([os.environ.get("FFMPEG", "ffmpeg"), "-nostdin", "-v", "error", "-xerror", "-i", source_name, "-f", "null", "-"], capture_output=True, timeout=decode_timeout, check=True, creationflags=flags)
             return "mp3", rate, channels, duration
+        except IntakeError:
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, json.JSONDecodeError) as error:
+            raise IntakeError("Invalid MP3 data") from error
+        finally:
+            if source_name is not None:
+                try:
+                    os.unlink(source_name)
+                except FileNotFoundError:
+                    pass
     raise IntakeError("Unsupported audio format")
 
 
 def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: dict, idempotency_key: str, *, storage: LocalPrivateStorage | None = None) -> dict:
+    if scope.role != "AGENT" or not scope.organisation_id.strip() or not scope.user_id.strip() or len(scope.team_ids) != 1 or not next(iter(scope.team_ids)).strip():
+        raise IntakeError("Recording intake requires an agent identity and one server-resolved team")
     if not idempotency_key or len(idempotency_key) > 200 or not external_ref or len(external_ref) > 300:
         raise IntakeError("Invalid idempotency key or external reference")
     codec, rate, channels, duration = inspect_audio(audio)
@@ -89,11 +108,18 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
     return {"id": str(call_id), "processing_state": "QUEUED"}
 
 
-def claim_job(connection, worker_id: str, lease_seconds: int = 60) -> dict | None:
+def claim_job(connection, worker_id: str, lease_seconds: int = 60, supported_stages=None) -> dict | None:
     if not worker_id or not 1 <= lease_seconds <= 3600:
         raise ValueError("invalid worker lease")
+    if supported_stages is not None and not supported_stages:
+        return None
+    stage_filter = "AND j.stage=ANY(%s)" if supported_stages is not None else ""
+    params = (MAX_JOB_ATTEMPTS, list(supported_stages), uuid4(), lease_seconds) if supported_stages is not None else (MAX_JOB_ATTEMPTS, uuid4(), lease_seconds)
     with connection.transaction():
-        row = connection.execute("WITH selected AS (SELECT j.organisation_id,j.id FROM jobs j JOIN calls c ON c.organisation_id=j.organisation_id AND c.id=j.call_id WHERE c.tombstoned_at IS NULL AND ((j.state='QUEUED' AND j.available_at<=now()) OR (j.state='RUNNING' AND j.lease_until<now())) ORDER BY j.available_at,j.id LIMIT 1 FOR UPDATE OF j,c SKIP LOCKED) UPDATE jobs j SET state='RUNNING',lease_token=%s,lease_until=now()+make_interval(secs=>%s),attempts=attempts+1 FROM selected s WHERE j.organisation_id=s.organisation_id AND j.id=s.id RETURNING j.*", (uuid4(), lease_seconds)).fetchone()
+        connection.execute("UPDATE jobs SET state='FAILED',lease_token=NULL,lease_until=NULL,last_error_code='RETRIES_EXHAUSTED' WHERE state='RUNNING' AND attempts >= %s AND lease_until < now()", (MAX_JOB_ATTEMPTS,))
+        connection.execute("UPDATE calls c SET processing_state='FAILED' FROM jobs j WHERE j.organisation_id=c.organisation_id AND j.call_id=c.id AND j.state='FAILED' AND j.last_error_code='RETRIES_EXHAUSTED' AND c.tombstoned_at IS NULL")
+        query = f"WITH selected AS (SELECT j.organisation_id,j.id FROM jobs j JOIN calls c ON c.organisation_id=j.organisation_id AND c.id=j.call_id WHERE c.tombstoned_at IS NULL AND j.attempts < %s {stage_filter} AND ((j.state IN ('QUEUED','WAITING_HANDLER','RETRY_WAIT') AND j.available_at<=now()) OR (j.state='RUNNING' AND j.lease_until<now())) ORDER BY j.available_at,j.id LIMIT 1 FOR UPDATE OF j,c SKIP LOCKED) UPDATE jobs j SET state='RUNNING',lease_token=%s,lease_until=now()+make_interval(secs=>%s),attempts=attempts+1 FROM selected s WHERE j.organisation_id=s.organisation_id AND j.id=s.id RETURNING j.*"
+        row = connection.execute(query, params).fetchone()
     if row is None:
         return None
     columns = [item.name for item in connection.execute("SELECT * FROM jobs LIMIT 0").description]
@@ -109,4 +135,35 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
         if changed == 1:
             state = result.get("processing_state", "NEEDS_REVIEW")
             connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
+    return changed == 1
+
+
+def defer_job(connection, job_id: str, lease_token: str) -> bool:
+    """Park work until its processor is installed; do not consume retry attempts."""
+    with connection.transaction():
+        changed = connection.execute("UPDATE jobs SET state='WAITING_HANDLER',lease_token=NULL,lease_until=NULL WHERE id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (job_id, lease_token)).rowcount
+    return changed == 1
+
+
+def retry_job(connection, job_id: str, lease_token: str, *, max_attempts: int = MAX_JOB_ATTEMPTS) -> bool:
+    """Retry failures with capped exponential delay, then fail the call safely."""
+    with connection.transaction():
+        locked = connection.execute("SELECT organisation_id,call_id,attempts FROM jobs WHERE id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now() FOR UPDATE", (job_id, lease_token)).fetchone()
+        if locked is None:
+            return False
+        if locked[2] >= max_attempts:
+            connection.execute("UPDATE jobs SET state='FAILED',lease_token=NULL,lease_until=NULL,last_error_code='PROCESSOR_FAILED' WHERE organisation_id=%s AND id=%s", (locked[0], job_id))
+            connection.execute("UPDATE calls SET processing_state='FAILED' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+        else:
+            delay = min(300, 2 ** max(0, locked[2] - 1))
+            connection.execute("UPDATE jobs SET state='RETRY_WAIT',available_at=now()+make_interval(secs=>%s),lease_token=NULL,lease_until=NULL,last_error_code='PROCESSOR_FAILED' WHERE organisation_id=%s AND id=%s", (delay, locked[0], job_id))
+            connection.execute("UPDATE calls SET processing_state='RETRY_WAIT' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+    return True
+
+
+def renew_job(connection, job_id: str, lease_token: str, lease_seconds: int = 60) -> bool:
+    if not 1 <= lease_seconds <= 3600:
+        raise ValueError("invalid worker lease")
+    with connection.transaction():
+        changed = connection.execute("UPDATE jobs SET lease_until=now()+make_interval(secs=>%s) WHERE id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (lease_seconds, job_id, lease_token)).rowcount
     return changed == 1

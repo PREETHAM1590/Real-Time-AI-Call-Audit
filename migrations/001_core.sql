@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   call_id uuid NOT NULL,
   stage text NOT NULL,
   input_revision integer NOT NULL DEFAULT 1,
-  state text NOT NULL CHECK (state IN ('QUEUED','RUNNING','DONE','RETRY_WAIT','FAILED')),
+  state text NOT NULL CHECK (state IN ('QUEUED','RUNNING','WAITING_HANDLER','DONE','RETRY_WAIT','FAILED')),
   attempts integer NOT NULL DEFAULT 0,
   available_at timestamptz NOT NULL DEFAULT now(),
   lease_token uuid,
