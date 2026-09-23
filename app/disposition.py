@@ -193,7 +193,11 @@ def _group_speaker_turns(utterances: list[dict[str, Any]]) -> list[dict[str, Any
     """Group adjacent redacted segments from the same known speaker; never split that turn."""
     turns: list[dict[str, Any]] = []
     for item in utterances:
-        speaker = item.get("speaker_id", item["role"])
+        speaker = item.get("speaker_id")
+        if not isinstance(speaker, str) or not speaker:
+            # Missing speaker identity is not evidence that two same-role
+            # segments came from one person; keep each segment independent.
+            speaker = f"unidentified:{item['id']}"
         if turns and turns[-1]["role"] == item["role"] and turns[-1]["speaker_id"] == speaker:
             turns[-1]["utterance_ids"].append(str(item["id"]))
             turns[-1]["end_ms"] = max(turns[-1]["end_ms"], item["end_ms"])
@@ -217,8 +221,12 @@ def _windows(turns: list[dict[str, Any]], context_limit: int, window_limit: int,
         if current and chars + size > window_limit:
             windows.append(current)
             if len(windows) >= max_chunks: return None
+            # Retained overlap consumes the same per-request character budget.
+            # Trim oldest overlap turns until the next whole turn fits.
             current = current[-overlap:] if overlap else []
             chars = sum(len(t["text_redacted"]) for t in current)
+            while current and chars + size > window_limit:
+                chars -= len(current.pop(0)["text_redacted"])
         current.append(turn); chars += size
     if current: windows.append(current)
     if len(windows) > max_chunks: return None

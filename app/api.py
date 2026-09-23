@@ -198,8 +198,8 @@ def create_app(
     def list_disposition_configs(scope: Scope = Depends(get_scope)) -> dict:
         require_admin(scope)
         with connect() as connection:
-            rows = connection.execute("SELECT v.config_id,v.use_case_id,v.version,v.content_hash,v.schema_version,v.created_by,v.created_at,a.version,a.generation,EXISTS (SELECT 1 FROM disposition_config_events e WHERE e.organisation_id=v.organisation_id AND e.config_id=v.config_id AND e.version=v.version AND e.action IN ('ACTIVATED','ROLLBACK')) FROM disposition_config_versions v LEFT JOIN active_disposition_configs a ON a.organisation_id=v.organisation_id AND a.config_id=v.config_id WHERE v.organisation_id=%s ORDER BY v.config_id,v.version", (scope.organisation_id,)).fetchall()
-        return {"versions": [{"config_id": r[0], "use_case_id": r[1], "version": r[2], "content_hash": r[3].strip(), "schema_version": r[4], "created_by": r[5], "created_at": r[6].isoformat(), "active": r[7] == r[2], "status": "ACTIVE" if r[7] == r[2] else ("RETIRED" if r[9] else "STAGED"), "active_generation": r[8]} for r in rows]}
+            rows = connection.execute("SELECT v.config_id,v.use_case_id,v.version,v.content_hash,v.schema_version,v.created_by,v.created_at,a.version,a.generation,EXISTS (SELECT 1 FROM disposition_config_events e WHERE e.organisation_id=v.organisation_id AND e.config_id=v.config_id AND e.version=v.version AND e.action IN ('ACTIVATED','ROLLBACK')), (SELECT e.actor_id FROM disposition_config_events e WHERE e.organisation_id=v.organisation_id AND e.config_id=v.config_id AND e.version=v.version AND e.action='APPROVED' AND e.actor_id<>v.created_by ORDER BY e.created_at LIMIT 1) FROM disposition_config_versions v LEFT JOIN active_disposition_configs a ON a.organisation_id=v.organisation_id AND a.config_id=v.config_id WHERE v.organisation_id=%s ORDER BY v.config_id,v.version", (scope.organisation_id,)).fetchall()
+        return {"versions": [{"config_id": r[0], "use_case_id": r[1], "version": r[2], "content_hash": r[3].strip(), "schema_version": r[4], "created_by": r[5], "created_at": r[6].isoformat(), "active": r[7] == r[2], "status": "ACTIVE" if r[7] == r[2] else ("RETIRED" if r[9] else ("APPROVED" if r[10] else "STAGED")), "approved_by": r[10], "active_generation": r[8]} for r in rows]}
 
     @app.post("/v1/disposition-configs/validate")
     def validate_disposition_config(raw: dict = Body(...), scope: Scope = Depends(get_scope)) -> dict:
@@ -226,6 +226,25 @@ def create_app(
             raise HTTPException(status_code=409, detail="Configuration version already exists or conflicts") from error
         return {"config_id": compiled.config_id, "use_case_id": compiled.use_case_id, "version": compiled.version, "content_hash": compiled.content_hash, "status": "STAGED"}
 
+    @app.post("/v1/disposition-configs/{config_id}/versions/{version}/approve")
+    def approve_disposition_config(config_id: str, version: int, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        reason = body.get("reason")
+        if set(body) != {"reason"} or not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise HTTPException(status_code=422, detail="A bounded approval reason is required")
+        with connect() as connection:
+            with connection.transaction():
+                row = connection.execute("SELECT created_by FROM disposition_config_versions WHERE organisation_id=%s AND config_id=%s AND version=%s", (scope.organisation_id, config_id, version)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404)
+                if row[0] == scope.user_id:
+                    raise HTTPException(status_code=403, detail="A different administrator must approve this version")
+                existing = connection.execute("SELECT 1 FROM disposition_config_events WHERE organisation_id=%s AND config_id=%s AND version=%s AND action='APPROVED' AND actor_id<>%s LIMIT 1", (scope.organisation_id, config_id, version, row[0])).fetchone()
+                if existing:
+                    raise HTTPException(status_code=409, detail="Configuration version is already approved")
+                write_config_event(connection, scope, "APPROVED", config_id, version, reason=reason.strip(), request_id=request.headers.get("X-Request-ID") if request else None)
+        return {"config_id": config_id, "version": version, "approved_by": scope.user_id, "status": "APPROVED"}
+
     @app.post("/v1/disposition-configs/{config_id}/versions/{version}/activate")
     def activate_disposition_config(config_id: str, version: int, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
         require_admin(scope)
@@ -235,8 +254,10 @@ def create_app(
         with connect() as connection:
             with connection.transaction():
                 connection.execute("SELECT id FROM organisations WHERE id=%s FOR UPDATE", (scope.organisation_id,))
-                config = connection.execute("SELECT 1 FROM disposition_config_versions WHERE organisation_id=%s AND config_id=%s AND version=%s", (scope.organisation_id, config_id, version)).fetchone()
+                config = connection.execute("SELECT created_by FROM disposition_config_versions WHERE organisation_id=%s AND config_id=%s AND version=%s", (scope.organisation_id, config_id, version)).fetchone()
                 if config is None: raise HTTPException(status_code=404)
+                approval = connection.execute("SELECT actor_id FROM disposition_config_events WHERE organisation_id=%s AND config_id=%s AND version=%s AND action='APPROVED' AND actor_id<>%s ORDER BY created_at LIMIT 1", (scope.organisation_id, config_id, version, config[0])).fetchone()
+                if approval is None: raise HTTPException(status_code=409, detail="Configuration version requires approval by a different administrator")
                 current = connection.execute("SELECT config_id,version,generation FROM active_disposition_configs WHERE organisation_id=%s FOR UPDATE", (scope.organisation_id,)).fetchone()
                 actual = current[2] if current else 0
                 if actual != expected: raise HTTPException(status_code=409, detail="Active configuration changed")
@@ -275,8 +296,8 @@ def create_app(
         with connect() as connection:
             with connection.transaction():
                 connection.execute("SELECT id FROM organisations WHERE id=%s FOR UPDATE", (scope.organisation_id,))
-                prior = connection.execute("SELECT 1 FROM disposition_config_events WHERE organisation_id=%s AND config_id=%s AND version=%s AND action IN ('ACTIVATED','ROLLBACK') LIMIT 1", (scope.organisation_id, config_id, target_version)).fetchone()
-                if prior is None: raise HTTPException(status_code=409, detail="Rollback target was never active")
+                prior = connection.execute("SELECT 1 FROM disposition_config_events e JOIN disposition_config_versions v ON v.organisation_id=e.organisation_id AND v.config_id=e.config_id AND v.version=e.version WHERE e.organisation_id=%s AND e.config_id=%s AND e.version=%s AND e.action IN ('ACTIVATED','ROLLBACK') AND EXISTS (SELECT 1 FROM disposition_config_events approved WHERE approved.organisation_id=e.organisation_id AND approved.config_id=e.config_id AND approved.version=e.version AND approved.action='APPROVED' AND approved.actor_id<>v.created_by) LIMIT 1", (scope.organisation_id, config_id, target_version)).fetchone()
+                if prior is None: raise HTTPException(status_code=409, detail="Rollback target must be previously active and independently approved")
                 current = connection.execute("SELECT config_id,version,generation FROM active_disposition_configs WHERE organisation_id=%s FOR UPDATE", (scope.organisation_id,)).fetchone()
                 if current is None or current[2] != expected: raise HTTPException(status_code=409, detail="Active configuration changed")
                 generation = expected + 1

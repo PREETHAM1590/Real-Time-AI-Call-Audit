@@ -93,6 +93,28 @@ class DispositionUnitTests(unittest.TestCase):
         config["resolver"]["rules"][0]["when"]["all"][0]["value"] = "not-a-number"
         with self.assertRaises(ConfigError):
             compile_disposition_config(config)
+
+    def test_compiler_bounds_config_size_depth_types_and_persisted_integer_ranges(self):
+        config = sample_config(); config["questions"]["committed"]["criteria"] = ["wrong-container"]
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["version"] = 2**31
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["version"] = 10**1000
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["resolver"]["rules"][0]["when"]["all"][0]["value"] = 10**1000
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["resolver"]["rules"][0]["when"]["all"][0]["value"] = 1e308
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["front_gates"][0]["source"] = ["telephony_status"]
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["confidence"]["per_code"] = []
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["identity"]["unexpected"] = {"nested": []}
+        cursor = config["identity"]["unexpected"]
+        for _ in range(20): cursor["nested"] = {"nested": []}; cursor = cursor["nested"]
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
+        config = sample_config(); config["identity"]["display_name"] = "x" * (256 * 1024)
+        with self.assertRaises(ConfigError): compile_disposition_config(config)
         config = sample_config()
         config["resolver"]["rules"][1]["when"]["all"][0]["value"] = "NOT_A_CHOICE"
         with self.assertRaises(ConfigError):
@@ -161,19 +183,34 @@ class DispositionUnitTests(unittest.TestCase):
         two_turns = [dict(self.turns[0], id=f"large{i}", role="CUSTOMER" if i % 2 == 0 else "AGENT", speaker_id=f"speaker-{i % 2}", text_redacted="x" * 700, start_ms=i * 800, end_ms=i * 800 + 700) for i in range(2)]
         self.assertEqual(classify_disposition(two_turns, {}, FakeAdapter(), config).review_reason, "CONTEXT_LIMIT")
 
+    def test_overlap_is_counted_inside_each_window_character_ceiling(self):
+        raw = sample_config(); raw["runtime"].update({"context_limit_chars": 2000, "window_chars": 800, "overlap_turns": 1, "max_chunks": 4})
+        config = compile_disposition_config(raw)
+        turns = [dict(self.turns[0], id=f"o{i}", role="CUSTOMER" if i % 2 == 0 else "AGENT", speaker_id=f"speaker-{i}", text_redacted="x" * size, start_ms=i * 1000, end_ms=i * 1000 + size) for i, size in enumerate((300, 500, 500))]
+        adapter = FakeAdapter()
+        result = classify_disposition(turns, {}, adapter, config)
+        self.assertEqual(result.status, "RESOLVED")
+        for _, window in adapter.seen:
+            self.assertLessEqual(sum(len(turn["text_redacted"]) for turn in window), config.window_chars)
+
     def test_adjacent_utterances_from_one_speaker_are_never_split(self):
         raw = sample_config(); raw["runtime"].update({"context_limit_chars": 1000, "window_chars": 800, "overlap_turns": 0, "max_chunks": 4})
         config = compile_disposition_config(raw)
         turns = [
             {"id": "agent-a", "role": "AGENT", "speaker_id": "channel-agent", "start_ms": 0, "end_ms": 10, "text_redacted": "A" * 260, "is_final": True},
             {"id": "agent-b", "role": "AGENT", "speaker_id": "channel-agent", "start_ms": 11, "end_ms": 20, "text_redacted": "B" * 260, "is_final": True},
-            {"id": "customer-a", "role": "CUSTOMER", "speaker_id": "channel-customer", "start_ms": 21, "end_ms": 30, "text_redacted": "A response.", "is_final": True},
+            {"id": "agent-c", "role": "AGENT", "speaker_id": "channel-agent-2", "start_ms": 21, "end_ms": 30, "text_redacted": "Different speaker.", "is_final": True},
+            {"id": "customer-a", "role": "CUSTOMER", "speaker_id": "channel-customer", "start_ms": 31, "end_ms": 40, "text_redacted": "A response.", "is_final": True},
         ]
         adapter = FakeAdapter()
         result = classify_disposition(turns, {}, adapter, config)
         self.assertEqual(result.status, "RESOLVED")
-        self.assertEqual(len(adapter.seen[0][1]), 2)
+        self.assertEqual(len(adapter.seen[0][1]), 3)
         self.assertEqual(adapter.seen[0][1][0]["utterance_ids"], ["agent-a", "agent-b"])
+        self.assertEqual(adapter.seen[0][1][1]["speaker_id"], "channel-agent-2")
+        missing_ids = [dict(turn, speaker_id=None) for turn in turns[:2]]
+        self.assertEqual(len(classify_disposition(missing_ids, {}, adapter := FakeAdapter(), config).signals), 2)
+        self.assertEqual([turn["utterance_ids"] for turn in adapter.seen[0][1]], [["agent-a"], ["agent-b"]])
         raw["runtime"]["window_chars"] = 500
         result = classify_disposition(turns, {}, FakeAdapter(), compile_disposition_config(raw))
         self.assertEqual(result.review_reason, "CONTEXT_LIMIT")
@@ -187,10 +224,11 @@ class DispositionUnitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 LocalVllmDispositionAdapter(artifact_version=f"sha256:{digest}", artifact_path=directory, base_url="https://models.example/v1")
             response_body = {"choices": [{"message": {"content": json.dumps({"signals": "local"})}}]}
+            server_root = {"value": directory}
 
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):
-                    payload = b'{"data":[{"id":"disposition-local"}]}'
+                    payload = json.dumps({"data": [{"id": "disposition-local", "root": server_root["value"]}]}).encode()
                     self.send_response(200); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
                 def do_POST(self):
                     self.rfile.read(int(self.headers["Content-Length"]))
@@ -203,6 +241,10 @@ class DispositionUnitTests(unittest.TestCase):
             try:
                 adapter = LocalVllmDispositionAdapter(artifact_version=f"sha256:{digest}", artifact_path=directory, base_url=f"http://127.0.0.1:{server.server_port}/v1")
                 self.assertEqual(adapter.evaluate({}, []), {"signals": "local"})
+                from app.local_disposition_adapter import LocalModelUnavailable
+                server_root["value"] = str(Path(directory).parent)
+                with self.assertRaises(LocalModelUnavailable):
+                    adapter.evaluate({}, [])
             finally:
                 server.shutdown(); thread.join(); server.server_close()
 
@@ -289,7 +331,12 @@ class DispositionPostgresTests(unittest.TestCase):
             lease_token = uuid4()
             connection.execute("UPDATE jobs SET state='RUNNING',attempts=1,lease_token=%s,lease_until=now()+interval '5 minutes' WHERE organisation_id=%s AND id=%s", (lease_token, self.org, job["id"]))
             job["lease_token"] = lease_token
-            output = make_disposition_processor(FakeAdapter())(job)
+            connection.execute("INSERT INTO transcript_utterances(organisation_id,call_id,revision,id,segment_id,speaker_id,role,start_ms,end_ms,text_redacted,confidence,model_version,is_final) VALUES (%s,%s,1,'utt2','seg2','channel-1','CUSTOMER',101,200,'I also agree.',0.9,'fake-asr',true)", (self.org, self.call))
+            connection.commit()
+            adapter = FakeAdapter()
+            output = make_disposition_processor(adapter)(job)
+            self.assertEqual([turn["speaker_id"] for turn in adapter.seen[0][1]], ["channel-0", "channel-1"])
+            self.assertEqual([turn["utterance_ids"] for turn in adapter.seen[0][1]], [["utt1"], ["utt2"]])
             self.assertTrue(finish_job(connection, str(job["id"]), str(job["lease_token"]), output))
             row = connection.execute("SELECT organisation_id,revision,transcript_revision,code,status,model_artifact,signals_json FROM dispositions WHERE organisation_id=%s AND call_id=%s", (self.org, self.call)).fetchone()
             self.assertEqual((str(row[0]), row[1], row[2], row[3], row[4], row[5]), (str(self.org), 1, 1, "COMMITTED", "RESOLVED", "sha256:" + "a" * 64))
@@ -341,7 +388,7 @@ class DispositionPostgresTests(unittest.TestCase):
         with connect() as connection:
             connection.execute("INSERT INTO organisations(id) VALUES (%s)", (api_org,))
             connection.execute("INSERT INTO organisations(id) VALUES (%s)", (other_org,))
-        scopes = {"admin": Scope(str(api_org), "admin-user", "ADMIN", frozenset()), "other": Scope(str(other_org), "other-admin", "ADMIN", frozenset()), "qa": Scope(str(api_org), "qa-user", "QA_ANALYST", frozenset())}
+        scopes = {"admin": Scope(str(api_org), "admin-user", "ADMIN", frozenset()), "approver": Scope(str(api_org), "approver-user", "ADMIN", frozenset()), "other": Scope(str(other_org), "other-admin", "ADMIN", frozenset()), "qa": Scope(str(api_org), "qa-user", "QA_ANALYST", frozenset())}
         settings = Settings(oidc_issuer="https://identity.test", oidc_audience="audit", oidc_public_key=public_key, csrf_secret="test-only-csrf-secret-at-least-32-bytes-long", allowed_origins=("https://audit.test",))
         client = TestClient(create_app(settings, identity_lookup=scopes.get, disposition_adapter=FakeAdapter()))
         def headers(subject="admin"):
@@ -360,12 +407,19 @@ class DispositionPostgresTests(unittest.TestCase):
             self.assertEqual(client.get(f"/v1/calls/{call_id}/disposition", headers=headers()).json()["code"], "COMMITTED")
             self.assertEqual(client.get(f"/v1/calls/{call_id}/disposition", headers=headers("other")).status_code, 404)
             self.assertEqual(client.post("/v1/disposition-configs", json=candidate, headers=headers()).status_code, 409)
+            self.assertEqual(client.post(f"/v1/disposition-configs/{config_id}/versions/1/approve", json={"reason": "self approval"}, headers=headers()).status_code, 403)
+            self.assertEqual(client.post(f"/v1/disposition-configs/{config_id}/versions/1/activate", json={"expected_generation": 0}, headers=headers()).status_code, 409)
+            approved = client.post(f"/v1/disposition-configs/{config_id}/versions/1/approve", json={"reason": "independent policy review"}, headers=headers("approver"))
+            self.assertEqual((approved.status_code, approved.json().get("approved_by")), (200, "approver-user"), approved.text)
+            listed = client.get("/v1/disposition-configs", headers=headers()).json()["versions"]
+            self.assertEqual(next(item for item in listed if item["config_id"] == config_id and item["version"] == 1)["approved_by"], "approver-user")
             activated = client.post(f"/v1/disposition-configs/{config_id}/versions/1/activate", json={"expected_generation": 0}, headers=headers())
             self.assertEqual(activated.status_code, 200, activated.text)
             self.assertEqual(activated.json()["generation"], 1)
             self.assertEqual(client.post(f"/v1/disposition-configs/{config_id}/versions/1/activate", json={"expected_generation": 0}, headers=headers()).status_code, 409)
             second = sample_config(); second["version"] = 2
             self.assertEqual(client.post("/v1/disposition-configs", json=second, headers=headers()).status_code, 201)
+            self.assertEqual(client.post(f"/v1/disposition-configs/{config_id}/versions/2/approve", json={"reason": "reviewed v2"}, headers=headers("approver")).status_code, 200)
             self.assertEqual(client.post(f"/v1/disposition-configs/{config_id}/versions/2/activate", json={"expected_generation": 1}, headers=headers()).json()["generation"], 2)
             replay = client.post(f"/v1/disposition-configs/{config_id}/versions/1/replay", json={"fixture_set_id": "synthetic-smoke-v1"}, headers=headers())
             self.assertEqual(replay.status_code, 200, replay.text)
@@ -375,10 +429,15 @@ class DispositionPostgresTests(unittest.TestCase):
             self.assertEqual(client.get("/v1/disposition-configs", headers=headers("other")).json()["versions"], [])
             self.assertEqual(client.post("/v1/disposition-configs/validate", json=candidate, headers=headers("qa")).status_code, 403)
             with connect() as connection:
+                applied = connection.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone()
+                check = connection.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='disposition_config_events'::regclass AND conname='disposition_config_events_action_check'").fetchone()
+                self.assertIsNotNone(applied)
+                self.assertIn("APPROVED", check[0])
                 active = connection.execute("SELECT config_id,version,generation FROM active_disposition_configs WHERE organisation_id=%s", (api_org,)).fetchone()
                 self.assertEqual(tuple(active), (config_id, 1, 3))
                 events = connection.execute("SELECT action,reason FROM disposition_config_events WHERE organisation_id=%s AND config_id=%s ORDER BY created_at,id", (api_org, config_id)).fetchall()
                 self.assertIn(("ROLLBACK", "synthetic rollback test"), events)
+                self.assertIn(("APPROVED", "independent policy review"), events)
         finally:
             client.close()
 

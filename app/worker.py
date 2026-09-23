@@ -31,11 +31,11 @@ def make_disposition_processor(adapter):
             if active is None or active[3] != job["input_revision"]:
                 raise RuntimeError("disposition config unavailable or transcript revision stale")
             rows = connection.execute(
-                "SELECT id,role,start_ms,end_ms,text_redacted,is_final FROM transcript_utterances "
+                "SELECT id,speaker_id,role,start_ms,end_ms,text_redacted,is_final FROM transcript_utterances "
                 "WHERE organisation_id=%s AND call_id=%s AND revision=%s ORDER BY start_ms,id",
                 (job["organisation_id"], job["call_id"], job["input_revision"]),
             ).fetchall()
-        transcript = [{"id": row[0], "role": row[1], "start_ms": row[2], "end_ms": row[3], "text_redacted": row[4], "is_final": row[5]} for row in rows]
+        transcript = [{"id": row[0], "speaker_id": row[1], "role": row[2], "start_ms": row[3], "end_ms": row[4], "text_redacted": row[5], "is_final": row[6]} for row in rows]
         config = compile_disposition_config(active[2])
         decision = classify_disposition(transcript, {}, adapter, config)
         output = decision.as_dict()

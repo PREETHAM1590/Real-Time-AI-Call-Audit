@@ -14,6 +14,12 @@ _ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}$")
 _FORBIDDEN_KEYS = {"provider", "model", "adapter", "api_profile", "endpoint", "tenant_id", "organisation_id", "organization_id", "credential", "credentials", "token", "password", "secret", "api_key", "apikey", "authorization", "expression", "script"}
 _SIGNAL_TYPES = {"noul", "choice", "score"}
 _OPERATORS = {"NOUL_GTE", "NOUL_LTE", "CHOICE_EQ", "CHOICE_IN", "CHOICE_CONFIDENCE_GTE", "SCORE_GTE", "SCORE_LTE", "EXISTS"}
+_MAX_CONFIG_BYTES = 256 * 1024
+_MAX_CONTAINER_ITEMS = 4096
+_MAX_NODES = 20_000
+_MAX_STRING_CHARS = 16_384
+_MAX_INTEGER = 2**63 - 1
+_MIN_INTEGER = -(2**63)
 
 
 class ConfigError(ValueError):
@@ -50,7 +56,16 @@ def _err(path: str, message: str) -> dict[str, str]:
 
 
 def _bounded_number(value: Any, path: str, errors: list[dict[str, str]]) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        errors.append(_err(path, "must be a finite number between 0 and 1"))
+        return None
+    # Compare integers before converting: math.isfinite(10**10000) raises
+    # OverflowError even though it should simply be rejected as out of range.
+    if isinstance(value, int):
+        if not 0 <= value <= 1:
+            errors.append(_err(path, "must be a finite number between 0 and 1"))
+            return None
+    elif not math.isfinite(value) or not 0 <= value <= 1:
         errors.append(_err(path, "must be a finite number between 0 and 1"))
         return None
     return float(value)
@@ -67,22 +82,52 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
     if not isinstance(raw, dict):
         raise ConfigError([_err("$", "must be an object")])
 
+    try:
+        encoded_raw = json.dumps(raw, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise ConfigError([_err("$", "must be bounded JSON data")]) from None
+    if len(encoded_raw) > _MAX_CONFIG_BYTES:
+        raise ConfigError([_err("$", f"configuration exceeds {_MAX_CONFIG_BYTES} bytes")])
+
+    visited = 0
     def walk(value: Any, path: str = "$", depth: int = 0) -> None:
-        if depth > 24:
-            errors.append(_err(path, "maximum configuration nesting depth is 24"))
+        nonlocal visited
+        visited += 1
+        if visited > _MAX_NODES:
+            if visited == _MAX_NODES + 1:
+                errors.append(_err(path, f"configuration exceeds {_MAX_NODES} values"))
+            return
+        if depth > 16:
+            errors.append(_err(path, "maximum configuration nesting depth is 16"))
             return
         if isinstance(value, dict):
+            if len(value) > _MAX_CONTAINER_ITEMS:
+                errors.append(_err(path, f"object may contain at most {_MAX_CONTAINER_ITEMS} fields"))
+                return
             for key, child in value.items():
+                if not isinstance(key, str):
+                    errors.append(_err(path, "object keys must be strings"))
+                    continue
                 if str(key).lower() in _FORBIDDEN_KEYS:
                     errors.append(_err(f"{path}.{key}", "field is not permitted; scope and model deployment are server-owned"))
                 walk(child, f"{path}.{key}", depth + 1)
         elif isinstance(value, list):
+            if len(value) > _MAX_CONTAINER_ITEMS:
+                errors.append(_err(path, f"array may contain at most {_MAX_CONTAINER_ITEMS} items"))
+                return
             for index, child in enumerate(value):
                 walk(child, f"{path}[{index}]", depth + 1)
-        elif isinstance(value, str) and ("://" in value or "${" in value or "{{" in value):
-            errors.append(_err(path, "URLs, templates, and variable interpolation are not supported"))
+        elif isinstance(value, str):
+            if len(value) > _MAX_STRING_CHARS:
+                errors.append(_err(path, f"strings may contain at most {_MAX_STRING_CHARS} characters"))
+            if "://" in value or "${" in value or "{{" in value:
+                errors.append(_err(path, "URLs, templates, and variable interpolation are not supported"))
+        elif isinstance(value, int) and not isinstance(value, bool) and not _MIN_INTEGER <= value <= _MAX_INTEGER:
+            errors.append(_err(path, "integer is outside the supported signed 64-bit range"))
         elif isinstance(value, float) and not math.isfinite(value):
             errors.append(_err(path, "numbers must be finite"))
+        elif value is not None and not isinstance(value, (str, int, float, bool)):
+            errors.append(_err(path, "value is not a JSON scalar or container"))
 
     walk(raw)
     allowed_top = {"schema_version", "config_id", "version", "identity", "questions", "taxonomy", "front_gates", "resolver", "confidence", "runtime", "output"}
@@ -111,8 +156,8 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
     if "default_locale" in identity and (not isinstance(identity["default_locale"], str) or len(identity["default_locale"]) > 32):
         errors.append(_err("$.identity.default_locale", "must be a locale string up to 32 characters"))
     version = raw.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-        errors.append(_err("$.version", "must be a positive integer"))
+    if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= 2**31 - 1:
+        errors.append(_err("$.version", "must be a positive PostgreSQL integer"))
         version = 1
     if raw.get("schema_version", "1.0.0") != "1.0.0":
         errors.append(_err("$.schema_version", "unsupported schema version"))
@@ -139,6 +184,8 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
                 errors.append(_err(f"$.questions.{qid}.criteria", "noul criteria require nonempty true and false descriptions"))
             if qtype == "choice" and (not isinstance(criteria, dict) or len(criteria) < 2 or any(not isinstance(k, str) for k in criteria)):
                 errors.append(_err(f"$.questions.{qid}.criteria", "choice criteria must name at least two choices"))
+            if qtype == "choice" and isinstance(criteria, dict) and (len(criteria) > 64 or any(not isinstance(k, str) or not k or len(k) > 128 for k in criteria)):
+                errors.append(_err(f"$.questions.{qid}.criteria", "choice identifiers must be nonempty, at most 128 characters, and limited to 64 choices"))
             if qtype == "choice" and isinstance(criteria, dict) and any(not isinstance(v, str) or not v.strip() for v in criteria.values()):
                 errors.append(_err(f"$.questions.{qid}.criteria", "choice descriptions must be nonempty strings"))
             if qtype == "score" and (not isinstance(criteria, list) or len(criteria) < 2 or len(criteria) > 10):
@@ -146,7 +193,12 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
             if qtype == "score" and isinstance(criteria, list) and any(not isinstance(v, str) or not v.strip() for v in criteria):
                 errors.append(_err(f"$.questions.{qid}.criteria", "score labels must be nonempty strings"))
 
-    codes_raw = raw.get("taxonomy", {}).get("codes", []) if isinstance(raw.get("taxonomy", {}), dict) else []
+    taxonomy_raw = raw.get("taxonomy", {})
+    if not isinstance(taxonomy_raw, dict):
+        errors.append(_err("$.taxonomy", "must be an object")); taxonomy_raw = {}
+    elif set(taxonomy_raw) - {"codes"}:
+        errors.append(_err("$.taxonomy", "only codes is supported"))
+    codes_raw = taxonomy_raw.get("codes", [])
     taxonomy: dict[str, dict[str, Any]] = {}
     if not isinstance(codes_raw, list) or not codes_raw:
         errors.append(_err("$.taxonomy.codes", "must contain at least one code"))
@@ -253,7 +305,7 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
         if not isinstance(gate, dict) or set(gate) != {"id", "enabled", "priority", "source", "condition", "emit"}:
             errors.append(_err(path, "unsupported front gate shape")); continue
         cond = gate.get("condition", {})
-        if gate.get("source") not in {"telephony_status", "call_status"}:
+        if not isinstance(gate.get("source"), str) or gate.get("source") not in {"telephony_status", "call_status"}:
             errors.append(_err(f"{path}.source", "only authoritative server facts are supported"))
         if not isinstance(cond, dict) or set(cond) != {"operator", "value"} or not isinstance(cond.get("operator"), str) or cond.get("operator") not in {"EQ", "NE", "IN", "NOT_IN", "EXISTS"}:
             errors.append(_err(f"{path}.condition", "unsupported condition"))
@@ -279,7 +331,10 @@ def compile_disposition_config(raw: dict) -> CompiledDispositionConfig:
     if commit is not None and review is not None and review > commit: errors.append(_err("$.confidence", "review threshold must not exceed commit threshold"))
     if confidence.get("low_confidence_action", "REVIEW") != "REVIEW": errors.append(_err("$.confidence.low_confidence_action", "only REVIEW is supported"))
     per_code = {}
-    for code, values in confidence.get("per_code", {}).items() if isinstance(confidence.get("per_code", {}), dict) else []:
+    per_code_raw = confidence.get("per_code", {})
+    if not isinstance(per_code_raw, dict):
+        errors.append(_err("$.confidence.per_code", "must be an object")); per_code_raw = {}
+    for code, values in per_code_raw.items():
         if code not in taxonomy: errors.append(_err(f"$.confidence.per_code.{code}", "unknown taxonomy code")); continue
         threshold = _bounded_number(values.get("commit_threshold") if isinstance(values, dict) else None, f"$.confidence.per_code.{code}.commit_threshold", errors)
         if threshold is not None: per_code[code] = threshold

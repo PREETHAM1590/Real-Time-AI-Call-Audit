@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -98,8 +99,21 @@ class LocalVllmDispositionAdapter:
                 if len(models_bytes) > 1_048_576:
                     raise LocalModelUnavailable("local model manifest exceeded size limit")
             models = json.loads(models_bytes)
-            if not any(item.get("id") == self.model_name for item in models.get("data", []) if isinstance(item, dict)):
+            matching = [item for item in models.get("data", []) if isinstance(item, dict) and item.get("id") == self.model_name]
+            if not matching:
                 raise LocalModelUnavailable("configured local model is not served")
+            # Bind the reported model ID to the exact locally verified artifact
+            # path. A matching alias alone is not provenance evidence.
+            reported_roots = [item.get("root") for item in matching]
+            if not reported_roots or any(not isinstance(root, str) or not root for root in reported_roots):
+                raise LocalModelUnavailable("local model server did not report its model root")
+            try:
+                expected_root = os.path.normcase(str(self.model_directory.resolve(strict=True)))
+                roots_match = all(os.path.normcase(str(Path(root).resolve(strict=True))) == expected_root for root in reported_roots)
+            except (OSError, RuntimeError, ValueError):
+                roots_match = False
+            if not roots_match:
+                raise LocalModelUnavailable("served model root does not match the verified local artifact path")
             with opener.open(request, timeout=self.timeout_seconds) as response:
                 encoded = response.read(1_048_577)
                 if len(encoded) > 1_048_576:
