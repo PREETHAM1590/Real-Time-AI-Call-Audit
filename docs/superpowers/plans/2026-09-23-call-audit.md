@@ -426,7 +426,7 @@ Use canonical timestamp sorting when persisting utterances; the helper above rec
 
 **Interfaces:** `sentiment_drop(previous: list[float], current: list[float]) -> bool` operates on already eligible final customer scores; `read_events(connection, scope: Scope, after_sequence: int, limit: int = 100) -> list[dict]`; `GET /v1/events` uses the spec envelope.
 
-- [ ] **1. Write sentiment boundary check:**
+- [x] **1. Write sentiment boundary check:** `tests/test_live.py` covers sample minimum, the 0.4 threshold, below-threshold behavior and invalid values.
 
 ```python
 import unittest
@@ -439,8 +439,8 @@ class LiveTests(unittest.TestCase):
         self.assertFalse(sentiment_drop([0.2, 0.2, 0.2], [0.1, 0.1, 0.1]))
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_live -v`; expect missing sentiment logic.
-- [ ] **3. Implement the calibrated-window predicate:**
+- [x] **2. Run:** `python -m unittest tests.test_live -v`; the test-first run failed because `app.sentiment` did not exist, then passed after implementation.
+- [x] **3. Implement the calibrated-window predicate:** `app.sentiment.sentiment_drop` validates signed finite scores in [-1, 1], requires at least three values on each side and returns true for an average drop of at least 0.4. This helper accepts already selected windows; upstream final-customer selection, 30-second adjacency, confidence and cooldown logic are still pending.
 
 ```python
 from statistics import mean
