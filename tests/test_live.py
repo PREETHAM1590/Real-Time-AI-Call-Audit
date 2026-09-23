@@ -33,8 +33,9 @@ class SentimentDropTests(unittest.TestCase):
 
 class SentimentAlertTests(unittest.TestCase):
     @staticmethod
-    def signal(start_ms, score, *, role="CUSTOMER", is_final=True, probability=0.8, end_ms=None):
+    def signal(start_ms, score, *, signal_id=None, role="CUSTOMER", is_final=True, probability=0.8, end_ms=None):
         return {
+            "id": f"signal-{start_ms}" if signal_id is None else signal_id,
             "role": role,
             "start_ms": start_ms,
             "end_ms": start_ms if end_ms is None else end_ms,
@@ -68,6 +69,10 @@ class SentimentAlertTests(unittest.TestCase):
         signals.extend(self.signal(30_000 + i * 100, 0.0, probability=0.7) for i in range(3))
         self.assertEqual(sentiment_alert_times(signals), [60_000])
 
+        signals = [self.signal(i * 100, 0.5, probability=0.7) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.1, probability=0.7) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [60_000])
+
     def test_enforces_ninety_second_cooldown(self):
         scores = [0.8, 0.0, 0.8, 0.8, 0.0]
         signals = [self.signal(i * 30_000 + j, scores[i])
@@ -87,6 +92,26 @@ class SentimentAlertTests(unittest.TestCase):
                 signal.update(changes)
                 with self.assertRaises(ValueError):
                     sentiment_alert_times([signal])
+
+    def test_rejects_missing_or_duplicate_utterance_ids(self):
+        signal = self.signal(0, 0.5)
+        signal.pop("id")
+        with self.assertRaises(ValueError):
+            sentiment_alert_times([signal])
+
+        repeated = self.signal(0, 0.5)
+        signals = [repeated, repeated.copy(), self.signal(100, 0.5), self.signal(200, 0.5)]
+        signals.extend(self.signal(30_000 + i * 100, 0.0) for i in range(3))
+        with self.assertRaises(ValueError):
+            sentiment_alert_times(signals)
+
+        conflicting = [self.signal(0, 0.5, signal_id="same"), self.signal(100, 0.4, signal_id="same")]
+        with self.assertRaises(ValueError):
+            sentiment_alert_times(conflicting)
+
+    def test_rejects_non_mapping_signals(self):
+        with self.assertRaises(ValueError):
+            sentiment_alert_times([None])
 
 
 if __name__ == "__main__":
