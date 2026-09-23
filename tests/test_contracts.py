@@ -384,6 +384,54 @@ class ApiContractTests(unittest.TestCase):
                 unavailable = self.client.get(grant.json()["url"], headers=qa_headers)
             self.assertEqual(unavailable.status_code, 404)
 
+    def test_scoped_report_and_compliance_export_api_contracts(self):
+        from app.reports import ReportForbidden
+
+        identities = {
+            "agent-report": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"})),
+            "leader-report": Scope("org-a", "leader-a", "TEAM_LEADER", frozenset({"team-a"})),
+            "compliance-report": Scope("org-a", "compliance-a", "COMPLIANCE_OFFICER", frozenset()),
+            "qa-report": Scope("org-a", "qa-a", "QA_ANALYST", frozenset()),
+        }
+        self.identity_lookup.side_effect = identities.get
+        agent_headers = {"Authorization": f"Bearer {self.token(subject='agent-report')}"}
+        with patch("app.api.connect"), patch("app.api.own_scores", return_value=[{"call_id": "synthetic-call"}]) as own:
+            self.assertEqual(self.client.get("/v1/me/scores", headers=agent_headers).json(), {"items": [{"call_id": "synthetic-call"}]})
+            self.assertEqual(own.call_args.args[1], identities["agent-report"])
+
+        qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-report')}"}
+        with patch("app.api.connect") as connect:
+            forbidden_own = self.client.get("/v1/me/scores", headers=qa_headers)
+        self.assertEqual(forbidden_own.status_code, 403)
+        connect.assert_not_called()
+
+        start, end = "2026-09-01T00:00:00Z", "2026-09-30T00:00:00Z"
+        leader_headers = {"Authorization": f"Bearer {self.token(subject='leader-report')}"}
+        with patch("app.api.connect"), patch("app.api.team_report", return_value={"cohorts": [{"team_id": "team-a"}]}) as report:
+            response = self.client.get(f"/v1/reports/team?start={start}&end={end}", headers=leader_headers)
+        self.assertEqual(response.json(), {"cohorts": [{"team_id": "team-a"}]})
+        self.assertEqual(report.call_args.args[1], identities["leader-report"])
+        with patch("app.api.connect") as connect:
+            denied_team = self.client.get(f"/v1/reports/team?start={start}&end={end}", headers=agent_headers)
+        self.assertEqual(denied_team.status_code, 403)
+        connect.assert_not_called()
+
+        compliance_headers = {"Authorization": f"Bearer {self.token(subject='compliance-report')}", "X-Request-ID": "export-req"}
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        with patch("app.api.connect", return_value=connection), patch("app.api.export_findings", return_value=(b"rule_id\r\n'=1+1\r\n", 1)) as export:
+            exported = self.client.get(f"/v1/exports/findings?start={start}&end={end}&limit=20", headers=compliance_headers)
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(exported.content, b"rule_id\r\n'=1+1\r\n")
+        self.assertTrue(exported.headers["content-disposition"].startswith("attachment; filename=\"findings-"))
+        self.assertEqual(exported.headers["x-export-row-count"], "1")
+        self.assertIn("FINDINGS_EXPORTED", " ".join(call.args[0] for call in connection.execute.call_args_list))
+        self.assertEqual(export.call_args.kwargs["limit"], 20)
+        with patch("app.api.connect") as connect:
+            denied_export = self.client.get(f"/v1/exports/findings?start={start}&end={end}", headers=leader_headers)
+        self.assertEqual(denied_export.status_code, 403)
+        connect.assert_not_called()
+
     def test_cookie_upload_requires_exact_origin_and_session_csrf(self):
         self.client.cookies.set("session", self.token())
         csrf_response = self.client.get("/v1/csrf")

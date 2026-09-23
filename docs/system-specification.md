@@ -229,9 +229,9 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 | GET /v1/calls/{id}/audio | Authenticated byte-range stream; rechecks role, tenant, call permission and tombstone for each request |
 | POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE/TRIAGE, base_review_version, reason and changed dimension scores; 201, or 409 on stale evidence/review |
 | GET /v1/events | Scoped SSE; Last-Event-ID resumes; expired cursor yields reset_required and client fetches snapshot |
-| GET /v1/me/scores | Agent's own reviewed scores and coaching notes; server derives identity |
-| GET /v1/reports/team | Scoped aggregates; sample count, period and rubric/model versions included |
-| GET /v1/exports/findings | Compliance role; bounded redacted export, download logged; neutralise CSV formula prefixes |
+| GET /v1/me/scores | Agent's own current-transcript reviewed scores, machine/reviewed checklist, and redacted saved coaching notes; agent identity derives from server scope |
+| GET /v1/reports/team | Server-authorized team aggregates, separately versioned by rubric/model runtime; cohorts below five distinct agents suppress counts and scores |
+| GET /v1/exports/findings | Compliance-officer-only current-revision policy findings; redacted, bounded CSV (92-day / 10,000-row maximum), formula-safe cells, and immutable access event before response |
 | DELETE /v1/calls/{id} | Privileged deletion request; 202 tombstone; legal hold conflict is 409 |
 | WS /v1/media/{call_id} | Vendor-authenticated session bound to organisation, call, tracks and one active generation |
 

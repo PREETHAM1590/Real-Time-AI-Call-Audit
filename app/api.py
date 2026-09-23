@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -24,6 +25,8 @@ from app.local_disposition_adapter import LocalVllmDispositionAdapter
 from app.reviews import ReviewConflict, ReviewForbidden, ReviewNotFound, append_review, call_detail, review_queue
 from app.audio_access import issue_audio_capability, verify_audio_capability
 from app.storage import LocalPrivateStorage
+from app.privacy import redact_text
+from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavailable, export_findings, own_scores, team_report
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -205,10 +208,12 @@ def create_app(
     *,
     identity_lookup: IdentityLookup | None = None,
     disposition_adapter=None,
+    report_redactor=None,
 ) -> FastAPI:
     """Create the API with OIDC validation and server-owned scope lookups."""
     app = FastAPI()
     get_scope = scope_dependency(settings, identity_lookup)
+    report_redactor = report_redactor or redact_text
     if disposition_adapter is None and os.environ.get("DISPOSITION_MODEL_SHA256"):
         disposition_adapter = LocalVllmDispositionAdapter.from_environment()
 
@@ -242,6 +247,57 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {"items": items}
+
+    @app.get("/v1/me/scores")
+    def get_own_scores(scope: Scope = Depends(get_scope)) -> dict:
+        if scope.role != "AGENT" or not scope.user_id.strip() or not scope.organisation_id.strip():
+            raise HTTPException(status_code=403, detail="Agent identity required")
+        try:
+            with connect() as connection:
+                scores = own_scores(connection, scope, redact=report_redactor)
+        except ReportForbidden as error:
+            raise HTTPException(status_code=403, detail="Agent identity required") from error
+        except ReportPrivacyUnavailable as error:
+            raise HTTPException(status_code=503, detail="Coaching notes are unavailable") from error
+        return {"items": scores}
+
+    @app.get("/v1/reports/team")
+    def get_team_report(start: datetime, end: datetime, scope: Scope = Depends(get_scope)) -> dict:
+        if scope.role != "TEAM_LEADER" or not scope.team_ids:
+            raise HTTPException(status_code=403, detail="Team leader membership required")
+        try:
+            with connect() as connection:
+                return team_report(connection, scope, start, end)
+        except ReportForbidden as error:
+            raise HTTPException(status_code=403, detail="Team leader membership required") from error
+        except ReportLimitError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/v1/exports/findings")
+    def download_findings(start: datetime, end: datetime, request: Request, limit: int = 10_000, scope: Scope = Depends(get_scope)):
+        if scope.role != "COMPLIANCE_OFFICER":
+            raise HTTPException(status_code=403, detail="Compliance officer role required")
+        request_id = request.headers.get("X-Request-ID")
+        if request_id is not None and (not request_id or len(request_id) > 128):
+            raise HTTPException(status_code=400, detail="Invalid request identifier")
+        export_id = uuid4()
+        try:
+            with connect() as connection:
+                with connection.transaction():
+                    content, row_count = export_findings(connection, scope, start, end, redact=report_redactor, limit=limit)
+                    connection.execute(
+                        "INSERT INTO access_events(organisation_id,id,actor_id,action,resource_type,resource_id,outcome,request_id) "
+                        "VALUES (%s,%s,%s,'FINDINGS_EXPORTED','FINDINGS_EXPORT',%s,'SUCCESS',%s)",
+                        (scope.organisation_id, uuid4(), scope.user_id, export_id, request_id),
+                    )
+        except ReportForbidden as error:
+            raise HTTPException(status_code=403, detail="Compliance officer role required") from error
+        except ReportLimitError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except ReportPrivacyUnavailable as error:
+            raise HTTPException(status_code=503, detail="Export redaction is unavailable") from error
+        filename = f"findings-{start.astimezone(timezone.utc).date().isoformat()}-{end.astimezone(timezone.utc).date().isoformat()}.csv"
+        return Response(content=content, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store", "X-Export-ID": str(export_id), "X-Export-Row-Count": str(row_count)})
 
     @app.post("/v1/calls/{call_id}/audio-access")
     def grant_audio_access(call_id: str, request: Request, scope: Scope = Depends(get_scope)) -> dict:
@@ -508,6 +564,10 @@ def create_app(
         @app.get("/analyst", include_in_schema=False)
         def analyst_home():
             return FileResponse(web_root / "index.html")
+
+        @app.get("/quality", include_in_schema=False)
+        def quality_home():
+            return FileResponse(web_root / "quality.html")
 
         app.mount("/analyst-assets", StaticFiles(directory=web_root), name="analyst-assets")
 

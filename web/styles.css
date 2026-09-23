@@ -36,4 +36,15 @@ h2 { margin: 0 0 .8rem; }
 .score-field select { display: block; width: 100%; }
 .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; }
 .error { color: #8a1c1c; }
+.report-layout { width: min(1100px, 96vw); margin: 24px auto; }
+.report-card { margin: 18px 0; padding: 18px; background: white; border: 1px solid #c9d1dc; border-radius: 8px; }
+.report-card h3, .report-card h4 { margin-top: .5rem; }
+.report-card dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.report-card dt { font-weight: 700; }
+.report-card dd { margin: 0; overflow-wrap: anywhere; }
+.period-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 16px; }
+.period-form label { display: grid; gap: 4px; }
+table { width: 100%; border-collapse: collapse; background: white; }
+th, td { text-align: left; padding: 10px; border-bottom: 1px solid #c9d1dc; }
+@media (max-width: 700px) { table { display: block; overflow-x: auto; } }
 @media (max-width: 850px) { .layout { grid-template-columns: 1fr; } }

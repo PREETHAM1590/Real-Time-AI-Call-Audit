@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Quality reports</title>
+    <link rel="stylesheet" href="/analyst-assets/styles.css">
+    <script src="/analyst-assets/quality.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Quality reports</h1>
+      <p>Current reviewed scores and versioned team trends.</p>
+    </header>
+    <main class="report-layout">
+      <p id="report-status" class="status" role="status" aria-live="polite">Loading your authorised report…</p>
+      <section id="own-report" class="block" aria-labelledby="own-title" hidden>
+        <h2 id="own-title">Your reviewed scores</h2>
+        <div id="own-items"></div>
+      </section>
+      <section id="team-report" class="block" aria-labelledby="team-title" hidden>
+        <h2 id="team-title">Team trends</h2>
+        <form id="period-form" class="period-form">
+          <label for="period-start">Start date</label><input id="period-start" type="date" required>
+          <label for="period-end">End date</label><input id="period-end" type="date" required>
+          <button type="submit">Refresh team report</button>
+        </form>
+        <div id="team-items"></div>
+      </section>
+    </main>
+  </body>
+</html>

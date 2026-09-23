@@ -66,7 +66,7 @@ Run the named test before implementation and confirm it fails for the expected m
 | app/media.py | Telephony session authentication, frame ordering and local STT draining | 7 |
 | config/models.lock.json | Exact local weight revisions/checksums/licenses and runtime versions | 3 |
 | app/events.py, app/sentiment.py, web/src/LiveCalls.tsx | Resumable scoped feed, sentiment and supervisor UI | 8 |
-| app/reports.py, web/src/Reports.tsx | Own-score/team views and safe exports | 9 |
+| app/reports.py, web/quality.html, web/quality.js | Own-score/team views and safe exports | 9 |
 | app/retention.py, app/metrics.py, app/evaluate.py | Purging, operational measurements and quality evaluation | 10 |
 | Dockerfile, .github/workflows/ci.yml | Container packaging and CI if hosted on GitHub | 10 |
 | tests/__init__.py, tests/test_*.py, tests/fixtures/ | Runnable contracts, integration cases and synthetic fixtures | 1–10, 3A |
@@ -459,11 +459,11 @@ Caller selects adjacent 30-second windows using utterance event time, enforces c
 
 ## Task 9: Deliver agent scores, trends and safe exports
 
-**Files:** Create reports module/component and `tests/test_reports.py`; modify API/App.
+**Files:** Create `app/reports.py`, `migrations/012_findings_export_events.sql`, `web/quality.html`, `web/quality.js`, `tests/test_reports.py`, and `tests/test_browser_reports.py`; modify `app/api.py`, `tests/test_contracts.py`, and report styles.
 
 **Interfaces:** `csv_cell(value: str) -> str`; `own_scores(connection, scope: Scope) -> list[dict]`; `team_report(connection, scope: Scope, start: datetime, end: datetime) -> dict`. Aggregates expose sample counts and group/filter by rubric/model versions.
 
-- [ ] **1. Write export injection check:**
+- [x] **1. Write export injection check:**
 
 ```python
 import unittest
@@ -476,8 +476,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(csv_cell("Coaching note"), "Coaching note")
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_reports -v`; expect missing export helper.
-- [ ] **3. Implement safe text cell conversion**, then let Python's `csv` library escape commas/quotes:
+- [x] **2. Run:** `python -m unittest tests.test_reports -v`; the first run failed because `app.reports` was not implemented yet.
+- [x] **3. Implement safe text cell conversion**, then let Python's `csv` library escape commas/quotes:
 
 ```python
 def csv_cell(value):
@@ -485,9 +485,9 @@ def csv_cell(value):
     return "'" + value if stripped.startswith(("=", "+", "-", "@")) else value
 ```
 
-- [ ] **4. Implement scoped reports:** own-score endpoint derives agent identity; team query uses authorised team set. Report reviewed vs machine scores separately, counts and version cohorts; suppress team comparison for fewer than five distinct agents as an initial privacy default. Include checklist and saved coaching notes in own view.
-- [ ] **5. Add bounded redacted CSV export** restricted to compliance role, logged access, safe filenames and row/date limits. Add integration assertions for own-only data, cross-team denial, empty periods, version separation and formula-safe cells.
-- [ ] **6. Run module and browser build**, demonstrate agent and team-leader views with two synthetic teams, then commit `feat: add scoped quality reporting`.
+- [x] **4. Implement scoped reports:** own-score endpoint derives agent identity; team query uses the server-authorized team set. Report reviewed vs machine scores separately, count and group by rubric/model versions; suppress cohort metrics below five distinct agents. Include checklist and redacted saved coaching notes in the own view.
+- [x] **5. Add bounded redacted CSV export** restricted to the compliance role, with immutable access-event logging, safe filenames, a 92-day window and a 10,000-row cap. Integration assertions cover own-only data, team scope, empty periods, version separation, export bounds, redaction and formula-safe cells.
+- [x] **6. Run module and browser checks** with synthetic agent/team views. The pilot uses the existing dependency-free vanilla HTML/CSS/JS approach instead of the originally proposed React/TypeScript build because no frontend build scaffold exists; replace it when a product frontend is selected. `tests.test_browser_reports` uses the optional pinned Playwright extra and Chromium, so there is no npm build command for this slice. Commit `feat: add scoped quality reporting`.
 
 ## Task 10: Qualify retention, recovery, quality and release
 
