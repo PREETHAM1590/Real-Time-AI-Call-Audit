@@ -138,7 +138,7 @@ Proposed infrastructure deliberately excludes Kafka, Kubernetes, Temporal, Click
 
 ### Processing lifecycle
 
-This is the target lifecycle. In the current implementation, `ANALYSING` runs disposition first and ends in `NEEDS_REVIEW`; policy checks and QA scoring are later planned stages.
+This is the target lifecycle. The current worker queues disposition (`ANALYSE`) and versioned policy (`POLICY`) jobs from the final transcript. Disposition processing leaves the call at `NEEDS_REVIEW`; policy findings do not mark it `READY`, and seven-dimension QA scoring remains unimplemented. Upload timing fields default to unreliable because no trusted connection/hold/completion source is integrated, so time-sensitive findings remain `UNKNOWN` until that integration is qualified.
 
 `UPLOADING → QUEUED → TRANSCRIBING → ANALYSING → AUDITING → DISPOSITIONING → READY`
 

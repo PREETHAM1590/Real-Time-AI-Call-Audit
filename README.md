@@ -2,7 +2,7 @@
 
 Self-hosted call auditing and configurable disposition platform: transcribe calls, check configured policies, identify interaction outcomes, propose evidence-backed quality scores, and support human review and live supervision.
 
-**Status:** implementation in progress. Identity-scoped APIs, durable recording intake, the final redacted transcript pipeline, and configurable disposition identification have runnable tests. Policy/audit scoring, analyst UI, live monitoring and deployment remain incomplete; disposition model quality and capacity have not been evaluated. Nothing is deployed.
+**Status:** implementation in progress. Identity-scoped APIs, durable recording intake, the final redacted transcript pipeline, and configurable disposition identification have runnable tests. Deterministic policy evaluation now has versioned findings, but trusted connection/hold/completion metadata is not integrated, so uploaded calls remain UNKNOWN for timed rules. Seven-dimension audit scoring, analyst UI, live monitoring and deployment remain incomplete; model quality and capacity are unmeasured. Nothing is deployed.
 
 ## Read in this order
 

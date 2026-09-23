@@ -247,7 +247,7 @@ Build the entire redacted batch before starting its persistence transaction. Do 
 
 **Interfaces:** `disclosure_state(utterances: list[Utterance], opportunity_ms: int, ended: bool, reliable: bool) -> str`; `evaluate_rules(utterances, context: dict, ruleset: dict) -> list[dict]` returns versioned findings. Context includes organisation/call/revision, agent connection, tagged holds, completeness and call type.
 
-- [ ] **1. Write timing/role checks:**
+- [x] **1. Write timing/role checks:**
 
 ```python
 import unittest
@@ -265,8 +265,8 @@ class DisclosureTests(unittest.TestCase):
         self.assertEqual(disclosure_state([customer], 30000, True, True), "POTENTIAL_VIOLATION")
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_compliance -v`; expect missing rule evaluator.
-- [ ] **3. Implement temporal state** after filtering final agent text to the opportunity window and joining adjacent eligible segments:
+- [x] **2. Run:** `python -m unittest tests.test_compliance -v`; expect missing rule evaluator.
+- [x] **3. Implement temporal state** after filtering final agent text to the opportunity window and joining adjacent eligible segments:
 
 ```python
 def disclosure_state(utterances, opportunity_ms, ended, reliable):
@@ -282,9 +282,12 @@ def disclosure_state(utterances, opportunity_ms, ended, reliable):
 ```
 
 This helper's input must already be clipped to the eligible window. `evaluate_rules` computes the window from agent connection/hold intervals and passes only qualifying utterances; test this caller separately so a late disclosure cannot satisfy an opening obligation. Configure approved phrase variants in the ruleset rather than expanding this illustrative phrase silently.
-- [ ] **4. Implement call-scoped finding upsert** keyed by call/transcript/ruleset/rule/evidence. Add closing checks at drain completion, advisory sensitive-number flags and safe remediation text. Do not equate a regex hit with a confirmed regulatory violation.
-- [ ] **5. Add boundary checks:** phrase split across two final agent segments satisfies; partial phrase does not; late phrase does not; hold exclusion uses tagged intervals; two calls cannot share triggered state; incomplete audio returns UNKNOWN.
-- [ ] **6. Run module**, record example policy as synthetic-only until approved, then commit `feat: add timed policy evaluation`.
+- [x] **4. Implement call-scoped finding upsert** keyed by call/transcript/ruleset/rule/evidence. Add closing checks at drain completion, advisory sensitive-number flags and safe remediation text. Do not equate a regex hit with a confirmed regulatory violation.
+- [x] **5. Add boundary checks:** phrase split across two final agent segments satisfies; partial phrase does not; late phrase does not; hold exclusion uses tagged intervals; two calls cannot share triggered state; incomplete audio returns UNKNOWN.
+- [x] **6. Run module**, record example policy as synthetic-only until approved, then commit `feat: add timed policy evaluation`.
+
+
+**Implemented limitation/release gate:** upload intake has no trusted source for agent connection, hold intervals, call completeness or call type. These columns default to unreliable; timed disclosure/closing findings stay `UNKNOWN` until a trusted telephony context integration and its verification are implemented. Caller-supplied audio metadata does not establish timing reliability. Policy rulesets are synthetic examples until approved. No call becomes `READY` from policy findings.
 
 ## Task 5: Generate and validate evidence-backed audits
 
