@@ -308,7 +308,6 @@ async function loadCall(callId) {
 
 byId("refresh-queue").addEventListener("click", loadQueue);
 const uploadForm = byId("call-upload-form");
-const uploadButton = byId("upload-submit");
 const uploadStatus = byId("upload-status");
 function uploadStatusText(message, error = false) {
   uploadStatus.textContent = message;
@@ -323,26 +322,33 @@ uploadForm.addEventListener("submit", async (event) => {
     uploadStatusText("Choose a WAV or MP3 recording.", true);
     return;
   }
+  if (!/\.(wav|mp3)$/i.test(audio.name)) {
+    uploadStatusText("Choose a file with a .wav or .mp3 extension.", true);
+    return;
+  }
   if (audio.size > MAX_UPLOAD_BYTES) {
     uploadStatusText("The recording exceeds the 250 MiB upload limit.", true);
     return;
   }
   if (!state.uploadKey) state.uploadKey = crypto.randomUUID();
-  uploadButton.disabled = true;
+  const formData = new FormData(uploadForm);
+  for (const control of uploadForm.elements) control.disabled = true;
   uploadStatusText("Uploading recording…");
   try {
     const result = await request("/v1/calls", {
       method: "POST",
-      body: new FormData(uploadForm),
+      body: formData,
       headers: { "Idempotency-Key": state.uploadKey },
     });
     state.uploadKey = null;
     uploadForm.reset();
     uploadStatusText(`Call ${result.id} is queued for processing.`);
   } catch (error) {
-    uploadStatusText(error.message, true);
+    uploadStatusText(error.status === 409
+      ? "That external reference is already in use. Choose a new reference, or retry the unchanged upload."
+      : error.message, true);
   } finally {
-    uploadButton.disabled = false;
+    for (const control of uploadForm.elements) control.disabled = false;
   }
 });
 document.addEventListener("DOMContentLoaded", loadQueue);

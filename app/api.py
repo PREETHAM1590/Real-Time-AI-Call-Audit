@@ -19,7 +19,7 @@ from starlette.staticfiles import StaticFiles
 from app.auth import IdentityLookup, Scope, can_access, csrf_token_for_session, scope_dependency
 from app.config import Settings
 from app.db import connect
-from app.ingest import IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept_recording
+from app.ingest import ExternalReferenceConflict, IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept_recording
 from app.disposition_config import ConfigError, compile_disposition_config
 from app.disposition import classify_disposition
 from app.local_disposition_adapter import LocalVllmDispositionAdapter
@@ -661,7 +661,7 @@ def create_app(
     async def upload_call(
         audio: UploadFile = File(...),
         external_ref: str = Form(...),
-        language: str = Form("und"),
+        language: str = Form("und", max_length=32),
         idempotency_key: str = Header(alias="Idempotency-Key"),
         scope: Scope = Depends(get_scope),
     ) -> dict[str, str]:
@@ -674,6 +674,8 @@ def create_app(
             payload.extend(block)
         try:
             result = await run_in_threadpool(accept_recording, scope, external_ref, bytes(payload), {"language": language}, idempotency_key)
+        except ExternalReferenceConflict as error:
+            raise HTTPException(status_code=409, detail="External reference already exists") from error
         except IdempotencyConflict as error:
             raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing audio") from error
         except IntakeError as error:

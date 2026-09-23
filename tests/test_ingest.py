@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from app.auth import Scope
 from app.db import connect
-from app.ingest import IdempotencyConflict, IntakeError, accept_recording, claim_job, defer_job, finish_job, inspect_audio, renew_job
+from app.ingest import ExternalReferenceConflict, IdempotencyConflict, IntakeError, accept_recording, claim_job, defer_job, finish_job, inspect_audio, renew_job
 from app.migrate import migrate
 from app.storage import LocalPrivateStorage
 
@@ -36,6 +36,12 @@ class AudioValidationTests(unittest.TestCase):
             inspect_audio(wav_fixture()[:-2])
         with self.assertRaises(IntakeError):
             inspect_audio(b"RIFF" + b"not an audio file")
+
+    def test_intake_rejects_invalid_language_before_storage(self):
+        scope = Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+        for language in ("", "x" * 33, None):
+            with self.subTest(language=language), self.assertRaisesRegex(IntakeError, "language"):
+                accept_recording(scope, "external", wav_fixture(), {"language": language}, "idem")
 
     @patch("app.ingest.subprocess.run")
     def test_mp3_probe_uses_closed_temp_file_and_cleans_it(self, run):
@@ -120,6 +126,22 @@ class PostgresIngestTests(unittest.TestCase):
         self.assertEqual(raced, [first, first])
         with self.assertRaises(IdempotencyConflict):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
+        with self.assertRaises(ExternalReferenceConflict):
+            accept_recording(self.scope, "ext-1", data, {}, "new-idem-key", storage=self.storage)
+        self.assertEqual(accept_recording(self.scope, "ext-1", data, {}, "idem-1", storage=self.storage), first)
+
+        def race_external_reference(idempotency_key):
+            try:
+                return accept_recording(self.scope, "ext-race", data, {}, idempotency_key, storage=self.storage)
+            except ExternalReferenceConflict:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            external_ref_race = list(pool.map(race_external_reference, ("race-key-a", "race-key-b")))
+        accepted = [result for result in external_ref_race if result != "conflict"]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(external_ref_race.count("conflict"), 1)
+        self.created_call_ids.add(accepted[0]["id"])
         with connect() as connection_a, connect() as connection_b:
             self.assertIsNone(claim_job(connection_a, "worker-a", supported_stages=()))
             for _ in range(6):

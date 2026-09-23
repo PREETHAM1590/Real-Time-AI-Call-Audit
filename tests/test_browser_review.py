@@ -5,6 +5,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
+import time
 import unittest
 from urllib.parse import urlsplit
 
@@ -26,6 +27,78 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 @unittest.skipIf(sync_playwright is None, "Install the optional browser-test extra and Chromium to run the browser check")
 class AnalystBrowserSmokeTests(unittest.TestCase):
+    def test_upload_disables_form_until_delayed_response_and_rejects_other_extensions(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        uploads = []
+
+        class DelayedUploadHandler(QuietHandler):
+            def do_GET(self):
+                path = urlsplit(self.path).path
+                if path == "/v1/csrf":
+                    body = json.dumps({"csrf_token": "synthetic-csrf"}).encode()
+                elif path == "/v1/reviews/queue":
+                    body = json.dumps({"items": []}).encode()
+                else:
+                    return super().do_GET()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                path = urlsplit(self.path).path
+                if path != "/v1/calls":
+                    self.send_error(404)
+                    return
+                uploads.append({"headers": dict(self.headers), "body": self.rfile.read(int(self.headers.get("Content-Length", "0")))})
+                time.sleep(0.5)
+                body = json.dumps({"id": "delayed-call", "processing_state": "QUEUED"}).encode()
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(DelayedUploadHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                page.get_by_label("External reference").fill("synthetic-delayed-ref")
+                page.get_by_label("Language").fill("en")
+                self.assertEqual(page.get_by_label("Language").get_attribute("maxlength"), "32")
+                page.locator("#upload-audio").set_input_files({"name": "synthetic.txt", "mimeType": "text/plain", "buffer": b"synthetic"})
+                page.get_by_role("button", name="Upload recording").click()
+                page.get_by_text("Choose a file with a .wav or .mp3 extension.").wait_for()
+                self.assertEqual(uploads, [])
+
+                page.locator("#upload-audio").set_input_files({"name": "synthetic.wav", "mimeType": "audio/wav", "buffer": b"synthetic wav fixture"})
+                page.get_by_role("button", name="Upload recording").click()
+                page.wait_for_function("document.querySelector('#upload-submit').disabled")
+                controls = page.locator("#call-upload-form").evaluate("form => [...form.elements].map(node => [node.id, node.disabled])")
+                self.assertTrue(all(disabled for _, disabled in controls), controls)
+                self.assertEqual(page.locator("#upload-external-ref").input_value(), "synthetic-delayed-ref")
+                page.get_by_text("Call delayed-call is queued for processing.").wait_for()
+                self.assertTrue(page.locator("#call-upload-form").evaluate("form => [...form.elements].every(node => !node.disabled)"))
+                self.assertEqual(page.locator("#upload-external-ref").input_value(), "")
+                self.assertEqual(len(uploads), 1)
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_manual_upload_multipart_csrf_queue_and_retry_key(self):
         web_root = Path(__file__).resolve().parent.parent / "web"
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))

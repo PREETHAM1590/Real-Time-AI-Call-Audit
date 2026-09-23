@@ -19,7 +19,7 @@ from app.api import MULTIPART_OVERHEAD_BYTES, UploadBodyLimitMiddleware, create_
 from app.config import Settings
 from app.contracts import PersistedUtterance, Utterance
 from app.db import connect
-from app.ingest import MAX_AUDIO_BYTES
+from app.ingest import ExternalReferenceConflict, MAX_AUDIO_BYTES
 from app.migrate import migrate
 from app.reviews import ReviewNotFound
 
@@ -308,6 +308,26 @@ class ApiContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 403)
         staff.close()
+
+    def test_upload_maps_external_reference_conflict_to_safe_409_and_limits_language(self):
+        headers = {"Authorization": f"Bearer {self.token()}", "Idempotency-Key": "request-conflict"}
+        with patch("app.api.accept_recording", side_effect=ExternalReferenceConflict("External reference already exists")):
+            response = self.client.post(
+                "/v1/calls",
+                headers=headers,
+                files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+                data={"external_ref": "existing-reference", "language": "en"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"detail": "External reference already exists"})
+
+        too_long = self.client.post(
+            "/v1/calls",
+            headers={**headers, "Idempotency-Key": "request-long-language"},
+            files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+            data={"external_ref": "language-limit", "language": "x" * 33},
+        )
+        self.assertEqual(too_long.status_code, 422)
 
     def test_forbidden_origin_is_rejected(self):
         response = self.client.options(

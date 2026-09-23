@@ -29,6 +29,10 @@ class IdempotencyConflict(IntakeError):
     pass
 
 
+class ExternalReferenceConflict(IntakeError):
+    pass
+
+
 def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
     if not audio or len(audio) > MAX_AUDIO_BYTES:
         raise IntakeError("Audio size is invalid")
@@ -88,6 +92,9 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
         raise IntakeError("Recording intake requires an agent identity and one server-resolved team")
     if not idempotency_key or len(idempotency_key) > 200 or not external_ref or len(external_ref) > 300:
         raise IntakeError("Invalid idempotency key or external reference")
+    language = metadata.get("language", "und")
+    if not isinstance(language, str) or not language or len(language) > 32:
+        raise IntakeError("Invalid language")
     codec, rate, channels, duration = inspect_audio(audio)
     checksum = hashlib.sha256(audio).hexdigest()
     storage = storage or LocalPrivateStorage(os.environ.get("AUDIO_STORAGE_PATH", "./private-audio"))
@@ -97,11 +104,13 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
     try:
         with connect() as connection:
             with connection.transaction():
-                inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT (organisation_id,idempotency_key) DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, scope.user_id if scope.role == "AGENT" else "", next(iter(scope.team_ids)) if scope.role == "AGENT" and len(scope.team_ids) == 1 else "", str(metadata.get("language", "und")))).fetchone()
+                inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, scope.user_id if scope.role == "AGENT" else "", next(iter(scope.team_ids)) if scope.role == "AGENT" and len(scope.team_ids) == 1 else "", language)).fetchone()
                 if inserted is None:
-                    existing = connection.execute("SELECT id,payload_sha256,processing_state FROM calls WHERE organisation_id=%s AND idempotency_key=%s", (scope.organisation_id, idempotency_key)).fetchone()
+                    existing = connection.execute("SELECT id,payload_sha256,processing_state,idempotency_key FROM calls WHERE organisation_id=%s AND (idempotency_key=%s OR external_ref=%s) ORDER BY (idempotency_key=%s) DESC LIMIT 1", (scope.organisation_id, idempotency_key, external_ref, idempotency_key)).fetchone()
                     if existing is None:
                         raise IntakeError("Call reference already exists")
+                    if existing[3] != idempotency_key:
+                        raise ExternalReferenceConflict("External reference already exists")
                     if existing[1] != checksum:
                         raise IdempotencyConflict("Idempotency key reused with different audio")
                     result = {"id": str(existing[0]), "processing_state": existing[2]}

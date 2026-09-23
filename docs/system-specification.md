@@ -214,7 +214,7 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 
 | Endpoint | Contract |
 |---|---|
-| POST /v1/calls | Authenticated multipart audio + external_ref and language; agent uploads derive agent/team from server identity and membership, never multipart values. QA/admin/service uploads require a trusted server-side assignment mapping. Return 202 with id/state; same Idempotency-Key and payload returns same result; conflicting payload is 409 |
+| POST /v1/calls | Authenticated multipart audio + external_ref and language (≤32 characters); agent uploads derive agent/team from server identity and membership, never multipart values. QA/admin/service uploads require a trusted server-side assignment mapping. Return 202 with id/state; same Idempotency-Key and payload returns same result; conflicting payload or already-used external_ref is 409, including concurrent intake races |
 | GET /v1/calls | Scoped filters for state, risk, agent and date; limit 1–100; opaque cursor; redacted summary |
 | GET /v1/calls/{id} | Scoped call, current audit, final transcript and findings; missing or out-of-scope ID returns 404 |
 | GET /v1/calls/{id}/disposition | Scoped current disposition plus config/model provenance and review state |
