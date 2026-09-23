@@ -26,6 +26,82 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 @unittest.skipIf(sync_playwright is None, "Install the optional browser-test extra and Chromium to run the browser check")
 class AnalystBrowserSmokeTests(unittest.TestCase):
+    def test_manual_upload_multipart_csrf_queue_and_retry_key(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        uploads = []
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+
+                def handle_api(route):
+                    path = urlsplit(route.request.url).path
+                    if path == "/v1/csrf":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({"csrf_token": "synthetic-csrf"}))
+                    elif path == "/v1/reviews/queue":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({"items": []}))
+                    elif path == "/v1/calls" and route.request.method == "POST":
+                        uploads.append({
+                            "headers": route.request.headers,
+                            "body": route.request.post_data_buffer,
+                        })
+                        if len(uploads) == 1:
+                            route.abort("failed")
+                        else:
+                            route.fulfill(status=202, content_type="application/json", body=json.dumps({"id": f"synthetic-call-{len(uploads) - 1}", "processing_state": "QUEUED"}))
+                    else:
+                        route.fulfill(status=404, content_type="application/json", body="{}")
+
+                page.route("**/v1/**", handle_api)
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                self.assertIn("exactly one server-resolved team", page.locator("#upload-title").locator("xpath=following-sibling::p").inner_text())
+                page.get_by_label("External reference").fill("synthetic-reference")
+                page.get_by_label("Language").fill("en")
+                page.locator("#upload-audio").set_input_files({"name": "synthetic.wav", "mimeType": "audio/wav", "buffer": b"synthetic wav fixture"})
+                page.locator("#upload-audio").evaluate("input => Object.defineProperty(input.files[0], 'size', { configurable: true, value: 250 * 1024 * 1024 + 1 })")
+                page.get_by_role("button", name="Upload recording").click()
+                page.get_by_text("The recording exceeds the 250 MiB upload limit.").wait_for()
+                self.assertEqual(len(uploads), 0)
+
+                page.locator("#upload-audio").set_input_files({"name": "synthetic.wav", "mimeType": "audio/wav", "buffer": b"synthetic wav fixture"})
+                page.get_by_role("button", name="Upload recording").click()
+                page.wait_for_function("document.querySelector('#upload-status').textContent.length > 0")
+                self.assertTrue(page.locator("#upload-status").evaluate("node => node.classList.contains('error')"))
+                self.assertEqual(len(uploads), 1)
+
+                first_headers = uploads[0]["headers"]
+                first_key = first_headers.get("idempotency-key")
+                self.assertTrue(first_key)
+                self.assertEqual(first_headers.get("x-csrf-token"), "synthetic-csrf")
+                self.assertRegex(first_headers.get("content-type", ""), r"^multipart/form-data; boundary=")
+                self.assertNotEqual(first_headers.get("content-type"), "application/json")
+                first_body = uploads[0]["body"]
+                self.assertIn(b'name="external_ref"', first_body)
+                self.assertIn(b"synthetic-reference", first_body)
+                self.assertIn(b'name="language"', first_body)
+                self.assertIn(b'filename="synthetic.wav"', first_body)
+                self.assertIn(b"synthetic wav fixture", first_body)
+
+                page.get_by_role("button", name="Upload recording").click()
+                page.get_by_text("Call synthetic-call-1 is queued for processing.").wait_for()
+                self.assertEqual(len(uploads), 2)
+                self.assertEqual(uploads[1]["headers"].get("idempotency-key"), first_key)
+                self.assertEqual(uploads[1]["headers"].get("x-csrf-token"), "synthetic-csrf")
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_queue_evidence_navigation_and_reasoned_review(self):
         web_root = Path(__file__).resolve().parent.parent / "web"
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))

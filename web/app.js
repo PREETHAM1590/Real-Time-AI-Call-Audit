@@ -1,7 +1,8 @@
 "use strict";
 
 const dimensions = ["greeting", "listening", "resolution", "compliance", "clarity", "objection", "closing"];
-const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false };
+const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false, uploadKey: null };
 const byId = (id) => document.getElementById(id);
 
 function element(tag, text, className) {
@@ -19,7 +20,7 @@ function timestamp(ms) {
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
-  if (options.body !== undefined) headers.set("Content-Type", "application/json");
+  if (typeof options.body === "string") headers.set("Content-Type", "application/json");
   if ((options.method || "GET") !== "GET") {
     const csrf = await fetch("/v1/csrf", { credentials: "include", headers: { Accept: "application/json" } });
     if (!csrf.ok) throw new Error("Your session could not be verified. Sign in again and reload this page.");
@@ -306,4 +307,42 @@ async function loadCall(callId) {
 }
 
 byId("refresh-queue").addEventListener("click", loadQueue);
+const uploadForm = byId("call-upload-form");
+const uploadButton = byId("upload-submit");
+const uploadStatus = byId("upload-status");
+function uploadStatusText(message, error = false) {
+  uploadStatus.textContent = message;
+  uploadStatus.classList.toggle("error", error);
+}
+uploadForm.addEventListener("input", () => { state.uploadKey = null; });
+uploadForm.addEventListener("change", () => { state.uploadKey = null; });
+uploadForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const audio = byId("upload-audio").files[0];
+  if (!audio) {
+    uploadStatusText("Choose a WAV or MP3 recording.", true);
+    return;
+  }
+  if (audio.size > MAX_UPLOAD_BYTES) {
+    uploadStatusText("The recording exceeds the 250 MiB upload limit.", true);
+    return;
+  }
+  if (!state.uploadKey) state.uploadKey = crypto.randomUUID();
+  uploadButton.disabled = true;
+  uploadStatusText("Uploading recording…");
+  try {
+    const result = await request("/v1/calls", {
+      method: "POST",
+      body: new FormData(uploadForm),
+      headers: { "Idempotency-Key": state.uploadKey },
+    });
+    state.uploadKey = null;
+    uploadForm.reset();
+    uploadStatusText(`Call ${result.id} is queued for processing.`);
+  } catch (error) {
+    uploadStatusText(error.message, true);
+  } finally {
+    uploadButton.disabled = false;
+  }
+});
 document.addEventListener("DOMContentLoaded", loadQueue);

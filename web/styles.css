@@ -18,6 +18,14 @@ h2 { margin: 0 0 .8rem; }
 .queue-list { list-style: none; padding: 0; margin: 0; display: grid; gap: .5rem; }
 .queue-list button { width: 100%; text-align: left; }
 .queue-list button[aria-current="true"] { border-width: 2px; background: #e8f1f8; }
+.upload-panel { margin-bottom: 1.25rem; padding-bottom: 1rem; border-bottom: 1px solid #d9e2ec; }
+.upload-panel h2 { margin-bottom: .4rem; }
+.upload-panel p { line-height: 1.4; }
+.upload-form { display: grid; gap: .45rem; }
+.upload-form label { font-weight: 650; }
+.upload-form input { width: 100%; min-height: 2.5rem; padding: .4rem; font: inherit; }
+.upload-form small { color: #486581; line-height: 1.4; }
+.upload-form input:focus-visible { outline: 3px solid #f0a202; outline-offset: 2px; }
 .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .5rem; margin: 1rem 0; }
 .summary-card, .finding, .dimension, .transcript-row, .review-entry { border: 1px solid #d9e2ec; border-radius: .35rem; padding: .65rem; }
 .summary-card strong, .dimension h4 { display: block; }

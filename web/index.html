@@ -14,6 +14,22 @@
     </header>
     <main class="layout">
       <section aria-labelledby="queue-title" class="queue-panel">
+        <section aria-labelledby="upload-title" class="upload-panel">
+          <h2 id="upload-title">Upload a call</h2>
+          <p>Manual uploads require an AGENT account with exactly one server-resolved team. QA and administrator accounts cannot upload recordings.</p>
+          <form id="call-upload-form" class="upload-form">
+            <label for="upload-external-ref">External reference</label>
+            <input id="upload-external-ref" name="external_ref" maxlength="300" required autocomplete="off">
+            <label for="upload-language">Language</label>
+            <input id="upload-language" name="language" value="en" maxlength="35" required aria-describedby="upload-language-help">
+            <small id="upload-language-help">Use a language tag such as en, or und when unknown.</small>
+            <label for="upload-audio">Call recording (WAV or MP3)</label>
+            <input id="upload-audio" name="audio" type="file" accept=".wav,.mp3,audio/wav,audio/mpeg" required aria-describedby="upload-audio-help">
+            <small id="upload-audio-help">Maximum file size: 250 MiB. Use synthetic recordings until real-data processing and retention policies are approved.</small>
+            <button id="upload-submit" type="submit">Upload recording</button>
+            <p id="upload-status" class="status" role="status" aria-live="polite"></p>
+          </form>
+        </section>
         <div class="section-heading"><h2 id="queue-title">Review queue</h2><button id="refresh-queue" type="button">Refresh</button></div>
         <p id="queue-status" class="status" role="status" aria-live="polite"></p>
         <ol id="queue-list" class="queue-list"></ol>
