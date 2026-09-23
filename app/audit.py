@@ -36,6 +36,11 @@ MAX_AUDIT_RESPONSE_BYTES = 1_048_576
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
+def _bounded_identifier(value: Any) -> bool:
+    """Check an untrusted identifier before using it as a mapping/set key."""
+    return isinstance(value, str) and 1 <= len(value) <= 128
+
+
 class AuditValidationError(ValueError):
     """Untrusted audit output does not satisfy the canonical schema."""
 
@@ -65,12 +70,17 @@ def validate_evidence(evidence: list[dict], utterances: Sequence[Utterance | Map
         else:
             get = lambda name, default=None: getattr(utterance, name, default)
         if get("is_final", True) is True:
-            final[get("id")] = utterance
+            source_id = get("id")
+            if not _bounded_identifier(source_id):
+                raise AuditValidationError("INVALID_CANONICAL_UTTERANCE_ID")
+            final[source_id] = utterance
     output = []
     for item in evidence:
         if not isinstance(item, Mapping) or set(item) != {"utterance_id", "quote"}:
             raise AuditValidationError("INVALID_EVIDENCE")
         utterance_id, quote = item.get("utterance_id"), item.get("quote")
+        if not _bounded_identifier(utterance_id):
+            raise AuditValidationError("INVALID_EVIDENCE")
         source = final.get(utterance_id)
         if source is None or not isinstance(quote, str) or not quote.strip() or len(quote) > 500:
             raise AuditValidationError("INVALID_EVIDENCE")
@@ -177,7 +187,7 @@ def _validate_model_response(raw: Any, utterances: Sequence[Utterance | Mapping[
         if not isinstance(item, Mapping) or set(item) != {"id", "status", "score", "reason", "evidence"}:
             raise AuditValidationError("INVALID_DIMENSION")
         dimension_id, status, score, reason = item.get("id"), item.get("status"), item.get("score"), item.get("reason")
-        if dimension_id not in DIMENSION_WEIGHTS or dimension_id in by_id:
+        if not isinstance(dimension_id, str) or len(dimension_id) > 32 or dimension_id not in DIMENSION_WEIGHTS or dimension_id in by_id:
             raise AuditValidationError("INVALID_DIMENSION_ID")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 1500:
             raise AuditValidationError("INVALID_REASON")
@@ -208,7 +218,16 @@ def _validate_model_response(raw: Any, utterances: Sequence[Utterance | Mapping[
             raise AuditValidationError("NARRATIVE_REQUIRES_EVIDENCE")
         return {"text": text.strip(), "evidence": evidence}
 
-    narrative = validate_narrative(raw.get("coaching_narrative"), require_evidence=True)
+    has_agent_evidence = any(
+        (utterance.get("is_final", True) is True and utterance.get("role") == "AGENT")
+        if isinstance(utterance, Mapping)
+        else (utterance.is_final is True and utterance.role == "AGENT")
+        for utterance in utterances
+    )
+    narrative_value = raw.get("coaching_narrative")
+    narrative = validate_narrative(narrative_value, require_evidence=has_agent_evidence)
+    if not has_agent_evidence and narrative["text"]:
+        raise AuditValidationError("NARRATIVE_WITHOUT_AGENT_EVIDENCE")
     validated_lists = {}
     for field in ("highlights", "improvement_areas"):
         entries = raw.get(field)
@@ -253,9 +272,10 @@ def audit_call(call: Mapping[str, Any], utterances: Sequence[Utterance | Mapping
     policy_fingerprint = hashlib.sha256(json.dumps(policy_provenance, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     started = time.monotonic()
     attempts = 0
+    usage: dict[str, int] = {}
 
     def review(reason: str) -> dict[str, Any]:
-        return _review_result(call, compiled, reason, model_artifact=artifact, inference_runtime=runtime, prompt_version=prompt_version, prompt_hash=prompt_hash, usage=getattr(adapter, "usage", {}), attempts=attempts, latency_ms=max(0, int((time.monotonic() - started) * 1000)), policy_provenance=policy_provenance)
+        return _review_result(call, compiled, reason, model_artifact=artifact, inference_runtime=runtime, prompt_version=prompt_version, prompt_hash=prompt_hash, usage=usage, attempts=attempts, latency_ms=max(0, int((time.monotonic() - started) * 1000)), policy_provenance=policy_provenance)
 
     if not utterances or any(not (u.get("is_final", True) if isinstance(u, Mapping) else u.is_final) for u in utterances):
         return review("INCOMPLETE_TRANSCRIPT")
@@ -282,6 +302,15 @@ def audit_call(call: Mapping[str, Any], utterances: Sequence[Utterance | Mapping
             attempt_payload = {**payload, "validation_errors": errors} if errors else payload
             attempts += 1
             raw = adapter.evaluate(attempt_payload)
+            observed_usage = getattr(adapter, "usage", {})
+            if isinstance(observed_usage, Mapping):
+                usage = {
+                    key: value for key, value in observed_usage.items()
+                    if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+                    and isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                }
+            else:
+                usage = {}
             validated = _validate_model_response(raw, utterances, compiled, objection_absent_confirmed=call.get("objection_absent_confirmed") is True)
             break
         except AuditValidationError as error:
@@ -310,7 +339,7 @@ def audit_call(call: Mapping[str, Any], utterances: Sequence[Utterance | Mapping
         **validated, "decision": decision, "review_reason": review_reason, "attempts": attempts,
         "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
         "policy_provenance": policy_provenance, "policy_fingerprint": policy_fingerprint,
-        "usage": dict(getattr(adapter, "usage", {}) or {}),
+        "usage": usage,
     }
 
 
@@ -469,6 +498,6 @@ def persist_audit(connection, organisation_id, call_id, transcript_revision: int
     connection.execute(
         "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,review_reason,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s) "
-        "ON CONFLICT (organisation_id,call_id,transcript_revision,model_artifact,prompt_hash,rubric_hash,policy_fingerprint) DO NOTHING",
+        "ON CONFLICT (organisation_id,call_id,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_hash,policy_fingerprint) DO NOTHING",
         (organisation_id, uuid4(), call_id, revision, transcript_revision, audit["model_artifact"], audit["inference_runtime"], audit["prompt_version"], audit["prompt_hash"], audit["rubric_version"], audit["rubric_hash"], json.dumps(policy_records, sort_keys=True), policy_fingerprint, json.dumps(audit["dimensions"], ensure_ascii=False), audit["overall_score"], audit["decision"], audit["review_reason"], json.dumps(audit["coaching_narrative"], ensure_ascii=False), json.dumps(audit["highlights"], ensure_ascii=False), json.dumps(audit["improvement_areas"], ensure_ascii=False), json.dumps(audit["usage"], ensure_ascii=False), attempts, latency_ms),
     )

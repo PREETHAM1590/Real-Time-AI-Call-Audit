@@ -332,7 +332,7 @@ The caller fetches only the authorised call's pinned transcript revision. Valida
 - [x] **6. Add score checks:** all scores 3 gives 3.00; objection N/A requires a server fact; missing required score yields null/NEEDS_REVIEW; duplicate dimensions, nonfinite scores, out-of-range values and unsupported citations are rejected. Transcript instructions remain untrusted data.
 - [x] **7. Run the full suite with PostgreSQL integrations on an isolated `_test` database**, then commit `feat: add validated call audits`.
 
-**Implemented limitation/release gate:** audit code, persistence and worker integration use deterministic fakes in tests, but no approved production model artifact, hardware, quality dataset, token-budget calibration or load/latency measurement exists. Calls remain `NEEDS_REVIEW` because the analyst review stage is Task 6 and trusted timed-policy inputs are not integrated. This slice does not establish production readiness.
+**Implemented limitation/release gate:** audit code, persistence and worker integration use deterministic fakes in tests; database triggers reject audit updates/deletes, and immutable identity includes inference runtime and prompt version as well as their hashes. Malformed model identifiers fail closed, and no-agent transcripts abstain without a coaching claim. No approved production model artifact, hardware, quality dataset, token-budget calibration or load/latency measurement exists. Calls remain `NEEDS_REVIEW` because the analyst review stage is Task 6 and trusted timed-policy inputs are not integrated. This slice does not establish production readiness.
 
 ## Task 6: Deliver analyst review and evidence navigation
 

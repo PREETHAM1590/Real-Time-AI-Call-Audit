@@ -146,7 +146,7 @@ This is the target lifecycle. The current worker queues disposition (`ANALYSE`) 
 
 Any processing state can become `RETRY_WAIT`, `NEEDS_REVIEW`, or `FAILED`; deletion uses `DELETING → DELETED`. Store the failing stage and a safe error code separately. Processing state and audit decision are different fields.
 
-A worker claims a job in a short transaction, releases its lock, performs bounded external work, then commits using a lease token. Lease expiration permits recovery; stale workers cannot overwrite newer results. Unique keys make stage effects idempotent. Audit identity includes transcript/rules/prompt/rubric/model revisions. Disposition results likewise record transcript revision, immutable config/schema/resolver versions and model artifact. A late transcript revision creates new audit and disposition revisions and marks older outputs superseded.
+A worker claims a job in a short transaction, releases its lock, performs bounded external work, then commits using a lease token. Lease expiration permits recovery; stale workers cannot overwrite newer results. Unique keys make stage effects idempotent. Audit identity includes transcript/rules/prompt version and hash/rubric/model artifact/inference runtime revisions; audit rows reject update and delete operations. Disposition results likewise record transcript revision, immutable config/schema/resolver versions and model artifact. A late transcript revision creates new audit and disposition revisions and marks older outputs superseded.
 
 ### Configurable disposition identification
 
