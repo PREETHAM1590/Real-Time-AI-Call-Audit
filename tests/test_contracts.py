@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from unittest.mock import patch, MagicMock
 
 from app.auth import Scope, can_access
 from app.api import create_app
@@ -125,15 +126,11 @@ class ApiContractTests(unittest.TestCase):
             oidc_public_key=public_key,
             allowed_origins=("https://audit.example.test",),
         )
-        identities = {"user-a": Scope("org-a", "agent-a", "AGENT", frozenset())}
+        identities = {"user-a": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))}
         self.client = TestClient(
             create_app(
                 self.settings,
                 identity_lookup=identities.get,
-                call_scopes={
-                    "call-a": ("org-a", "agent-a", "team-a"),
-                    "call-b": ("org-b", "agent-b", "team-b"),
-                },
             )
         )
 
@@ -172,8 +169,40 @@ class ApiContractTests(unittest.TestCase):
         )
 
         headers = {"Authorization": f"Bearer {self.token()}"}
-        self.assertEqual(self.client.get("/v1/calls/call-a", headers=headers).status_code, 200)
-        self.assertEqual(self.client.get("/v1/calls/call-b", headers=headers).status_code, 404)
+        connection = MagicMock()
+        connection.__enter__.return_value.execute.return_value.fetchone.side_effect = [
+            ("call-a", "org-a", "agent-a", "team-a", "QUEUED"),
+            None,
+        ]
+        with patch("app.api.connect", return_value=connection):
+            self.assertEqual(self.client.get("/v1/calls/call-a", headers=headers).json(), {"id": "call-a", "processing_state": "QUEUED"})
+            self.assertEqual(self.client.get("/v1/calls/call-b", headers=headers).status_code, 404)
+        params = connection.__enter__.return_value.execute.call_args_list
+        self.assertEqual(params[0].args[1][0], "org-a")
+
+    def test_upload_uses_server_identity_and_rejects_unmapped_assignment(self):
+        headers = {"Authorization": f"Bearer {self.token()}"}
+        with patch("app.api.accept_recording", return_value={"id": "call-a", "processing_state": "QUEUED"}) as accept:
+            response = self.client.post(
+                "/v1/calls",
+                headers={**headers, "Idempotency-Key": "request-1"},
+                files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+                data={"external_ref": "external-1", "agent_id": "forged", "team_id": "other-team"},
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(accept.call_args.args[3], {"language": "und"})
+        self.assertEqual(accept.call_args.args[0], Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"})))
+
+        app = create_app(self.settings, identity_lookup=lambda _: Scope("org-a", "qa-a", "QA_ANALYST", frozenset()))
+        staff = TestClient(app)
+        response = staff.post(
+            "/v1/calls",
+            headers={"Authorization": f"Bearer {self.token()}", "Idempotency-Key": "request-2"},
+            files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+            data={"external_ref": "external-2", "agent_id": "forged", "team_id": "other-team"},
+        )
+        self.assertEqual(response.status_code, 403)
+        staff.close()
 
     def test_forbidden_origin_is_rejected(self):
         response = self.client.options(

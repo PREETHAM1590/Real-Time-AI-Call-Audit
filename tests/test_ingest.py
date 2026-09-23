@@ -3,8 +3,10 @@ import os
 import tempfile
 import unittest
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app.auth import Scope
 from app.db import connect
@@ -26,13 +28,17 @@ def wav_fixture() -> bytes:
 class AudioValidationTests(unittest.TestCase):
     def test_valid_synthetic_wav_and_spoof_rejected(self):
         self.assertEqual(inspect_audio(wav_fixture()), ("wav", 16000, 1, 100))
+        with self.assertRaisesRegex(IntakeError, "Truncated"):
+            inspect_audio(wav_fixture()[:-2])
         with self.assertRaises(IntakeError):
             inspect_audio(b"RIFF" + b"not an audio file")
 
 
-@unittest.skipUnless(os.environ.get("DATABASE_URL"), "DATABASE_URL required for isolated PostgreSQL integration")
+@unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
 class PostgresIngestTests(unittest.TestCase):
     def setUp(self):
+        if not os.environ.get("DATABASE_URL"):
+            raise RuntimeError("RUN_POSTGRES_INTEGRATION=1 requires DATABASE_URL for an isolated PostgreSQL database ending in _test")
         parsed = urlparse(os.environ["DATABASE_URL"])
         if not (parsed.path or "").lstrip("/").endswith("_test"):
             raise RuntimeError("Refusing integration tests unless DATABASE_URL database name ends in _test")
@@ -42,29 +48,67 @@ class PostgresIngestTests(unittest.TestCase):
         self.storage_dir = tempfile.TemporaryDirectory()
         self.storage = LocalPrivateStorage(self.storage_dir.name)
         with connect() as connection:
-            connection.execute("INSERT INTO organisations(id) VALUES (%s) ON CONFLICT DO NOTHING", (self.organisation_id,))
+            self.created_organisation = connection.execute("INSERT INTO organisations(id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING id", (self.organisation_id,)).fetchone() is not None
+        self.created_call_ids = set()
 
     def tearDown(self):
-        with connect() as connection:
-            connection.execute("DELETE FROM organisations WHERE id=%s AND NOT EXISTS (SELECT 1 FROM calls WHERE organisation_id=%s)", (self.organisation_id, self.organisation_id))
+        if self.created_call_ids:
+            with connect() as connection:
+                call_ids = [UUID(value) for value in self.created_call_ids]
+                connection.execute("DELETE FROM jobs WHERE organisation_id=%s AND call_id=ANY(%s)", (self.organisation_id, call_ids))
+                connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=ANY(%s)", (self.organisation_id, call_ids))
+                connection.execute("DELETE FROM calls WHERE organisation_id=%s AND id=ANY(%s)", (self.organisation_id, call_ids))
+        if self.created_organisation:
+            with connect() as connection:
+                connection.execute("DELETE FROM organisations WHERE id=%s", (self.organisation_id,))
         self.storage_dir.cleanup()
 
     def test_intake_idempotency_conflict_and_lease_recovery(self):
         data = wav_fixture()
         first = accept_recording(self.scope, "ext-1", data, {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
+        self.created_call_ids.add(first["id"])
         again = accept_recording(self.scope, "ext-1", data, {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
         self.assertEqual(first, again)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            raced = list(pool.map(lambda _: accept_recording(self.scope, "ext-1", data, {}, "idem-1", storage=self.storage), range(2)))
+        self.assertEqual(raced, [first, first])
         with self.assertRaises(IdempotencyConflict):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
-        with connect() as connection:
-            one = claim_job(connection, "worker-a")
+        with connect() as connection_a, connect() as connection_b:
+            one = claim_job(connection_a, "worker-a")
             self.assertIsNotNone(one)
-            self.assertIsNone(claim_job(connection, "worker-b"))
-            connection.execute("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE id=%s", (one["id"],))
-            two = claim_job(connection, "worker-b")
+            self.assertIsNone(claim_job(connection_b, "worker-b"))
+            connection_a.execute("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE organisation_id=%s AND id=%s", (self.organisation_id, one["id"]))
+            two = claim_job(connection_b, "worker-b")
             self.assertEqual(one["id"], two["id"])
-            self.assertFalse(finish_job(connection, str(one["id"]), str(one["lease_token"]), {}))
-            self.assertTrue(finish_job(connection, str(two["id"]), str(two["lease_token"]), {}))
+            self.assertFalse(finish_job(connection_a, str(one["id"]), str(one["lease_token"]), {}))
+            connection_b.execute("UPDATE calls SET tombstoned_at=now() WHERE organisation_id=%s AND id=%s", (self.organisation_id, first["id"]))
+            self.assertFalse(finish_job(connection_b, str(two["id"]), str(two["lease_token"]), {}))
+
+    def test_tombstone_does_not_starve_next_job(self):
+        one = accept_recording(self.scope, "ext-1", wav_fixture(), {}, "idem-1", storage=self.storage)
+        two = accept_recording(self.scope, "ext-2", wav_fixture(), {}, "idem-2", storage=self.storage)
+        self.created_call_ids.update((one["id"], two["id"]))
+        with connect() as connection:
+            connection.execute("UPDATE calls SET tombstoned_at=now() WHERE organisation_id=%s AND id=%s", (self.organisation_id, one["id"]))
+            claimed = claim_job(connection, "worker")
+            self.assertEqual(str(claimed["call_id"]), two["id"])
+
+
+class StorageCleanupTests(unittest.TestCase):
+    def test_only_old_unreferenced_objects_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = LocalPrivateStorage(directory)
+            orphan = Path(directory, "orphan.audio")
+            retained = Path(directory, "retained.audio")
+            orphan.write_bytes(b"orphan")
+            retained.write_bytes(b"retained")
+            old = (Path(directory).stat().st_mtime - 2 * 86400)
+            os.utime(orphan, (old, old))
+            os.utime(retained, (old, old))
+            self.assertEqual(storage.delete_orphans({"retained.audio"}), 1)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(retained.exists())
 
 
 if __name__ == "__main__":

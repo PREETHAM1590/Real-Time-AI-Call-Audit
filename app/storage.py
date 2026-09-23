@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -29,3 +30,16 @@ class LocalPrivateStorage:
         if Path(key).name != key:
             raise ValueError("invalid storage key")
         (self.root / key).unlink(missing_ok=True)
+
+    def delete_orphans(self, referenced: set[str], *, older_than: timedelta = timedelta(days=1)) -> int:
+        cutoff = datetime.now(timezone.utc).timestamp() - older_than.total_seconds()
+        removed = 0
+        for item in self.root.glob("*.audio"):
+            if item.name not in referenced:
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink(missing_ok=True)
+                        removed += 1
+                except FileNotFoundError:
+                    pass
+        return removed
