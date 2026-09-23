@@ -375,7 +375,7 @@ The browser test supplies deterministic synthetic fixtures and does not disable 
 
 **Interfaces:** `FinalBuffer.apply(segment_id: str, text: str, final: bool) -> None`, `FinalBuffer.final_text() -> str`; `MediaSession.accept(frame: dict) -> list[bytes]` emits ordered validated audio; session identity includes a generation token so old reconnects cannot write to the active call.
 
-- [ ] **1. Write partial/final/deduplication check:**
+- [x] **1. Write partial/final/deduplication check:** `tests/test_media.py` covers partial replacement, empty final output before finalization, duplicate finals, immunity to late partials and caller-supplied final ordering.
 
 ```python
 import unittest
@@ -392,8 +392,8 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(buffer.final_text(), "may be recorded")
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_media -v`; expect missing buffer/session implementation.
-- [ ] **3. Implement segment finality:**
+- [x] **2. Run:** `python -m unittest tests.test_media -v`; the test-first run failed because `app.media` did not exist, then passed after implementation.
+- [x] **3. Implement segment finality:** `app.media.FinalBuffer` replaces partials, promotes a segment once, ignores later partials and duplicate finals, and joins finals in first-finalized order. The helper has no timestamps, so callers must supply canonical order; timestamp sorting remains at the persistence boundary.
 
 ```python
 class FinalBuffer:
@@ -414,7 +414,9 @@ class FinalBuffer:
         return " ".join(self.finals.values())
 ```
 
-Use canonical timestamp sorting when persisting utterances; the helper above receives ordered segments. Corrections to already-final local segments are explicit transcript revisions, not silent replacement.
+Use canonical timestamp sorting when persisting utterances; the helper receives ordered segments. Corrections to already-final local segments are explicit transcript revisions, not silent replacement.
+
+**Task 7 status:** provider-independent `FinalBuffer` steps 1–3 are implemented and checked. No telephony adapter, worker/API integration, or DRAINING workflow is implemented by this slice.
 - [ ] **4. Implement one telephony media adapter** after inspecting that platform's current authentication and media format. Validate signature/session scope, track IDs, codec, sequence, timestamps, payload length and base64. Bound input queue by bytes and time; 200-ms reorder buffer initially. Reject replayed sessions and mark gaps instead of filling fabricated audio. Send bounded overlapping speech windows from local Silero VAD to local faster-whisper; record window-to-stable-final latency and correction rate.
 - [ ] **5. Implement DRAINING:** run a final local decode/reconciliation at call end; wait for a benchmarked bounded interval, then audit or mark incomplete on timeout. Flush stable redacted utterances transactionally before enqueuing audit. A late correction creates a new revision; stale generation frames are rejected. Never treat each window's raw Whisper text as final solely because inference returned.
 - [ ] **6. Extend checks:** out-of-order and duplicate frames, missing frame, invalid signature, queue overflow, disconnect during drain and late final after timeout. Confirm provisional policy alerts are retractable and final findings are call-scoped.
