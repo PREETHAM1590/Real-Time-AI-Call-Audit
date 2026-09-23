@@ -6,33 +6,38 @@ Status: proposed procedures. Commands and application paths below become runnabl
 
 Use local synthetic data, isolated staging with approved samples, and production with separate identity clients, keys, model artifacts, databases and buckets. Never copy production audio to developer machines by default. Model inference runs on project-controlled hardware or a dedicated private deployment under project control.
 
-Planned configuration names: `DATABASE_URL`, `OBJECT_BUCKET`, `OBJECT_REGION`, `STT_MODEL_PATH`, `STT_MODEL_SHA256`, `DIARIZATION_MODEL_PATH`, `SENTIMENT_MODEL_PATH`, `AUDIT_MODEL_PATH`, `AUDIT_MODEL_SHA256`, `LOCAL_LLM_URL`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `SESSION_SECRET`, `MEDIA_SIGNING_SECRET`, `RULESET_VERSION`, `RUBRIC_VERSION`, `PROMPT_VERSION`, `MAX_UPLOAD_BYTES`, `MAX_CALL_SECONDS`, `AUDIO_RETENTION_DAYS`, `TRANSCRIPT_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`, `EVENT_RETENTION_DAYS`, `ACCESS_LOG_RETENTION_DAYS`, `BACKUP_RETENTION_DAYS`.
+Current upload intake accepts a verified OIDC subject mapped to one active server-side AGENT membership with one team in `identity_memberships`. An optional organisation selector only chooses among database-verified memberships. It does not trust submitted agent/team fields. Cookie-authenticated mutations require the exact allowlisted Origin and a CSRF token from `GET /v1/csrf`; provision a non-placeholder `CSRF_SECRET`. QA/admin and telephony/batch upload remain unavailable until a trusted server-side source-to-agent mapping is implemented and tested.
 
-Production must fail startup when identity, encryption/storage, retention or pinned local model paths/checksums are missing. Set per-model concurrency, GPU memory and queue limits; reject or defer new work visibly when capacity is exhausted. Inference services must not download weights or send call data to external AI endpoints at runtime.
+Current settings: `DATABASE_URL`, `AUDIO_STORAGE_PATH`, `FFPROBE`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_PUBLIC_KEY`, `CSRF_SECRET`, and `ALLOWED_ORIGINS`. The transcription adapter additionally requires `FASTER_WHISPER_MODEL_PATH`, `FASTER_WHISPER_MODEL_SHA256`, and `FASTER_WHISPER_MODEL_VERSION`; set `FASTER_WHISPER_DEVICE` and `FASTER_WHISPER_COMPUTE_TYPE` for the selected hardware. Redaction requires `PRESIDIO_SPACY_MODEL_PATH` and `PRESIDIO_SPACY_MODEL_SHA256`. The example identity key, secret, database password and origin are placeholders; provision environment-specific values before starting the service. The secret must be at least 32 bytes and cannot be the placeholder. Planned additions include bounded stage concurrency and approved retention settings. Disposition currently uses `DISPOSITION_MODEL_PATH`, `DISPOSITION_MODEL_SHA256`, `DISPOSITION_LOCAL_URL`, and `DISPOSITION_LOCAL_MODEL_NAME` as detailed below; object-bucket and generic local-LLM settings are not current settings.
+
+Production must fail startup when identity, encryption/storage, retention or pinned local model paths/checksums are missing. Set per-model concurrency, GPU memory and queue limits; reject or defer new work visibly when capacity is exhausted. Inference services must not download weights or send call data to external AI endpoints at runtime. The current decoder has size, duration, timeout and concurrency bounds but lacks OS-enforced CPU and memory limits; this blocks all real-data and production use until isolated-process limits and a resource-exhaustion test are in place.
 
 Planned developer workflow:
+
+The commands below are the target developer workflow, not a claim that the full application can start today. The current project defines the `[test]` extra and `compose.yaml` provides local PostgreSQL. The API composition module (`app.main:app`) will be added with deployment packaging, so the final `uvicorn` command is not available yet. Do not use an application database for integration tests; set `DATABASE_URL` to a disposable database whose name ends in `_test`.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[test]"
 docker compose up -d postgres
 python -m app.migrate
 python -m unittest discover -s tests -v
-python -m uvicorn app.api:app --reload
+python -m uvicorn app.main:app --reload
 # Separate terminals:
 python -m app.worker
 npm --prefix web ci
 npm --prefix web run dev
 ```
 
-Task 1 establishes the package; Task 2 establishes migrations and worker; Task 6 establishes the browser application. Lock dependencies and document exact versions as part of those tasks.
+Task 1 establishes the package; Task 2 establishes migrations and durable intake/jobs; Tasks 3A and 6 establish disposition and the browser workflow. Lock dependencies and document exact versions as part of those tasks. `AGENTS.md` and the implementation plan define the current task order; proposed commands are not claims that unimplemented stages exist.
 
 ## Release validation
 
 | Layer | Inputs | Required evidence |
 |---|---|---|
 | Domain | Synthetic text and segment fixtures | Disclosure timing, unknown roles, silent calls, split phrases, duplicate segments, exact evidence and scoring checks |
+| Disposition | Synthetic redacted final utterances, authoritative facts, versioned config fixtures | Per-code precision/recall and confusion, abstention/review rate, calibration/coverage, front-gate authority, rule trace completeness, replay/reproducibility, tenant isolation and config rollback |
 | Integration | PostgreSQL, private storage and local inference fakes | Duplicate upload, expired lease, mid-stage crash, review conflict, deletion race and tenant isolation |
 | Local model contract | Approved short recordings and pinned model artifacts | Segment finalisation, timestamps, language, model refusal/error mapping, output validation and resource use |
 | Browser | Analyst, supervisor, agent and forbidden-user sessions | Accessible queue/review, permitted playback, own-score scope, stale feed and resumption |
@@ -58,7 +63,7 @@ Proposed pilot gates:
 
 These are proposed release thresholds, not current measurements. A 100-call set alone cannot establish a reliable rare-event false-negative rate; gather enough positive cases and report confidence intervals before making that claim. Keep all excluded and abstained cases in the report.
 
-For every prompt/model/rule change: run deterministic checks → held-out evaluation → shadow run → QA sample review → versioned promotion. Retain old versions and results. Do not rewrite old audits to make a new model appear consistent. A secondary model is an optional sampled calibration tool once a measured benefit justifies its cost.
+For every prompt/model/rule/config change: run deterministic checks → held-out evaluation (including per-disposition confusion and review coverage) → shadow run → QA sample review → versioned promotion. Retain old versions and results. Do not rewrite old audits/dispositions to make a new model appear consistent. A secondary model is an optional sampled calibration tool once a measured benefit justifies its cost.
 
 ## Metrics and alerting
 
@@ -134,3 +139,11 @@ Engineering owns correctness, recovery and interfaces. QA owns adjudication and 
 Release sequence: synthetic demo → shadow post-call pilot → QA-approved limited team → live shadow mode → live advisory alerts → production gate. No automatic disciplinary decisions or external coaching messages are introduced by the pilot. Coaching notes are saved in the application.
 
 Before production, record: policy/retention decisions; exact model/code licenses, revisions and checksums; target hardware and offline-inference proof; golden-set report; security and accessibility results; restore and deletion evidence; live load report; compute cost projection; named on-call and rollback owner.
+
+## Disposition implementation boundary
+
+The current disposition adapter is a local OpenAI-compatible JSON client intended for a colocated vLLM service. Deployment must set `DISPOSITION_MODEL_PATH` to an absolute, read-only model directory mounted at the same path in the worker/API and model-serving runtimes, `DISPOSITION_MODEL_SHA256` to that directory's verified recursive digest, `DISPOSITION_LOCAL_URL` to the loopback `/v1` endpoint, and `DISPOSITION_LOCAL_MODEL_NAME` to the model ID served there. Startup verifies the local directory contents; each inference request requires the loopback `/v1/models` manifest to report both the configured model ID and a `root` resolving to the exact verified directory. A matching alias with a different or absent root fails closed. Operators must provision the server out of band from this pinned artifact. The application does not download models or fall back to hosted inference. A missing digest leaves `ANALYSE` without a handler and jobs parked; an invalid configured artifact path fails worker startup; a server manifest mismatch fails inference and follows bounded retry/failure handling.
+
+Disposition config activation requires an explicit immutable approval event from an ADMIN whose identity differs from the version creator. Activation is the pilot's deployment action after that independent approval; rollback is limited to previously active, approved versions and records a reason. `status` and `approved_by` are derived from append-only events rather than mutable version-row columns.
+
+Disposition windows use character ceilings as a conservative implementation bound, not a measured token budget: each request is at most 100,000 characters, full-call input at most 2,000,000 characters, and each job at most 128 windows. Adjacent utterances from the same known speaker are grouped first and never split across windows; evidence still refers to the canonical member utterance IDs. The default one-active-config-per-organisation pointer is an initial simplifying limit; `config_id` and `use_case_id` do not confer tenant authority. Per-use-case activation requires an authoritative call-routing key and membership policy. `ANALYSE` currently ends with a disposition result and `NEEDS_REVIEW`; it does not mean policy evaluation or QA scoring completed and cannot set `READY`. No model quality, calibration, latency, production capacity or deployment readiness is claimed by this code slice.

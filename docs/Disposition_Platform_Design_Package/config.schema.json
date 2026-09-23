@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/disposition-platform-config-v1.json",
+  "title": "Configurable Disposition Platform Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "config_id", "version", "status", "identity", "input", "provider", "runtime", "questions", "taxonomy", "resolver", "confidence", "output"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "1.0.0"},
+    "config_id": {"type": "string", "minLength": 3},
+    "version": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["DRAFT", "VALIDATED", "STAGED", "ACTIVE", "RETIRED"]},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "use_case_id", "display_name"],
+      "properties": {
+        "tenant_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{1,63}$"},
+        "use_case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{1,63}$"},
+        "display_name": {"type": "string", "minLength": 1},
+        "default_locale": {"type": "string"},
+        "timezone": {"type": "string"}
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transcript_path", "call_id_path", "speaker_mapping"],
+      "properties": {
+        "transcript_path": {"type": "string"},
+        "call_id_path": {"type": "string"},
+        "metadata_path": {"type": "string"},
+        "system_facts_path": {"type": "string"},
+        "speaker_mapping": {
+          "type": "object",
+          "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        },
+        "required_fields": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "model"],
+      "properties": {
+        "adapter": {"type": "string"},
+        "model": {"type": "string"},
+        "api_profile": {"type": "string"},
+        "request_timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000},
+        "max_retries": {"type": "integer", "minimum": 0, "maximum": 5}
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context_window_tokens", "single_pass_soft_limit_tokens", "single_pass_hard_limit_tokens", "oversized_strategy", "chunking"],
+      "properties": {
+        "context_window_tokens": {"type": "integer", "minimum": 4096},
+        "single_pass_soft_limit_tokens": {"type": "integer", "minimum": 1000},
+        "single_pass_hard_limit_tokens": {"type": "integer", "minimum": 1000},
+        "reserved_question_tokens": {"type": "integer", "minimum": 0},
+        "reserved_response_tokens": {"type": "integer", "minimum": 0},
+        "oversized_strategy": {"enum": ["TURN_AWARE_MAP_AGGREGATE", "REJECT"]},
+        "chunking": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_chunk_tokens", "max_chunk_tokens", "overlap_turns", "max_parallel_chunks", "preserve_speaker_turns"],
+          "properties": {
+            "target_chunk_tokens": {"type": "integer", "minimum": 500},
+            "max_chunk_tokens": {"type": "integer", "minimum": 500},
+            "overlap_turns": {"type": "integer", "minimum": 0, "maximum": 50},
+            "max_parallel_chunks": {"type": "integer", "minimum": 1, "maximum": 64},
+            "preserve_speaker_turns": {"type": "boolean"},
+            "never_split_customer_turn": {"type": "boolean"},
+            "conflict_confirmation_enabled": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "terminology": {"type": "object"},
+    "front_gates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/frontGate"}
+    },
+    "questions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/question"}
+    },
+    "taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["codes"],
+      "properties": {
+        "codes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/taxonomyCode"}
+        }
+      }
+    },
+    "resolver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "default_emit", "rules"],
+      "properties": {
+        "strategy": {"enum": ["FIRST_MATCH_WINS"]},
+        "default_emit": {"type": "string"},
+        "rules": {"type": "array", "items": {"$ref": "#/$defs/rule"}}
+      }
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_commit_threshold", "default_review_threshold", "low_confidence_action"],
+      "properties": {
+        "default_commit_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "default_review_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "low_confidence_action": {"type": "string"},
+        "per_code": {"type": "object", "additionalProperties": {"type": "object", "properties": {"commit_threshold": {"type": "number", "minimum": 0, "maximum": 1}}, "additionalProperties": false}}
+      }
+    },
+    "aggregation": {"type": "object"},
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include"],
+      "properties": {
+        "include": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "aliases": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "observability": {"type": "object"},
+    "deployment": {"type": "object"}
+  },
+  "$defs": {
+    "question": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "instructions"],
+          "properties": {
+            "type": {"const": "noul"},
+            "instructions": {"type": "string", "minLength": 1},
+            "criteria": {
+              "type": "object",
+              "required": ["true", "false"],
+              "properties": {"true": {"type": "string"}, "false": {"type": "string"}},
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "instructions", "criteria"],
+          "properties": {
+            "type": {"const": "choice"},
+            "instructions": {"type": "string", "minLength": 1},
+            "criteria": {"type": "object", "minProperties": 2, "additionalProperties": {"type": "string"}}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "instructions", "criteria"],
+          "properties": {
+            "type": {"const": "score"},
+            "instructions": {"type": "string", "minLength": 1},
+            "criteria": {"type": "array", "minItems": 2, "items": {"type": "string"}}
+          }
+        }
+      ]
+    },
+    "taxonomyCode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "name", "level", "parent_code", "terminal", "callback", "success"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "definition": {"type": "string"},
+        "level": {"type": "integer", "minimum": 0},
+        "parent_code": {"type": ["string", "null"]},
+        "terminal": {"type": "boolean"},
+        "callback": {"type": "boolean"},
+        "success": {"type": "boolean"},
+        "metadata": {"type": "object"}
+      }
+    },
+    "frontGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "enabled", "priority", "source", "condition", "emit"],
+      "properties": {
+        "id": {"type": "string"},
+        "enabled": {"type": "boolean"},
+        "priority": {"type": "integer"},
+        "source": {"type": "string"},
+        "condition": {
+          "type": "object",
+          "required": ["operator", "value"],
+          "properties": {
+            "operator": {"enum": ["EQ", "NE", "IN", "NOT_IN", "EXISTS", "REGEX"]},
+            "value": {}
+          },
+          "additionalProperties": false
+        },
+        "emit": {"type": "string"}
+      }
+    },
+    "predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal", "operator"],
+      "properties": {
+        "signal": {"type": "string"},
+        "operator": {"enum": ["NOUL_GTE", "NOUL_LTE", "CHOICE_EQ", "CHOICE_IN", "CHOICE_CONFIDENCE_GTE", "SCORE_GTE", "SCORE_LTE", "EXISTS"]},
+        "value": {}
+      }
+    },
+    "conditionTree": {
+      "oneOf": [
+        {"$ref": "#/$defs/predicate"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["all"],
+          "properties": {"all": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/conditionTree"}}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["any"],
+          "properties": {"any": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/conditionTree"}}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["not"],
+          "properties": {"not": {"$ref": "#/$defs/conditionTree"}}
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "priority", "when", "emit"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "priority": {"type": "integer"},
+        "when": {"$ref": "#/$defs/conditionTree"},
+        "emit": {"type": "string"},
+        "confidence_expression": {"type": "string"}
+      }
+    }
+  }
+}

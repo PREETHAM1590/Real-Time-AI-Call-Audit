@@ -1,0 +1,281 @@
+{
+  "schema_version": "1.0.0",
+  "config_id": "sample_tenant.sample_use_case",
+  "version": 1,
+  "status": "DRAFT",
+  "identity": {
+    "tenant_id": "sample_tenant",
+    "use_case_id": "sample_use_case",
+    "display_name": "Sample Disposition Use Case",
+    "default_locale": "en-IN",
+    "timezone": "Asia/Kolkata"
+  },
+  "input": {
+    "transcript_path": "$.transcript",
+    "call_id_path": "$.call_id",
+    "metadata_path": "$.metadata",
+    "system_facts_path": "$.system_facts",
+    "speaker_mapping": {
+      "agent": ["AGENT", "ASSISTANT", "BOT"],
+      "customer": ["CUSTOMER", "USER", "RECEIVER"],
+      "system": ["SYSTEM", "TELEPHONY"]
+    },
+    "required_fields": ["call_id", "transcript"]
+  },
+  "provider": {
+    "adapter": "typesafe_system_one",
+    "model": "discover_or_pin_at_deploy_time",
+    "api_profile": "default",
+    "request_timeout_ms": 8000,
+    "max_retries": 2
+  },
+  "runtime": {
+    "context_window_tokens": 32000,
+    "single_pass_soft_limit_tokens": 16000,
+    "single_pass_hard_limit_tokens": 24000,
+    "reserved_question_tokens": 5000,
+    "reserved_response_tokens": 1000,
+    "oversized_strategy": "TURN_AWARE_MAP_AGGREGATE",
+    "chunking": {
+      "target_chunk_tokens": 6000,
+      "max_chunk_tokens": 8000,
+      "overlap_turns": 4,
+      "max_parallel_chunks": 8,
+      "preserve_speaker_turns": true,
+      "never_split_customer_turn": true,
+      "conflict_confirmation_enabled": true
+    }
+  },
+  "terminology": {
+    "organization_aliases": ["our company"],
+    "target_party_label": "customer",
+    "product_aliases": ["target product"],
+    "competitor_terms": [],
+    "custom_terms": {
+      "online_payment": ["payment link", "online payment"],
+      "branch": ["branch", "office"],
+      "advisor": ["advisor", "agent", "representative"]
+    }
+  },
+  "front_gates": [
+    {
+      "id": "NO_CONNECTION",
+      "enabled": true,
+      "priority": 10,
+      "source": "$.metadata.telephony_status",
+      "condition": {
+        "operator": "IN",
+        "value": ["NO_ANSWER", "FAILED", "NOT_CONNECTED"]
+      },
+      "emit": "NO_CONTACT"
+    }
+  ],
+  "questions": {
+    "has_meaningful_customer_speech": {
+      "type": "noul",
+      "instructions": "Did a live receiver provide meaningful speech rather than only silence or machine audio?",
+      "criteria": {
+        "true": "A live human produced usable speech.",
+        "false": "There is no usable live-human speech."
+      }
+    },
+    "receiver_identity": {
+      "type": "choice",
+      "instructions": "Who is the receiver relative to the intended target party?",
+      "criteria": {
+        "TARGET_PARTY": "The intended target party is speaking.",
+        "RELATED_PARTY": "A related person, assistant, or authorized proxy is speaking.",
+        "INTERMEDIARY": "An advisor, distributor, broker, or other intermediary is speaking.",
+        "UNRELATED": "The receiver has no relevant relationship to the target party.",
+        "UNKNOWN": "The relationship cannot be established."
+      }
+    },
+    "positive_commitment": {
+      "type": "noul",
+      "instructions": "Did the customer make an affirmative commitment that satisfies the primary business objective or a configured next-step commitment?",
+      "criteria": {
+        "true": "The customer personally expressed a clear affirmative commitment.",
+        "false": "No affirmative commitment is established."
+      }
+    },
+    "commitment_state": {
+      "type": "choice",
+      "instructions": "What is the strongest supported commitment state?",
+      "criteria": {
+        "COMPLETED": "The target action is stated as already completed.",
+        "FUTURE": "The customer states they will complete the target action later.",
+        "NONE": "No commitment is made.",
+        "UNCLEAR": "The state is ambiguous."
+      }
+    },
+    "callback_requested": {
+      "type": "noul",
+      "instructions": "Did the live receiver ask for a later contact attempt?",
+      "criteria": {
+        "true": "A later contact attempt was requested or accepted.",
+        "false": "No later-contact request is established."
+      }
+    },
+    "explicit_decline": {
+      "type": "noul",
+      "instructions": "Did the target party explicitly decline the primary business objective?",
+      "criteria": {
+        "true": "A clear refusal or decline was expressed.",
+        "false": "No clear refusal is established."
+      }
+    },
+    "human_handover_requested": {
+      "type": "noul",
+      "instructions": "Did the customer explicitly request a human representative or an out-of-scope handover?",
+      "criteria": {
+        "true": "A human or specialist handover was requested.",
+        "false": "No handover request is established."
+      }
+    },
+    "engagement_depth": {
+      "type": "score",
+      "instructions": "How substantive was the live conversation?",
+      "criteria": [
+        "No usable live conversation",
+        "Greeting or opening only",
+        "Some substantive engagement",
+        "Clear business outcome established"
+      ]
+    }
+  },
+  "taxonomy": {
+    "codes": [
+      {
+        "code": "NO_CONTACT",
+        "name": "No Contact",
+        "level": 0,
+        "parent_code": null,
+        "terminal": false,
+        "callback": true,
+        "success": false
+      },
+      {
+        "code": "COMMITTED",
+        "name": "Committed",
+        "level": 0,
+        "parent_code": null,
+        "terminal": false,
+        "callback": false,
+        "success": true
+      },
+      {
+        "code": "CALLBACK",
+        "name": "Callback Required",
+        "level": 0,
+        "parent_code": null,
+        "terminal": false,
+        "callback": true,
+        "success": false
+      },
+      {
+        "code": "DECLINED",
+        "name": "Declined",
+        "level": 0,
+        "parent_code": null,
+        "terminal": true,
+        "callback": false,
+        "success": false
+      },
+      {
+        "code": "REVIEW",
+        "name": "Human Review",
+        "level": 0,
+        "parent_code": null,
+        "terminal": false,
+        "callback": false,
+        "success": false
+      }
+    ]
+  },
+  "resolver": {
+    "strategy": "FIRST_MATCH_WINS",
+    "default_emit": "REVIEW",
+    "rules": [
+      {
+        "id": "COMMITMENT_COMPLETED",
+        "priority": 100,
+        "when": {
+          "all": [
+            {"signal": "positive_commitment", "operator": "NOUL_GTE", "value": 0.70},
+            {"signal": "commitment_state", "operator": "CHOICE_EQ", "value": "COMPLETED"}
+          ]
+        },
+        "emit": "COMMITTED"
+      },
+      {
+        "id": "EXPLICIT_DECLINE",
+        "priority": 200,
+        "when": {
+          "all": [
+            {"signal": "explicit_decline", "operator": "NOUL_GTE", "value": 0.70}
+          ]
+        },
+        "emit": "DECLINED"
+      },
+      {
+        "id": "CALLBACK_REQUESTED",
+        "priority": 300,
+        "when": {
+          "all": [
+            {"signal": "callback_requested", "operator": "NOUL_GTE", "value": 0.60}
+          ]
+        },
+        "emit": "CALLBACK"
+      }
+    ]
+  },
+  "confidence": {
+    "default_commit_threshold": 0.65,
+    "default_review_threshold": 0.45,
+    "low_confidence_action": "REVIEW",
+    "per_code": {
+      "COMMITTED": {"commit_threshold": 0.70},
+      "DECLINED": {"commit_threshold": 0.72}
+    }
+  },
+  "aggregation": {
+    "noul_strategy": "MAX_SUPPORT_WITH_CONTRADICTION_CHECK",
+    "choice_strategy": "CONFIDENCE_WEIGHTED_PROBABILITY_POOL",
+    "score_strategy": "CONFIDENCE_WEIGHTED_MEAN",
+    "material_conflict_threshold": 0.25
+  },
+  "output": {
+    "include": [
+      "call_id",
+      "tenant_id",
+      "use_case_id",
+      "config_version",
+      "disposition_code",
+      "disposition_name",
+      "parent_code",
+      "confidence",
+      "requires_review",
+      "matched_rule_id",
+      "model",
+      "usage",
+      "processing_path"
+    ],
+    "aliases": {
+      "disposition_code": "disposition",
+      "requires_review": "manual_review"
+    }
+  },
+  "observability": {
+    "emit_signal_scores": true,
+    "emit_rule_trace": true,
+    "emit_chunk_metrics": true,
+    "store_raw_transcript": false,
+    "redact_pii_in_logs": true
+  },
+  "deployment": {
+    "minimum_fixture_count": 100,
+    "minimum_required_accuracy": 0.90,
+    "shadow_mode_required": true,
+    "allow_activation_without_approval": false
+  }
+}

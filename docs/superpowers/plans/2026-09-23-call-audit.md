@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an evidence-backed post-call QA system, then extend it to live transcription, policy alerts and human review.
+**Goal:** Build an evidence-backed post-call QA and configurable disposition system, then extend it to live transcription, policy alerts and human review.
 
-**Architecture:** Start with a modular Python backend, separate API/worker processes, self-hosted inference processes, PostgreSQL state/jobs/outbox, private audio storage and a React client. Reuse canonical transcript and audit contracts for uploaded recordings and live media. Add large-scale infrastructure only after measured bottlenecks justify a separate subsystem plan.
+**Architecture:** Start with a modular Python backend, separate API/worker processes, self-hosted inference processes, PostgreSQL state/jobs/outbox, private audio storage and a React client. Reuse canonical transcript, disposition and audit contracts for uploaded recordings and live media. Disposition classification uses replaceable local typed-signal inference followed by deterministic rules in versioned JSON config; it is stored separately from the QA audit. Add large-scale infrastructure only after measured bottlenecks justify a separate subsystem plan.
 
 **Tech Stack:** Python 3.12+, FastAPI, Pydantic, psycopg, PostgreSQL, private S3-compatible storage, local faster-whisper/Whisper STT, local Qwen3-8B/vLLM audit candidate, Presidio, React/TypeScript, standard-library unittest, browser tests where UI behaviour needs them.
 
-**Spec:** [Product and technical specification](../../system-specification.md). Read it together with [operations and evaluation](../../operations-and-evaluation.md) and [self-hosted models](../../open-source-models.md).
+**Spec:** [Product and technical specification](../../system-specification.md). Read it together with [operations and evaluation](../../operations-and-evaluation.md), [self-hosted models](../../open-source-models.md) and the [user-provided disposition design package](../../Disposition_Platform_Design_Package/README.md).
 
 ## Global Constraints
 
@@ -21,6 +21,8 @@
 - Do not assign PASS or FAIL when required evidence is missing or unreliable.
 - Keep model artifact, inference runtime, prompt, rubric, ruleset and transcript revision identifiers with each audit.
 - Self-host STT, diarization, sentiment, redaction, embeddings and audit inference; no hosted AI API fallback.
+- Run disposition signal inference locally. TypeSafe System One/Jev is a typed-decision design reference, not a selected dependency. Do not assert its vendor-reported speed, cost, calibration or accuracy for this project.
+- Keep disposition taxonomy/rules and its immutable result lineage separate from QA rubric scores/reviews. Never allow a disposition model to choose its own policy result without deterministic resolution.
 - Pin model artifacts by revision and checksum, record licenses, and disable runtime downloads.
 - Use synthetic data until real-data processing and retention policies are approved.
 
@@ -38,7 +40,7 @@
 
 This workspace contained no application, repository metadata or project instructions when inspected. All application paths below are **proposed new files**. This plan creates no cloud resources and does not authorise use of real recordings by itself.
 
-Tasks 1–6 deliver a post-call application; 7–8 deliver live monitoring; 9–10 complete the operational pilot. Keep those boundaries independently demoable. Expansion features listed in the specification need separate plans; they are not hidden work inside Task 10.
+Tasks 1–6 deliver a post-call application with a distinct disposition result; 7–8 deliver live monitoring; 9–10 complete the operational pilot. Execute Task 3A immediately after Task 3. Keep those boundaries independently demoable. Expansion features listed in the specification need separate plans; they are not hidden work inside Task 10.
 
 Each numbered step is one reviewable action; larger implementation blocks are subdivided into focused changes. The code below pins important contracts and boundary behaviour; local model adapter wiring follows the selected runtime's current documented API and is validated by staging contract checks. Do not treat these excerpts as a complete application already written.
 
@@ -57,6 +59,7 @@ Run the named test before implementation and confirm it fails for the expected m
 | app/transcription.py, app/privacy.py | Local STT normalisation, role mapping and redaction | 3 |
 | app/compliance.py, config/rules.v1.json | Pure call-scoped policy evaluation and approved versioned rules | 4 |
 | app/audit.py, config/rubric.v1.json, prompts/audit.v1.txt | Local model request, evidence validation, deterministic scoring | 5 |
+| app/disposition.py, app/disposition_config.py, config/disposition.v1.json | Typed signal contract, safe config validation, front gates, deterministic resolver and immutable trace | 3A |
 | app/reviews.py | Immutable reviews and conflict control | 6 |
 | web/package.json, web/package-lock.json, web/tsconfig.json, web/vite.config.ts, web/index.html | Browser build and test tooling | 6 |
 | web/src/main.tsx, web/src/App.tsx, web/src/api.ts, web/src/styles.css | Accessible analyst application and typed API access | 6 |
@@ -66,7 +69,7 @@ Run the named test before implementation and confirm it fails for the expected m
 | app/reports.py, web/src/Reports.tsx | Own-score/team views and safe exports | 9 |
 | app/retention.py, app/metrics.py, app/evaluate.py | Purging, operational measurements and quality evaluation | 10 |
 | Dockerfile, .github/workflows/ci.yml | Container packaging and CI if hosted on GitHub | 10 |
-| tests/__init__.py, tests/test_*.py, tests/fixtures/ | Runnable contracts, integration cases and synthetic fixtures | 1–10 |
+| tests/__init__.py, tests/test_*.py, tests/fixtures/ | Runnable contracts, integration cases and synthetic fixtures | 1–10, 3A |
 | web/tests/qa.spec.ts, web/tests/live.spec.ts | Critical browser flows | 6, 8 |
 
 No repository/helper already exists to reuse. Use Pydantic for validation already needed by FastAPI, PostgreSQL constraints for uniqueness, native audio controls for playback and plain SQL migrations. Keep one concrete local inference adapter per task and avoid a second queue service in the pilot.
@@ -82,7 +85,7 @@ No repository/helper already exists to reuse. Use Pydantic for validation alread
 - `Utterance(id: str, role: str, start_ms: int, end_ms: int, text_redacted: str, is_final: bool = True)` Pydantic model. The persisted envelope adds organisation/call/revision/local-model fields from the spec.
 - `create_app(settings: Settings) -> FastAPI`; shared scope dependency validates production OIDC/session identity. Test injection is confined to test construction.
 
-- [ ] **1. Write the contract check** in `tests/test_contracts.py`:
+- [x] **1. Write the contract check** in `tests/test_contracts.py`:
 
 ```python
 import unittest
@@ -101,9 +104,9 @@ class ContractTests(unittest.TestCase):
                       end_ms=10, text_redacted="Hello")
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_contracts -v`; expect missing `app`/contract before implementing it.
-- [ ] **3. Implement contracts** with `extra="forbid"`, bounded text, allowed roles `AGENT/CUSTOMER/UNKNOWN/IVR`, nonnegative offsets and `end_ms >= start_ms`.
-- [ ] **4. Implement scope enforcement** using this decision order:
+- [x] **2. Run:** `python -m unittest tests.test_contracts -v`; the initial test established the expected failure before implementation.
+- [x] **3. Implement contracts** with `extra="forbid"`, bounded text, allowed roles `AGENT/CUSTOMER/UNKNOWN/IVR`, nonnegative offsets and `end_ms >= start_ms`.
+- [x] **4. Implement scope enforcement** using this decision order:
 
 ```python
 def can_access(scope, organisation_id, agent_id, team_id):
@@ -117,8 +120,8 @@ def can_access(scope, organisation_id, agent_id, team_id):
 ```
 
 This grants record visibility only; audio/review/export permissions remain separate. Verify agent identity mapping against the identity store, not a submitted request body.
-- [ ] **5. Wire validated settings, identity and health routes.** Verify OIDC signature/issuer/audience/expiry through the selected maintained client; reject forged tokens, missing sessions and forbidden origins. Add HTTP checks for 401 and cross-tenant 404 in the same test module using the FastAPI test client.
-- [ ] **6. Run the module again**, record pinned package versions, then commit `feat: establish contracts and scoped access`.
+- [x] **5. Wire validated settings, identity and health routes.** OIDC signature/issuer/audience/expiry, PostgreSQL-backed active-subject memberships, cookie origin/CSRF and pre-multipart upload authorization are covered; ambiguous or unavailable identity resolution fails closed.
+- [x] **6. Run the module again**, record pinned package versions, then commit `feat: establish contracts and scoped access` and the reviewed auth follow-up. Sol approval and PostgreSQL `_test` results are recorded in the implementation handoff.
 
 ## Task 2: Build durable recording intake and job recovery
 
@@ -131,24 +134,25 @@ This grants record visibility only; audio/review/export permissions remain separ
 - `finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool` returns false for stale lease/tombstone.
 - `python -m app.migrate` applies versioned SQL; `python -m app.worker` drains jobs.
 
-- [ ] **1. Write the database recovery check** against isolated PostgreSQL:
+- [x] **1. Write the database recovery check** against isolated PostgreSQL:
 
 ```python
 # In tests/test_ingest.py, after migrations and inserting one synthetic job:
-first = claim_job(connection, "worker-a", lease_seconds=60)
-self.assertIsNotNone(first)
-self.assertIsNone(claim_job(connection, "worker-b", lease_seconds=60))
-connection.execute("UPDATE jobs SET lease_until = now() - interval '1 second' WHERE id = %s", (first["id"],))
-connection.commit()
-second = claim_job(connection, "worker-b", lease_seconds=60)
-self.assertEqual(first["id"], second["id"])
-self.assertFalse(finish_job(connection, first["id"], first["lease_token"], {}))
-self.assertTrue(finish_job(connection, second["id"], second["lease_token"], {}))
+with connect() as connection_a, connect() as connection_b:
+    first = claim_job(connection_a, "worker-a", lease_seconds=60)
+    self.assertIsNotNone(first)
+    self.assertIsNone(claim_job(connection_b, "worker-b", lease_seconds=60))
+    connection_a.execute("UPDATE jobs SET lease_until = now() - interval '1 second' WHERE id = %s", (first["id"],))
+    connection_a.commit()
+    second = claim_job(connection_b, "worker-b", lease_seconds=60)
+    self.assertEqual(first["id"], second["id"])
+    self.assertFalse(finish_job(connection_a, first["id"], first["lease_token"], {}))
+    self.assertTrue(finish_job(connection_b, second["id"], second["lease_token"], {}))
 ```
 
 Use `unittest.TestCase.setUp` to apply migrations to a dedicated test database and insert the organisation/call/job with explicit UUIDs; `tearDown` removes only those test IDs. Refuse the integration suite unless the database name ends in `_test`.
-- [ ] **2. Run:** `python -m unittest tests.test_ingest -v`; expect missing intake/job implementation.
-- [ ] **3. Create schema** for the tables and composite keys in spec §8. Claim due work in a short transaction:
+- [x] **2. Run:** `python -m unittest tests.test_ingest -v`; explicitly enabling `RUN_POSTGRES_INTEGRATION=1` requires `DATABASE_URL` naming an isolated `_test` database and must fail if the variable or database is missing; never treat a skipped integration suite as passed verification.
+- [x] **3. Create schema** for the tables and composite keys in spec §8. Claim due work in a short transaction:
 
 ```sql
 WITH selected AS (
@@ -164,10 +168,10 @@ WHERE id IN (SELECT id FROM selected)
 RETURNING *;
 ```
 
-Update completion only when ID/token match, lease is unexpired, state is RUNNING and call is not tombstoned. Renew lease during long stages. Transactions that store stage output also enqueue the next stage.
-- [ ] **4. Implement intake:** enforce byte limits while streaming, inspect codec/duration in a restricted decoder, generate storage keys server-side, compute SHA-256, and commit call/job only after verified private upload. Same organisation/idempotency key plus different payload returns 409. Expired staged objects are cleaned up.
-- [ ] **5. Add assertions:** duplicate key returns same call; changed bytes return 409; spoofed media and over-limit recordings fail; two parallel claims cannot own the same lease. Storage failure leaves no runnable job.
-- [ ] **6. Run checks**, kill/restart a worker on synthetic input and verify recovery, then commit `feat: add durable recording intake`.
+Update completion only when ID/token match, lease is unexpired, state is RUNNING and call is not tombstoned. Renew lease during long stages. Transactions that store stage output also enqueue the next stage. Keep migration versions immutable; follow-up schema changes use a new migration.
+- [x] **4. Implement intake:** enforce request-body limits before multipart parsing and file-size limits while streaming; bound upload/decode concurrency. Inspect codec/duration and fully decode in a bounded worker, generate storage keys server-side, compute SHA-256, and commit call/job only after verified private upload. Derive agent/team from authenticated server identity/membership. Same organisation/idempotency key plus different payload returns 409. Expired staged objects are cleaned up. **Release gate remains:** OS-enforced decoder CPU/memory limits are not implemented; do not process real data or claim production readiness until the decoder is isolated with those limits.
+- [x] **5. Add assertions:** duplicate/concurrent idempotency returns the same call; changed bytes return 409; spoofed/truncated media and over-limit bodies fail before unbounded spooling; CORS preflight permits the idempotency header; tombstoned jobs do not starve live jobs; unsupported stages park without consuming retry attempts; two independent workers cannot own the same lease; expired leases recover; persisted call detail is scoped. Storage failure leaves no runnable job.
+- [x] **6. Run unit and full migration-upgrade checks**, simulate worker loss by expiring a lease, then reclaim the job from a second independent connection. Explicitly run PostgreSQL tests against an isolated `_test` database with no skips, then commit `feat: add durable recording intake`.
 
 ## Task 3: Transcribe and enforce the privacy boundary
 
@@ -212,9 +216,30 @@ def prepare_utterances(segments, redact):
 ```
 
 Build the entire redacted batch before starting its persistence transaction. Do not log source segments or exception payloads.
-- [ ] **4. Implement local STT and production redaction.** Provision a pinned Whisper weight artifact and faster-whisper runtime, verify SHA-256/license before use, disable runtime download, validate codec/language settings, and combine Presidio's local recognisers with approved structured patterns. Compute sensitive-number signals before redaction but persist only safe spans/types. Redact word-level text too, or omit it from persisted records. Preserve AGENT/CUSTOMER from distinct channels; mono remains UNKNOWN until mapping is supported by evidence.
-- [ ] **5. Extend tests** with name/address/phone/email/number fixtures, ambiguous mono speaker, silence, overlapping timings, and captured logs/model input asserting secrets are absent. Run pinned local model on approved samples with outbound internet blocked; record actual WER, role/timestamp behaviour, runtime and GPU use.
-- [ ] **6. Run module and integration tests**, verify raw text has no database column or log sink, then commit `feat: add transcription and privacy boundary`.
+- [x] **4. Implement local STT and production redaction adapters.** The pinned local faster-whisper runtime and fail-closed Presidio/structured redactor verify absolute artifact paths and SHA-256, with runtime downloads disabled. Actual model artifacts are not provisioned; compute sensitive-number signals before redaction and persist no raw word-level content. Mono/stereo roles remain UNKNOWN unless trusted channel mapping is supplied.
+- [x] **5a. Add synthetic tests** for PII fixtures, mono/stereo unknown roles, channel separation, overlapping timings, and raw-secret/log absence.
+- [ ] **5b. Run the pinned local model on approved samples** with outbound internet blocked; record actual WER, role/timestamp behaviour, runtime and GPU use. **Pending release gate:** no approved samples, pinned model artifacts, or target hardware are available in this workspace.
+- [x] **6. Run module and migration-upgrade tests** against an isolated `_test` database; verify raw text has no database column or log sink; then commit `feat: add private local transcription pipeline` and `fix: transcribe stereo channels independently`.
+
+## Task 3A: Identify configurable dispositions from final redacted evidence
+
+**Files:** Create `app/disposition.py`, `app/disposition_config.py`, `config/disposition.v1.json`, `tests/test_disposition.py`; add tenant-scoped immutable `disposition_configs` and `dispositions` tables to the next SQL migration; extend the post-call worker/API to persist and return disposition separately from the audit.
+
+**References:** Follow the user-provided [PRD](../../Disposition_Platform_Design_Package/PRD_Configurable_Disposition_Platform.docx), [TRD](../../Disposition_Platform_Design_Package/TRD_Configurable_Disposition_Platform.docx), [system design](../../Disposition_Platform_Design_Package/System_Design_Configurable_Disposition_Platform.docx), [JSON guide](../../Disposition_Platform_Design_Package/JSON_Configuration_Guide.docx), and sample schema/config. Treat the documents as proposed product requirements; follow this repository's self-hosted model and privacy constraints where they conflict with the hosted Jev sample.
+
+**Interfaces:** `compile_disposition_config(raw: dict) -> CompiledDispositionConfig`; `resolve_disposition(config, signals, authoritative_facts) -> DispositionDecision`; `classify_disposition(transcript: list[Utterance], facts: dict, adapter: LocalTypedDecisionAdapter) -> DispositionResult`. Canonical signals use typed `noul`, `choice` or `score` values with finite probabilities; the model adapter is replaceable and receives only final redacted utterances. The model proposes signals; deterministic front gates and priority-sorted declarative rules choose a configured taxonomy code.
+
+- [x] **1. Add a failing deterministic boundary check** for authoritative front-gate precedence, priority order, missing/invalid signal → REVIEW, and reproducibility from identical config/signals. Include a fake local adapter contract and assert the fake receives only final redacted text.
+- [x] **2. Run:** `python -m unittest tests.test_disposition -v`; confirm the new test fails because the module is absent.
+- [x] **3. Compile configuration before use:** validate schema and cross-references (unique codes/question IDs/rule IDs/priorities, acyclic parent links, valid emits, compatible operators/types, bounded thresholds); reject unknown keys and all executable expressions/URLs/credentials. Store immutable tenant-scoped version + content hash; only an approved version is active.
+- [x] **4. Implement normalized typed-signal validation and a single local inference adapter.** Keep provider/model selection outside business JSON and in deployment config. Do not claim model-calibrated confidence until the selected pinned open model passes calibration evaluation; invalid, missing or nonfinite outputs become review. Use deterministic fakes in CI; no hosted fallback or runtime downloads.
+- [x] **5. Implement deterministic resolution:** authoritative system facts may satisfy validated front gates; otherwise evaluate rules by explicit numeric priority, then confidence policy. Missing evidence, unknown role, incomplete call, conflicting signals or no qualifying rule resolves to configured review/unknown behavior. Add no generic expression language or second queue/database.
+- [x] **6. Persist immutable revision/provenance:** organisation/call/transcript revision, config ID/version/hash/schema, local model artifact + adapter version, canonical signals, processing path, matched rule, confidence/review status and usage. A reprocessing revision creates a new disposition record; it never overwrites a prior result. Enforce organisation scope with composite keys and idempotent stage completion.
+- [x] **7. Add scoped APIs** per system-specification §9: get result/config versions, validate without storage, stage immutable versions, record a reasoned immutable approval from an ADMIN other than the creator, activate only approved versions by compare-and-swap, replay synthetic/approved redacted fixtures, and rollback only to previously active approved history with a required reason. Return field errors (422), auth errors (401/403), stale-pointer conflicts (409); never edit version rows/events. The pilot's approval action is this explicit second-ADMIN event; status/approver fields are derived from append-only events. Every administrative mutation is access-logged. Provide fixture replay metrics, but do not allow per-config deployment flags to bypass platform privacy/model policy.
+- [x] **8. Run unit, migration and worker integration checks** for tenant isolation, duplicate execution, partial transcript exclusion, invalid model output, front-gate no-inference, immutable revisions and config rollback. Test only on an isolated database whose name ends `_test`; run backend suite and fix regressions.
+- [x] **9. Run synthetic end-to-end classification through the post-call worker and scoped call detail API.** Report dispositions as a distinct result from seven-dimension audit/review; then commit `feat: add configurable disposition identification`.
+
+**Initial implementation boundary:** keep one active config per organisation until the platform has an authoritative call-to-use-case routing key and use-case membership policy. `config_id` and `use_case_id` are business identifiers only; organisation identity remains server-derived. Group adjacent canonical utterances by known speaker ID and role before bounded window packing; never split a turn, count overlap against the per-request character ceiling, and retain member utterance IDs for evidence. Bound config JSON bytes, depth, container sizes and persisted integer ranges. Use bounded character counts for per-request windows and full-call limits, cap chunks at 128, and document that these are not tokenizer-measured budgets. The local vLLM model manifest must report both the configured model ID and the exact verified artifact root path; mismatches fail closed. In this slice `ANALYSE` means disposition only and returns `NEEDS_REVIEW`; the later policy and QA stages must be implemented before any call can become `READY`.
 
 ## Task 4: Implement versioned policy evaluation
 
@@ -324,7 +349,7 @@ self.assertEqual(stored[0], original_machine_score)
 Create `qa_scope` with Task 1's `Scope`, insert a completed synthetic call/audit in setUp and use Task 2's isolated database restriction.
 - [ ] **2. Run:** `python -m unittest tests.test_reviews -v`; expect missing review implementation.
 - [ ] **3. Implement atomic review append:** lock the audit's review head, verify organisation/permission and expected version, validate changed scores and nonempty reason, insert review and access event in one transaction. Recompute the effective reviewed score with Task 5's scoring function.
-- [ ] **4. Build queue and detail screen:** show risk, processing state, agent/date, redacted transcript, findings, machine score and reviewed score separately. Clicking evidence seeks native `<audio controls>` to the canonical timestamp only after authorised playback access. Render transcript as text, never unsanitised HTML.
+- [ ] **4. Build queue and detail screen:** show risk, processing state, agent/date, redacted transcript, findings, disposition code/name/config version/review state, machine score and reviewed score separately. Never conflate disposition with QA score or human review. Clicking evidence seeks native `<audio controls>` to the canonical timestamp only after authorised playback access. Render transcript as text, never unsanitised HTML.
 - [ ] **5. Add review form** with required reason, saving/error state, conflict reload, keyboard focus and visible labels. Disable scoring action on superseded audit until current evidence is loaded. Record playback access before issuing a short-lived URL.
 - [ ] **6. Create browser check** against a seeded local test backend:
 
@@ -396,7 +421,7 @@ Use canonical timestamp sorting when persisting utterances; the helper above rec
 
 ## Task 8: Add sentiment and a resumable supervisor view
 
-**Files:** Create events/sentiment modules, LiveCalls component, `tests/test_live.py`, `web/tests/live.spec.ts`; modify API/App.
+**Files:** Create events/sentiment modules, LiveCalls component, `tests/test_live.py`, `web/tests/live.spec.ts`; modify API/App and the post-call disposition stage.
 
 **Interfaces:** `sentiment_drop(previous: list[float], current: list[float]) -> bool` operates on already eligible final customer scores; `read_events(connection, scope: Scope, after_sequence: int, limit: int = 100) -> list[dict]`; `GET /v1/events` uses the spec envelope.
 
@@ -429,6 +454,7 @@ Caller selects adjacent 30-second windows using utterance event time, enforces c
 - [ ] **5. Implement scoped SSE:** commit final events in the same transaction as state changes; order by durable sequence; resume after Last-Event-ID; detect expired cursor and request snapshot. Never write raw or interim text to the durable outbox. Bound per-client buffers and disconnect slow clients with recovery instructions.
 - [ ] **6. Build active-call cards** with textual policy/sentiment state, evidence, acknowledgement and stale indicator. Browser test disconnects feed, expects “Reconnecting”, reconnects with previous cursor and asserts one finding after a replayed event. Backend test attempts another organisation's cursor/call and receives no data.
 - [ ] **7. Run backend checks and browser live check**, measure final-arrival-to-render latency, then commit `feat: add live supervisor monitoring`.
+- [ ] Re-run disposition only after the live finalisation barrier on the final transcript revision; late corrections create a new immutable disposition revision and emit `disposition.ready`. Partial transcripts never create durable dispositions. Test normal completion, timeout/NEEDS_REVIEW, late correction and reconnect.
 
 ## Task 9: Deliver agent scores, trends and safe exports
 
@@ -517,6 +543,7 @@ Undefined ratios remain null, never perfect scores. Score agreement uses only ad
 | Business problem, QA workflow and explainability | Spec §§1–4; Tasks 5–6 |
 | Upload/live ingestion, STT and speaker attribution | Tasks 2–3, 7 |
 | Sentiment, policy and LLM scoring | Tasks 4–5, 8 |
+| Configurable disposition taxonomy, typed signals, deterministic precedence, config lifecycle and model replacement | Spec §§6, 8; Task 3A; user-provided disposition design package |
 | Analyst/supervisor/agent dashboards and trends | Tasks 6, 8–9 |
 | Privacy, security, data model and override history | Tasks 1–3, 6, 10 |
 | Testing, latency, reliability, cost, CI and observability | Task 10 and operations guide |
@@ -526,10 +553,8 @@ Undefined ratios remain null, never perfect scores. Score agreement uses only ad
 | Fine-tuning, multilingual, predictive/whisper coaching and biometrics | Future research, not pilot release obligations |
 | Interview advice, author biography and platform chrome | Reference-only; no application feature |
 
-Self-review: requirement IDs R01–R14 map to tasks in the specification; core type/function names are consistent across tasks; five high-risk review conditions have named checks; local model quality and hardware capacity are evaluation gates. The plan contains proposed tests, not claims that those tests have run.
+Self-review: requirement IDs R01–R15 map to tasks in the specification; core type/function names are consistent across tasks; high-risk review conditions have named checks; local model quality and hardware capacity are evaluation gates. The plan contains proposed tests, not claims that those tests have run.
 
 ## Handoff
 
-Review the specification's assumptions, release scope and proposed operational thresholds before implementation. For execution, native sequential implementation is the recommended starting approach because tasks share contracts and one transactional data model. Subagent-driven execution is available if independent per-task implementation/review is preferred.
-
-The writing-plans skill's execution handoff says to “ask them to review the plan and choose an execution method before implementation.” This document completes the requested planning work; implementation is a separate next action after that review.
+Execution has been authorised. Use the user-selected subagent-driven workflow: GPT-6 Luna implements one scoped task at a time, then GPT-6 Sol reviews it before the next task starts. Preserve this plan's order and dependency boundaries; stop to fix blocking review findings rather than building dependent stages on top of them. The documented thresholds remain proposals until measured and approved.

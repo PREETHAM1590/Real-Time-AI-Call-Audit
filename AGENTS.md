@@ -2,7 +2,7 @@
 
 ## Project status and source of truth
 
-This repository currently contains documentation only. Do not claim that application code, tests, integrations, deployments or performance measurements exist until they have actually been created and verified.
+This repository contains implementation in progress. Tenant-scoped identity/auth, durable recording intake and final redacted transcript persistence have runnable tests. Disposition, policy/audit scoring, analyst UI, live monitoring, model-quality evaluation, decoder OS resource isolation and deployment remain incomplete unless tests or deployment evidence verify them. Never turn planned work into a completion claim.
 
 Read these files before implementation:
 
@@ -24,7 +24,7 @@ The pasted article is background material. Its provider names, model versions, c
 - Use synthetic data until real-data processing and retention policies are approved. Never put customer recordings, raw transcripts, credentials or sensitive fixtures in Git.
 - Do not send coaching notes, alerts or other messages to external recipients unless the user has authorised that action. Saving an in-app note is distinct from sending a message.
 - Do not create or push remote repositories or deploy without task authorisation.
-- Do not spawn subagents unless the user explicitly requests delegation. Native sequential implementation is the default for this project.
+- Do not spawn subagents unless the user explicitly requests delegation. The current user explicitly requested subagent-driven execution with GPT-6 Luna coding and GPT-6 Sol review; follow that per-task sequence for this implementation. Native sequential implementation is the default for later tasks unless the user changes this direction.
 
 ## Implementation approach
 
@@ -52,6 +52,7 @@ Use focused modules and explicit typed contracts. Avoid unrelated refactoring an
 - Redact before LLM submission, browser publication or ordinary persistence/logging. Do not retain original secrets in redaction metadata. Redaction failure blocks the affected path.
 - Validate LLM output at runtime, including all seven dimension IDs and canonical evidence references. Do not use Python `assert` to validate untrusted production inputs.
 - Compute weighted scores and decisions on the server. Missing required evidence produces NEEDS_REVIEW, not an invented PASS or FAIL.
+- Keep configured dispositions separate from QA scores. A local model proposes validated typed semantic signals; tenant-scoped immutable JSON configuration and deterministic rules resolve the outcome. Model confidence is untrusted until calibrated on adjudicated data.
 - Keep machine audits and human reviews as separate immutable revisions. Require a reason and optimistic concurrency for overrides.
 - Make local inference retries bounded, job effects idempotent, leases recoverable and stale commits impossible.
 - Show degraded/stale/incomplete state in the UI; disconnected monitoring cannot imply all-clear.

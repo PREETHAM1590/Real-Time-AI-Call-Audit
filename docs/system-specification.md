@@ -1,7 +1,7 @@
 # Product and technical specification
 
 Date: 2026-09-23  
-Status: proposed design for an empty workspace  
+Status: proposed design; implementation is in progress and deployment has not occurred
 Related: [implementation plan](superpowers/plans/2026-09-23-call-audit.md), [operations guide](operations-and-evaluation.md), [self-hosted model guide](open-source-models.md)
 
 ## 1. Purpose
@@ -19,6 +19,7 @@ These assumptions allow planning to proceed. They are not facts supplied by the 
 | First deployment | One organisation, tenant-scoped data model | Product owner before pilot |
 | Initial language | English, evaluated on Indian-English contact-centre samples | QA lead before model selection |
 | First ingestion | Uploaded WAV/MP3 recordings; then one vendor WebSocket adapter | Telephony owner before live work |
+| Upload assignment | Derive agent/team from authenticated server identity and membership; keep QA/admin/service upload disabled until a trusted source-to-agent mapping exists | Identity/telephony owner before enabling those uploaders |
 | Pilot capacity | 100 concurrent live calls, 25 dashboard viewers | Engineering during load qualification |
 | Pilot input limits | 250 MiB upload, 120-minute duration, mono/stereo audio | Operations before integration |
 | Model selection | Local Whisper/faster-whisper and Qwen3-8B/vLLM are benchmark candidates; inference stays self-hosted | Engineering using representative recordings, exact artifact licenses and target hardware |
@@ -33,7 +34,7 @@ Use synthetic recordings while those real-data decisions are unresolved. Vendor 
 
 | Release | Included | Exit evidence |
 |---|---|---|
-| P1: Post-call pilot | Authenticated upload, durable processing, transcription, role mapping, redaction, configured policy checks, seven-dimension audit, analyst queue, evidence, override history | Tasks 1–6; representative calls reviewed end to end |
+| P1: Post-call pilot | Authenticated upload, durable processing, transcription, role mapping, redaction, configured policy checks, configurable disposition identification, seven-dimension audit, analyst queue, evidence, override history | Tasks 1–6; representative calls reviewed end to end |
 | P2: Live monitoring | One authenticated media adapter, ordered audio, partial/final transcript handling, live policy state, sentiment signals, resumable supervisor feed | Tasks 7–8; live interruption and replay checks |
 | P3: Operational release | Own-score agent portal, team trends, policy export, retention, observability, evaluation and recovery drills | Tasks 9–10; operational gates pass |
 | Expansion | SIPREC and other media vendors, re-diarization, secondary-model verification, analytics warehouse and larger-scale event backbone | Separate subsystem plans after measured need |
@@ -74,6 +75,7 @@ Supervisor flow: sign in → active team calls → provisional signals → verif
 | R12 | Reliability | Crash recovery, bounded retries, dead-letter inspection and explicit incomplete status | 2, 5, 7, 10 |
 | R13 | Governance | Retention, deletion, access trail and restricted audio enforced | 1, 3, 6, 10 |
 | R14 | Quality and operations | Golden-set evaluation, load results, rollback and restore evidence | 10 |
+| R15 | Disposition identification | Tenant/use-case configuration maps redacted final transcript and authoritative facts to a versioned disposition, deterministic rule trace and review state; remains separate from QA score | 3A, 6, 10 |
 
 ### Global constraints
 
@@ -117,11 +119,13 @@ flowchart LR
     Worker --> STT
     STT --> Privacy[Role mapping and redaction]
     Privacy --> Rules[Versioned policy evaluation]
+    Privacy --> Disposition[Typed local disposition signals + deterministic resolver]
     Privacy --> Sentiment[Sentiment analysis]
     Privacy --> Audit[Local post-call LLM audit]
     Rules --> DB
     Sentiment --> DB
     Audit --> DB
+    Disposition --> DB
     DB --> API
     API --> UI[Analyst, supervisor and agent views]
 ```
@@ -134,13 +138,25 @@ Proposed infrastructure deliberately excludes Kafka, Kubernetes, Temporal, Click
 
 ### Processing lifecycle
 
-`UPLOADING → QUEUED → TRANSCRIBING → ANALYSING → AUDITING → READY`
+This is the target lifecycle. In the current implementation, `ANALYSING` runs disposition first and ends in `NEEDS_REVIEW`; policy checks and QA scoring are later planned stages.
 
-`LIVE → DRAINING → ANALYSING → AUDITING → READY`
+`UPLOADING → QUEUED → TRANSCRIBING → ANALYSING → AUDITING → DISPOSITIONING → READY`
+
+`LIVE → DRAINING → ANALYSING → AUDITING → DISPOSITIONING → READY`
 
 Any processing state can become `RETRY_WAIT`, `NEEDS_REVIEW`, or `FAILED`; deletion uses `DELETING → DELETED`. Store the failing stage and a safe error code separately. Processing state and audit decision are different fields.
 
-A worker claims a job in a short transaction, releases its lock, performs bounded external work, then commits using a lease token. Lease expiration permits recovery; stale workers cannot overwrite newer results. Unique keys make stage effects idempotent. Audit identity includes transcript/rules/prompt/rubric/model revisions. A late transcript revision creates a new audit revision and marks the older audit superseded.
+A worker claims a job in a short transaction, releases its lock, performs bounded external work, then commits using a lease token. Lease expiration permits recovery; stale workers cannot overwrite newer results. Unique keys make stage effects idempotent. Audit identity includes transcript/rules/prompt/rubric/model revisions. Disposition results likewise record transcript revision, immutable config/schema/resolver versions and model artifact. A late transcript revision creates new audit and disposition revisions and marks older outputs superseded.
+
+### Configurable disposition identification
+
+Disposition answers “what outcome or next step did this interaction reach?” and is stored separately from the seven-dimension agent-quality audit. A versioned, tenant-scoped JSON config defines input mapping, canonical speaker mapping, typed semantic questions, taxonomy, deterministic priority rules, confidence policy and output aliases. A model supplies semantic signals only; application code resolves the final code. Authoritative telephony/system facts may short-circuit inference through validated front gates. Unknown roles, incomplete calls, uncertain evidence, invalid model output or unresolved signals produce review/unknown status instead of a guessed code.
+
+Model decisions use a narrow replaceable local adapter contract for typed Noul (probabilistic yes/no), Choice and Score signals. The [TypeSafe System One/Jev announcement](https://typesafe.ai/blog/introducing-system-one-models-and-jev) is a design reference for structured probabilistic decisions, not a runtime dependency or verified performance claim. It describes Jev as early access and reports vendor measurements; the referenced service is not the project's self-hosted open-source stack. Runtime classification therefore stays on project-controlled infrastructure with pinned open model artifacts and no hosted AI fallback. A later adapter may replace the initial local model without changing business JSON or the canonical result shape; model changes require replay and shadow evaluation.
+
+Use one evaluation request when the final redacted transcript fits the measured model budget. For longer calls, group adjacent canonical utterances from the same known speaker into whole turns, then pack bounded, turn-aware windows with limited overlap; never split a speaker turn, and keep each member utterance ID available for evidence references. Aggregate per-question typed signals locally into the same canonical contract. Conflicts, missing coverage and uncertain roles produce `NEEDS_REVIEW` with a specific review reason; aggregate input beyond its hard limit uses the `CONTEXT_LIMIT` reason. None produce a guessed disposition. Both paths preserve provenance and are replayable. Configs are structurally and semantically validated, immutable once staged, replayed against labeled synthetic fixtures first, and carry content hashes and approval/activation history. Tenant configuration contains no executable code, credentials, arbitrary endpoints, or model/provider implementation keys; translate the package example into the platform's provider-neutral schema. The sample disposition package is a proposed baseline; its Jev model, 32k context, accuracy, latency, costs and rollout thresholds are not adopted measurements or defaults.
+
+The initial implementation keeps one active disposition config per organisation. `config_id` and `use_case_id` are validated business identifiers; neither establishes tenant identity, which comes only from authenticated server scope. Expand the active pointer to organisation/use-case scope after an authoritative call-routing key and use-case membership rules are defined. Window sizes are currently bounded character counts (`window_chars` at 100,000 characters per inference request, `context_limit_chars` at 2,000,000 characters across a call, and `max_chunks` capped at 128), not tokenizer-measured token budgets; overflow abstains to review. The current worker's `ANALYSE` stage computes disposition only. It is not a completed policy or seven-dimension QA stage, so it leaves the call in `NEEDS_REVIEW`; no path may set `READY` until the required later stages are implemented and pass their evidence gates.
 
 ## 7. Audio and transcription
 
@@ -165,6 +181,8 @@ Use UUIDs for application identities; local inference segment IDs are separately
 | utterances | organisation_id, id, call_id, revision, segment_id, model_version, speaker_id, role, start_ms, end_ms, text_redacted, confidence; unique call/revision/segment |
 | findings | organisation_id, id, call_id, transcript_revision, rule_id, ruleset_version, status, severity, evidence_ids, deadline_ms; unique call/revision/rule/evidence fingerprint |
 | audits | organisation_id, id, call_id, revision, transcript_revision, model_artifact, inference_runtime, prompt_version, rubric_version, ruleset_version, dimensions_json, overall_score, decision, usage_json; immutable |
+| dispositions | organisation_id, id, call_id, revision, transcript_revision, config_id, config_version, config_hash, schema_version, model_artifact, adapter_version, processing_path, code, parent_code, confidence, requires_review, matched_rule_id, signals_json, usage_json; immutable |
+| disposition_configs | organisation_id, config_id, version, content_hash, schema_version, raw_json, created_by, created_at; immutable version rows; status and approved_by are derived from append-only config events |
 | reviews | organisation_id, id, audit_id, base_review_version, reviewer_id, action, effective_scores_json, reason, created_at; append-only |
 | jobs | organisation_id, id, call_id, stage, input_revision, state, attempts, available_at, lease_token, lease_until, last_error_code; unique call/stage/input revision |
 | events | organisation_id, sequence, call_id, type, redacted_payload, created_at; ordered resumable dashboard outbox |
@@ -196,9 +214,17 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 
 | Endpoint | Contract |
 |---|---|
-| POST /v1/calls | Authenticated multipart audio + external_ref, agent_id, team_id, language; 202 with id/state; same Idempotency-Key and payload returns same result; conflicting payload is 409 |
+| POST /v1/calls | Authenticated multipart audio + external_ref and language; agent uploads derive agent/team from server identity and membership, never multipart values. QA/admin/service uploads require a trusted server-side assignment mapping. Return 202 with id/state; same Idempotency-Key and payload returns same result; conflicting payload is 409 |
 | GET /v1/calls | Scoped filters for state, risk, agent and date; limit 1–100; opaque cursor; redacted summary |
 | GET /v1/calls/{id} | Scoped call, current audit, final transcript and findings; missing or out-of-scope ID returns 404 |
+| GET /v1/calls/{id}/disposition | Scoped current disposition plus config/model provenance and review state |
+| GET /v1/disposition-configs | Admin's organisation-scoped immutable config versions and active version pointer |
+| POST /v1/disposition-configs/validate | Admin validates candidate JSON without storing it; 200 with normalized preview or 422 with safe field errors |
+| POST /v1/disposition-configs | Admin stores a validated immutable STAGED version; 201; duplicate version/content conflict is 409 |
+| POST /v1/disposition-configs/{id}/versions/{version}/approve | A different Admin from the version creator records a reasoned, immutable approval event; self-approval is forbidden |
+| POST /v1/disposition-configs/{id}/versions/{version}/activate | Admin atomically changes the active pointer only to an independently approved version; prior versions/results remain immutable; 409 on stale pointer |
+| POST /v1/disposition-configs/{id}/versions/{version}/replay | Admin replays only synthetic or approved redacted fixtures; returns metrics without activating or changing historical calls |
+| POST /v1/disposition-configs/{id}/rollback | Admin atomically points to a previously active, independently approved immutable version; reason required; 409 on stale pointer |
 | POST /v1/calls/{id}/audio-access | Separate audio permission; logged short-lived playback URL, maximum 60-second validity |
 | POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE, base_review_version, reason and dimension scores; 201, or 409 on stale review |
 | GET /v1/events | Scoped SSE; Last-Event-ID resumes; expired cursor yields reset_required and client fetches snapshot |
@@ -210,7 +236,7 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 
 Common error: `{"error":{"code":"INVALID_AUDIO","message":"Unsupported audio format","request_id":"..."}}`. Never return model service credentials, raw transcript fragments or stack traces.
 
-SSE envelope: `{sequence, schema_version, call_id, type, occurred_at, payload}`. Types: `call.updated`, `transcript.partial`, `transcript.final`, `finding.updated`, `sentiment.updated`, `audit.ready`, `reset_required`. Provisional redacted text is short-lived and not written to the durable outbox; after reconnect restore final state and wait for fresh partials.
+SSE envelope: `{sequence, schema_version, call_id, type, occurred_at, payload}`. Types: `call.updated`, `transcript.partial`, `transcript.final`, `finding.updated`, `sentiment.updated`, `audit.ready`, `disposition.ready`, `reset_required`. Provisional redacted text is short-lived and not written to the durable outbox; after reconnect restore final state and wait for fresh partials.
 
 ## 9. Policy evaluation
 
@@ -258,7 +284,7 @@ Browser views show connection state, last-update age and incomplete evidence. Us
 
 ## 12. Security and data lifecycle
 
-Authenticate people through organisation OIDC. Validate issuer, audience, expiry and signature; derive roles/team membership server-side. Use secure HttpOnly session cookies and CSRF protection for mutations; explicitly validate media signatures/tokens and replay bounds. Allowlisted origins, rate limits and file limits apply at trust boundaries.
+Authenticate people through organisation OIDC. Validate issuer, audience, expiry and signature; map the verified token subject to active `identity_memberships` records in PostgreSQL. Reject absent or ambiguous mappings; an optional organisation selector only narrows a verified membership. Use secure HttpOnly session cookies and require both an allowlisted `Origin` and session-bound HMAC CSRF token on cookie-authenticated mutations; obtain the token from `GET /v1/csrf` with `Cache-Control: no-store`. Bearer-authenticated API clients do not use cookie CSRF. Explicitly validate media signatures/tokens and replay bounds. Allowlisted origins, rate limits and file limits apply at trust boundaries.
 
 Keep raw audio private and encrypted with managed keys. Use encrypted temporary storage with short expiry for decoder spill; disable unsafe swap/core dumps in sensitive containers. Raw transcript text is processed transiently for redaction, not stored as a parallel permanent column. Redaction failure blocks persistence, model submission and UI delivery. PII detection combines configured entity recognition and structured patterns; verify coverage for the selected language/domain.
 
