@@ -1,6 +1,10 @@
+import json
+import os
 import threading
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.requests import Request
@@ -10,8 +14,13 @@ from app.auth import IdentityLookup, Scope, can_access, csrf_token_for_session, 
 from app.config import Settings
 from app.db import connect
 from app.ingest import IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept_recording
+from app.disposition_config import ConfigError, compile_disposition_config
+from app.disposition import classify_disposition
+from app.local_disposition_adapter import LocalVllmDispositionAdapter
+from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
+MAX_DISPOSITION_CONFIG_BYTES = 1024 * 1024
 
 
 class _RequestBodyTooLarge(Exception):
@@ -73,14 +82,72 @@ class UploadBodyLimitMiddleware:
             self.slots.release()
 
 
+class DispositionBodyLimitMiddleware:
+    """Authenticate admin config writes before bounded JSON body parsing."""
+
+    def __init__(self, app, *, get_scope, max_bytes: int = MAX_DISPOSITION_CONFIG_BYTES, concurrent_requests: int = 8):
+        self.app = app
+        self.get_scope = get_scope
+        self.max_bytes = max_bytes
+        self.slots = threading.BoundedSemaphore(concurrent_requests)
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or scope.get("method") != "POST" or not path.startswith("/v1/disposition-configs"):
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", ()))
+        try:
+            length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            await JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)(scope, receive, send)
+            return
+        if length > self.max_bytes:
+            await JSONResponse({"detail": "Configuration request is too large"}, status_code=413)(scope, receive, send)
+            return
+        if not self.slots.acquire(blocking=False):
+            await JSONResponse({"detail": "Configuration API capacity is busy"}, status_code=503, headers={"Retry-After": "1"})(scope, receive, send)
+            return
+        try:
+            try:
+                auth_scope = await self.get_scope(Request(scope, receive))
+            except HTTPException as error:
+                await JSONResponse({"detail": error.detail}, status_code=error.status_code)(scope, receive, send)
+                return
+            if auth_scope.role != "ADMIN":
+                await JSONResponse({"detail": "Administrator role required"}, status_code=403)(scope, receive, send)
+                return
+            scope.setdefault("state", {})["auth_scope"] = auth_scope
+            count = 0
+
+            async def limited_receive():
+                nonlocal count
+                message = await receive()
+                if message["type"] == "http.request":
+                    count += len(message.get("body", b""))
+                    if count > self.max_bytes:
+                        raise _RequestBodyTooLarge
+                return message
+
+            try:
+                await self.app(scope, limited_receive, send)
+            except _RequestBodyTooLarge:
+                await JSONResponse({"detail": "Configuration request is too large"}, status_code=413)(scope, receive, send)
+        finally:
+            self.slots.release()
+
+
 def create_app(
     settings: Settings,
     *,
     identity_lookup: IdentityLookup | None = None,
+    disposition_adapter=None,
 ) -> FastAPI:
     """Create the API with OIDC validation and server-owned scope lookups."""
     app = FastAPI()
     get_scope = scope_dependency(settings, identity_lookup)
+    if disposition_adapter is None and os.environ.get("DISPOSITION_MODEL_SHA256"):
+        disposition_adapter = LocalVllmDispositionAdapter.from_environment()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -101,6 +168,121 @@ def create_app(
         if record is None or not can_access(scope, str(record[1]), record[2], record[3]):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         return {"id": str(record[0]), "processing_state": record[4]}
+
+    @app.get("/v1/calls/{call_id}/disposition")
+    def get_disposition(call_id: str, scope: Scope = Depends(get_scope)) -> dict:
+        with connect() as connection:
+            call = connection.execute("SELECT id,organisation_id,agent_id,team_id FROM calls WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (scope.organisation_id, call_id)).fetchone()
+            if call is None or not can_access(scope, str(call[1]), call[2], call[3]):
+                raise HTTPException(status_code=404)
+            row = connection.execute(
+                "SELECT revision,transcript_revision,config_id,config_version,config_hash,schema_version,model_artifact,adapter_version,processing_path,status,code,parent_code,confidence,requires_review,review_reason,matched_rule_id,signals_json,usage_json,created_at "
+                "FROM dispositions WHERE organisation_id=%s AND call_id=%s ORDER BY revision DESC LIMIT 1",
+                (scope.organisation_id, call_id),
+            ).fetchone()
+        if row is None:
+            return {"call_id": call_id, "status": "PENDING"}
+        return {"call_id": call_id, "revision": row[0], "transcript_revision": row[1], "config_id": row[2], "config_version": row[3], "config_hash": row[4].strip(), "schema_version": row[5], "model_artifact": row[6], "adapter_version": row[7], "processing_path": row[8], "status": row[9], "code": row[10], "parent_code": row[11], "confidence": row[12], "requires_review": row[13], "review_reason": row[14], "matched_rule_id": row[15], "signals": row[16], "usage": row[17], "created_at": row[18].isoformat()}
+
+    def require_admin(scope: Scope) -> None:
+        if scope.role != "ADMIN":
+            raise HTTPException(status_code=403, detail="Administrator role required")
+
+    def write_config_event(connection, scope: Scope, action: str, config_id: str, version: int, *, reason: str | None = None, request_id: str | None = None, details: dict | None = None) -> None:
+        connection.execute(
+            "INSERT INTO disposition_config_events(organisation_id,id,actor_id,action,config_id,version,reason,request_id,details) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            (scope.organisation_id, uuid4(), scope.user_id, action, config_id, version, reason, request_id, json.dumps(details or {})),
+        )
+
+    @app.get("/v1/disposition-configs")
+    def list_disposition_configs(scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        with connect() as connection:
+            rows = connection.execute("SELECT v.config_id,v.use_case_id,v.version,v.content_hash,v.schema_version,v.created_by,v.created_at,a.version,a.generation,EXISTS (SELECT 1 FROM disposition_config_events e WHERE e.organisation_id=v.organisation_id AND e.config_id=v.config_id AND e.version=v.version AND e.action IN ('ACTIVATED','ROLLBACK')) FROM disposition_config_versions v LEFT JOIN active_disposition_configs a ON a.organisation_id=v.organisation_id AND a.config_id=v.config_id WHERE v.organisation_id=%s ORDER BY v.config_id,v.version", (scope.organisation_id,)).fetchall()
+        return {"versions": [{"config_id": r[0], "use_case_id": r[1], "version": r[2], "content_hash": r[3].strip(), "schema_version": r[4], "created_by": r[5], "created_at": r[6].isoformat(), "active": r[7] == r[2], "status": "ACTIVE" if r[7] == r[2] else ("RETIRED" if r[9] else "STAGED"), "active_generation": r[8]} for r in rows]}
+
+    @app.post("/v1/disposition-configs/validate")
+    def validate_disposition_config(raw: dict = Body(...), scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        try:
+            compiled = compile_disposition_config(raw)
+        except ConfigError as error:
+            raise HTTPException(status_code=422, detail=error.errors) from error
+        return {"valid": True, "config_id": compiled.config_id, "use_case_id": compiled.use_case_id, "version": compiled.version, "content_hash": compiled.content_hash, "schema_version": compiled.schema_version, "question_count": len(compiled.questions), "taxonomy_codes": sorted(compiled.taxonomy)}
+
+    @app.post("/v1/disposition-configs", status_code=201)
+    def stage_disposition_config(raw: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        try:
+            compiled = compile_disposition_config(raw)
+        except ConfigError as error:
+            raise HTTPException(status_code=422, detail=error.errors) from error
+        try:
+            with connect() as connection:
+                with connection.transaction():
+                    connection.execute("INSERT INTO disposition_config_versions(organisation_id,config_id,use_case_id,version,content_hash,schema_version,raw_json,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)", (scope.organisation_id, compiled.config_id, compiled.use_case_id, compiled.version, compiled.content_hash, compiled.schema_version, json.dumps(compiled.normalized), scope.user_id))
+                    write_config_event(connection, scope, "STAGED", compiled.config_id, compiled.version, request_id=request.headers.get("X-Request-ID") if request else None)
+        except UniqueViolation as error:
+            raise HTTPException(status_code=409, detail="Configuration version already exists or conflicts") from error
+        return {"config_id": compiled.config_id, "use_case_id": compiled.use_case_id, "version": compiled.version, "content_hash": compiled.content_hash, "status": "STAGED"}
+
+    @app.post("/v1/disposition-configs/{config_id}/versions/{version}/activate")
+    def activate_disposition_config(config_id: str, version: int, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        expected = body.get("expected_generation")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            raise HTTPException(status_code=422, detail="expected_generation must be a nonnegative integer")
+        with connect() as connection:
+            with connection.transaction():
+                connection.execute("SELECT id FROM organisations WHERE id=%s FOR UPDATE", (scope.organisation_id,))
+                config = connection.execute("SELECT 1 FROM disposition_config_versions WHERE organisation_id=%s AND config_id=%s AND version=%s", (scope.organisation_id, config_id, version)).fetchone()
+                if config is None: raise HTTPException(status_code=404)
+                current = connection.execute("SELECT config_id,version,generation FROM active_disposition_configs WHERE organisation_id=%s FOR UPDATE", (scope.organisation_id,)).fetchone()
+                actual = current[2] if current else 0
+                if actual != expected: raise HTTPException(status_code=409, detail="Active configuration changed")
+                generation = actual + 1
+                if current:
+                    connection.execute("UPDATE active_disposition_configs SET config_id=%s,version=%s,generation=%s,changed_by=%s,changed_at=now() WHERE organisation_id=%s AND generation=%s", (config_id, version, generation, scope.user_id, scope.organisation_id, expected))
+                else:
+                    connection.execute("INSERT INTO active_disposition_configs(organisation_id,config_id,version,generation,changed_by) VALUES (%s,%s,%s,%s,%s)", (scope.organisation_id, config_id, version, generation, scope.user_id))
+                write_config_event(connection, scope, "ACTIVATED", config_id, version, request_id=request.headers.get("X-Request-ID") if request else None, details={"generation": generation})
+        return {"config_id": config_id, "version": version, "generation": generation}
+
+    @app.post("/v1/disposition-configs/{config_id}/versions/{version}/replay")
+    def replay_disposition_config(config_id: str, version: int, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        if set(body) != {"fixture_set_id"} or body.get("fixture_set_id") != "synthetic-smoke-v1":
+            raise HTTPException(status_code=422, detail="Only the bundled synthetic-smoke-v1 fixture set is supported")
+        if disposition_adapter is None:
+            raise HTTPException(status_code=503, detail="Local disposition model is unavailable")
+        with connect() as connection:
+            row = connection.execute("SELECT raw_json FROM disposition_config_versions WHERE organisation_id=%s AND config_id=%s AND version=%s", (scope.organisation_id, config_id, version)).fetchone()
+            if row is None: raise HTTPException(status_code=404)
+        compiled = compile_disposition_config(row[0])
+        fixtures = [{"id": "synthetic-customer-1", "role": "CUSTOMER", "start_ms": 0, "end_ms": 1000, "text_redacted": "Synthetic customer asks about a sample service."}, {"id": "synthetic-agent-1", "role": "AGENT", "start_ms": 1001, "end_ms": 2000, "text_redacted": "Synthetic agent offers a sample next step."}]
+        result = classify_disposition(fixtures, {}, disposition_adapter, compiled)
+        with connect() as connection:
+            with connection.transaction():
+                write_config_event(connection, scope, "REPLAYED", config_id, version, request_id=request.headers.get("X-Request-ID") if request else None, details={"fixture_set_id": "synthetic-smoke-v1", "status": result.status})
+        return {"fixture_set_id": "synthetic-smoke-v1", "sample_count": 1, "resolved_count": int(result.status == "RESOLVED"), "review_count": int(result.status == "NEEDS_REVIEW"), "results": [{"status": result.status, "code": result.code, "requires_review": result.requires_review}]}
+
+    @app.post("/v1/disposition-configs/{config_id}/rollback")
+    def rollback_disposition_config(config_id: str, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        target_version, expected, reason = body.get("version"), body.get("expected_generation"), body.get("reason")
+        if isinstance(target_version, bool) or not isinstance(target_version, int) or target_version < 1 or isinstance(expected, bool) or not isinstance(expected, int) or expected < 1 or not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise HTTPException(status_code=422, detail="version, expected_generation, and reason are required")
+        with connect() as connection:
+            with connection.transaction():
+                connection.execute("SELECT id FROM organisations WHERE id=%s FOR UPDATE", (scope.organisation_id,))
+                prior = connection.execute("SELECT 1 FROM disposition_config_events WHERE organisation_id=%s AND config_id=%s AND version=%s AND action IN ('ACTIVATED','ROLLBACK') LIMIT 1", (scope.organisation_id, config_id, target_version)).fetchone()
+                if prior is None: raise HTTPException(status_code=409, detail="Rollback target was never active")
+                current = connection.execute("SELECT config_id,version,generation FROM active_disposition_configs WHERE organisation_id=%s FOR UPDATE", (scope.organisation_id,)).fetchone()
+                if current is None or current[2] != expected: raise HTTPException(status_code=409, detail="Active configuration changed")
+                generation = expected + 1
+                connection.execute("UPDATE active_disposition_configs SET config_id=%s,version=%s,generation=%s,changed_by=%s,changed_at=now() WHERE organisation_id=%s AND generation=%s", (config_id, target_version, generation, scope.user_id, scope.organisation_id, expected))
+                write_config_event(connection, scope, "ROLLBACK", config_id, target_version, reason=reason.strip(), request_id=request.headers.get("X-Request-ID") if request else None, details={"generation": generation})
+        return {"config_id": config_id, "version": target_version, "generation": generation, "status": "ROLLED_BACK"}
 
     @app.post("/v1/calls", status_code=status.HTTP_202_ACCEPTED)
     async def upload_call(
@@ -126,6 +308,7 @@ def create_app(
         return result
 
     limited_app = UploadBodyLimitMiddleware(app, max_bytes=MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES, get_scope=get_scope)
+    limited_app = DispositionBodyLimitMiddleware(limited_app, get_scope=get_scope)
     return CORSMiddleware(
         limited_app,
         allow_origins=list(settings.allowed_origins),

@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0.0",
+  "config_id": "sample_outcome_v1",
+  "version": 1,
+  "identity": {
+    "use_case_id": "sample_outcome",
+    "display_name": "Synthetic sample outcome"
+  },
+  "questions": {
+    "affirmative_commitment": {
+      "type": "noul",
+      "instructions": "Did the customer make an explicit affirmative commitment to the next step?",
+      "criteria": {
+        "true": "A clear affirmative commitment is stated.",
+        "false": "No clear commitment is stated."
+      }
+    }
+  },
+  "taxonomy": {
+    "codes": [
+      {"code": "NO_CONTACT", "name": "No contact", "level": 0, "parent_code": null, "terminal": true, "callback": true, "success": false},
+      {"code": "COMMITTED", "name": "Committed", "level": 0, "parent_code": null, "terminal": true, "callback": false, "success": true},
+      {"code": "REVIEW", "name": "Human review", "level": 0, "parent_code": null, "terminal": true, "callback": false, "success": false}
+    ]
+  },
+  "front_gates": [
+    {
+      "id": "NO_CONNECTION",
+      "enabled": true,
+      "priority": 10,
+      "source": "telephony_status",
+      "condition": {"operator": "IN", "value": ["NO_ANSWER", "FAILED", "NOT_CONNECTED"]},
+      "emit": "NO_CONTACT"
+    }
+  ],
+  "resolver": {
+    "strategy": "FIRST_MATCH_WINS",
+    "default_emit": "REVIEW",
+    "rules": [
+      {
+        "id": "COMMITMENT_CONFIRMED",
+        "priority": 100,
+        "when": {"all": [{"signal": "affirmative_commitment", "operator": "NOUL_GTE", "value": 0.7}]},
+        "emit": "COMMITTED"
+      }
+    ]
+  },
+  "confidence": {
+    "default_commit_threshold": 0.65,
+    "default_review_threshold": 0.45,
+    "low_confidence_action": "REVIEW",
+    "per_code": {"COMMITTED": {"commit_threshold": 0.7}}
+  },
+  "runtime": {
+    "context_limit_chars": 100000,
+    "window_chars": 12000,
+    "overlap_turns": 1,
+    "max_chunks": 128
+  }
+}

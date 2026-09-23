@@ -169,6 +169,22 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                         (locked[0], uuid4(), locked[1], revision),
                     )
                 connection.execute("UPDATE calls SET processing_state=%s,transcript_revision=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, revision, locked[0], locked[1]))
+            elif "disposition" in result:
+                disposition = result["disposition"]
+                required = {"transcript_revision", "config_id", "config_version", "config_hash", "schema_version", "model_artifact", "adapter_version", "processing_path", "status", "code", "parent_code", "confidence", "requires_review", "review_reason", "matched_rule_id", "signals", "usage"}
+                if not isinstance(disposition, dict) or set(disposition) != required:
+                    raise ValueError("invalid disposition result")
+                if disposition["transcript_revision"] != locked[3]:
+                    raise ValueError("stale disposition transcript revision")
+                revision = connection.execute("SELECT COALESCE(MAX(revision),0)+1 FROM dispositions WHERE organisation_id=%s AND call_id=%s", (locked[0], locked[1])).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO dispositions(organisation_id,id,call_id,revision,transcript_revision,config_id,config_version,config_hash,schema_version,model_artifact,adapter_version,processing_path,status,code,parent_code,confidence,requires_review,review_reason,matched_rule_id,signals_json,usage_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb) ON CONFLICT (organisation_id,call_id,transcript_revision,config_id,config_version,model_artifact,adapter_version) DO NOTHING RETURNING id",
+                    (locked[0], uuid4(), locked[1], revision, disposition["transcript_revision"], disposition["config_id"], disposition["config_version"], disposition["config_hash"], disposition["schema_version"], disposition["model_artifact"], disposition["adapter_version"], disposition["processing_path"], disposition["status"], disposition["code"], disposition["parent_code"], disposition["confidence"], disposition["requires_review"], disposition["review_reason"], disposition["matched_rule_id"], json.dumps(disposition["signals"]), json.dumps(disposition["usage"])),
+                ).fetchone()
+                # ANALYSE is disposition-only in this slice. Never mark a call READY;
+                # QA policy/audit stages have not been implemented yet.
+                connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
             else:
                 connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
     return changed == 1
