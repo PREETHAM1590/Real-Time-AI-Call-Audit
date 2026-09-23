@@ -340,7 +340,7 @@ The caller fetches only the authorised call's pinned transcript revision. Valida
 
 **Approved implementation adjustment:** The repository has no existing browser application or npm build scaffold. For the pilot review surface, use native HTML/CSS/JavaScript served by FastAPI and a Python Playwright browser smoke test (`.[browser-test]` plus Chromium). This avoids introducing a speculative frontend dependency tree; a React/TypeScript client remains a later replacement path and is not claimed as delivered.
 
-**Interfaces:** `append_review(connection, scope: Scope, audit_id: str, base_review_version: int, action: str, scores: dict, reason: str) -> dict`; `ReviewConflict` exception maps to HTTP 409. Browser `getCall(id: string)` and `submitReview(auditId: string, body: ReviewInput)` implement the spec API.
+**Interfaces:** `append_review(connection, scope: Scope, audit_id: str, base_review_version: int, action: str, scores: dict, reason: str) -> dict`; `ReviewConflict` maps to HTTP 409. The delivered vanilla JavaScript client uses `request()` for the authenticated API and `loadCall()` for call detail; there is no TypeScript interface or npm build in this pilot.
 
 - [x] **1. Write concurrent-review integration check:**
 
