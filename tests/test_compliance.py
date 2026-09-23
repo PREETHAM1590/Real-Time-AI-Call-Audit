@@ -102,6 +102,16 @@ class PolicyWindowTests(unittest.TestCase):
         disclosure = next(item for item in findings if item["rule_id"] == "opening_disclosure")
         self.assertEqual(disclosure["status"], "UNKNOWN")
 
+    def test_unknown_role_crossing_either_closing_boundary_makes_result_unknown(self):
+        for utterance in (
+            u("cross-start", "UNKNOWN", 15_950, 16_050, "Unclear speaker."),
+            u("cross-end", "UNKNOWN", 30_500, 31_500, "Unclear speaker."),
+        ):
+            with self.subTest(utterance=utterance.id):
+                findings = evaluate_rules([utterance], context(call_duration_ms=31_000), self.ruleset)
+                closing = next(item for item in findings if item["rule_id"] == "closing_farewell")
+                self.assertEqual(closing["status"], "UNKNOWN")
+
     def test_hold_or_ivr_breaks_phrase_continuity(self):
         rows = [
             u("before", "AGENT", 9_000, 9_500, "This call may be"),
@@ -154,6 +164,10 @@ class PolicyWindowTests(unittest.TestCase):
         renamed["rules"].append(copy.deepcopy(renamed_rule))
         with self.assertRaises(RulesetError):
             compile_ruleset(renamed)
+        optional = copy.deepcopy(self.ruleset)
+        optional["rules"] = [rule for rule in optional["rules"] if rule["type"] != "SENSITIVE_NUMBER_ADVISORY"]
+        self.assertEqual(len(compile_ruleset(optional)["rules"]), 2)
+        self.assertEqual(scan_sensitive_numbers([{"segment_id": "segment-1", "text": "415-555-0199"}], optional), [])
 
 
 @unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")

@@ -160,8 +160,8 @@ def compile_ruleset(raw: Mapping[str, Any]) -> dict[str, Any]:
             if kind == "OPENING_DISCLOSURE" and "window_ms" in rule or kind == "CLOSING_PHRASE" and "opportunity_ms" in rule:
                 raise RulesetError("Rule duration does not match rule type")
         compiled_rules.append({**dict(rule), "policy_text_version": policy_version})
-    if sum(rule["type"] == "SENSITIVE_NUMBER_ADVISORY" for rule in compiled_rules) != 1:
-        raise RulesetError("Ruleset must define exactly one sensitive-number advisory rule")
+    if sum(rule["type"] == "SENSITIVE_NUMBER_ADVISORY" for rule in compiled_rules) > 1:
+        raise RulesetError("Ruleset can define at most one sensitive-number advisory rule")
     normalized = json.loads(json.dumps(dict(raw), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return {
         "ruleset_id": ruleset_id,
@@ -215,6 +215,26 @@ def _normalise_holds(value: Any, duration_ms: int) -> list[tuple[int, int]] | No
 
 def _hold_overlap(holds: Sequence[tuple[int, int]], start: int, end: int) -> int:
     return sum(max(0, min(end, hold_end) - max(start, hold_start)) for hold_start, hold_end in holds)
+
+
+def _has_unknown_overlap(
+    utterances: Sequence[Utterance | Mapping[str, Any]],
+    start_ms: int,
+    end_ms: int,
+    holds: Sequence[tuple[int, int]],
+) -> bool:
+    """Return whether UNKNOWN speech overlaps non-held opportunity time."""
+    for utterance in utterances:
+        if _field(utterance, "role") != "UNKNOWN":
+            continue
+        start, end = _field(utterance, "start_ms"), _field(utterance, "end_ms")
+        if isinstance(start, bool) or not isinstance(start, int) or isinstance(end, bool) or not isinstance(end, int):
+            continue
+        overlap_start, overlap_end = max(start, start_ms), min(end, end_ms)
+        opportunity_overlap = max(0, overlap_end - overlap_start)
+        if opportunity_overlap and _hold_overlap(holds, overlap_start, overlap_end) < opportunity_overlap:
+            return True
+    return False
 
 
 def _opening_deadline(start: int, opportunity_ms: int, holds: Sequence[tuple[int, int]]) -> int:
@@ -289,19 +309,7 @@ def evaluate_rules(utterances: Sequence[Utterance | Mapping[str, Any]], context:
                 opportunity_end = min(duration, deadline)
                 elapsed = max(0, opportunity_end - connected - _hold_overlap(safe_holds, connected, opportunity_end))
             window_end = min(duration, deadline) if isinstance(duration, int) and deadline is not None else None
-            unknown_role = False
-            if window_end is not None:
-                for utterance in utterances:
-                    if _field(utterance, "role") != "UNKNOWN":
-                        continue
-                    start, end = _field(utterance, "start_ms"), _field(utterance, "end_ms")
-                    if not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int) or isinstance(end, bool):
-                        continue
-                    overlap_start, overlap_end = max(start, connected), min(end, window_end)
-                    opportunity_overlap = max(0, overlap_end - overlap_start)
-                    if opportunity_overlap and _hold_overlap(safe_holds, overlap_start, overlap_end) < opportunity_overlap:
-                        unknown_role = True
-                        break
+            unknown_role = window_end is not None and _has_unknown_overlap(utterances, connected, window_end, safe_holds)
             allowed_ids = {str(_field(u, "id")) for u in eligible}
             phrase_evidence = _phrase_evidence(utterances, rule["phrase_variants"], allowed_ids)
             state = disclosure_state(
@@ -327,7 +335,7 @@ def evaluate_rules(utterances: Sequence[Utterance | Mapping[str, Any]], context:
                     start, end = _field(utterance, "start_ms"), _field(utterance, "end_ms")
                     if isinstance(start, int) and isinstance(end, int) and window_start <= start <= end <= window_end and _hold_overlap(safe_holds, start, end) == 0:
                         eligible.append(utterance)
-            unknown_role = any(_field(u, "role") == "UNKNOWN" for u in eligible)
+            unknown_role = window_start is not None and window_end is not None and _has_unknown_overlap(utterances, window_start, window_end, safe_holds)
             if not reliable or window_start is None or unknown_role:
                 state = "UNKNOWN"
             elif _phrase_evidence(
