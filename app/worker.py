@@ -1,12 +1,14 @@
 """Lease-safe queue drain. Model stages register a processor when implemented."""
 
 import os
+import logging
 import socket
 import threading
+import time
 from collections.abc import Callable, Mapping
 
 from app.db import connect
-from app.ingest import claim_job, defer_job, finish_job, renew_job, retry_job
+from app.ingest import MAX_JOB_ATTEMPTS, claim_job, defer_job, finish_job, renew_job, retry_job
 from app.storage import LocalPrivateStorage
 from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
@@ -16,6 +18,27 @@ from app.audit import audit_call, load_pinned_text, load_rubric
 Processor = Callable[[dict], str | dict]
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
+_LOGGER = logging.getLogger(__name__)
+_KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT"})
+_KNOWN_OUTCOMES = frozenset({"WAITING_HANDLER", "LEASE_LOST", "COMMITTED", "STALE_COMMIT", "RETRY_HANDLED", "RETRY_HANDLER_FAILED"})
+
+
+def _log_stage_outcome(stage, attempt, outcome, started_at: float) -> None:
+    safe_stage = stage if isinstance(stage, str) and stage in _KNOWN_STAGES else "UNKNOWN"
+    safe_attempt = attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else 0
+    safe_attempt = min(MAX_JOB_ATTEMPTS, max(0, safe_attempt))
+    safe_outcome = outcome if outcome in _KNOWN_OUTCOMES else "UNKNOWN"
+    duration_ms = min(31_536_000_000, max(0, round((time.monotonic() - started_at) * 1000)))
+    _LOGGER.info(
+        "worker stage outcome",
+        extra={
+            "event_name": "worker.stage_outcome",
+            "stage": safe_stage,
+            "attempt": safe_attempt,
+            "outcome": safe_outcome,
+            "duration_ms": duration_ms,
+        },
+    )
 
 
 def make_disposition_processor(adapter):
@@ -115,9 +138,13 @@ def run_once(worker_id: str, processors: Mapping[str, Processor] | None = None) 
         processor = processors.get(job["stage"])
         job_id, token = str(job["id"]), str(job["lease_token"])
         if processor is None:
-            defer_job(connection, job_id, token)
+            started_at = time.monotonic()
+            deferred = defer_job(connection, job_id, token)
+            _log_stage_outcome(job.get("stage"), job.get("attempts"), "WAITING_HANDLER" if deferred else "LEASE_LOST", started_at)
             return True
 
+        started_at = time.monotonic()
+        outcome = "LEASE_LOST"
         stopping, lease_lost = threading.Event(), threading.Event()
 
         def heartbeat() -> None:
@@ -136,13 +163,20 @@ def run_once(worker_id: str, processors: Mapping[str, Processor] | None = None) 
         try:
             output = processor(job)
             result = output if isinstance(output, dict) else {"processing_state": output}
-            if not lease_lost.is_set():
-                finish_job(connection, job_id, token, result)
+            if lease_lost.is_set():
+                outcome = "LEASE_LOST"
+            else:
+                outcome = "COMMITTED" if finish_job(connection, job_id, token, result) else "STALE_COMMIT"
         except Exception:
-            retry_job(connection, job_id, token)
+            try:
+                outcome = "RETRY_HANDLED" if retry_job(connection, job_id, token) else "LEASE_LOST"
+            except Exception:
+                outcome = "RETRY_HANDLER_FAILED"
+                raise
         finally:
             stopping.set()
             thread.join(timeout=HEARTBEAT_SECONDS + 1)
+            _log_stage_outcome(job.get("stage"), job.get("attempts"), outcome, started_at)
     return True
 
 

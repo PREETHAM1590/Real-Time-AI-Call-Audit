@@ -28,6 +28,7 @@ from app.storage import LocalPrivateStorage
 from app.privacy import redact_text
 from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavailable, export_findings, own_scores, team_report
 from app.retention import request_call_deletion
+from app.operations import operations_summary
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -221,6 +222,33 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        def database_probe() -> bool:
+            try:
+                with connect() as connection:
+                    return connection.execute("SELECT 1").fetchone() == (1,)
+            except Exception:
+                return False
+
+        database_available = await run_in_threadpool(database_probe)
+        payload = {
+            "status": "database_available" if database_available else "database_unavailable",
+            "database": "available" if database_available else "unavailable",
+            "model_readiness": "unknown",
+        }
+        return JSONResponse(payload, status_code=200 if database_available else 503)
+
+    @app.get("/v1/operations/summary")
+    def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict[str, int]:
+        if scope.role != "ADMIN":
+            raise HTTPException(status_code=403, detail="Administrator role required")
+        try:
+            with connect() as connection:
+                return operations_summary(connection, scope.organisation_id)
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="Operations summary unavailable") from error
 
     @app.get("/v1/csrf")
     async def get_csrf_token(request: Request, response: Response, _scope: Scope = Depends(get_scope)) -> dict[str, str]:

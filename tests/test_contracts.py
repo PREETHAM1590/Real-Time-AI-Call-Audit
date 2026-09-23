@@ -185,6 +185,36 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(self.client.get("/health").status_code, 200)
         self.assertEqual(self.client.get("/v1/calls/call-a").status_code, 401)
 
+    def test_readiness_reports_database_separately_from_unknown_model_state(self):
+        with patch("app.api.connect") as connect:
+            connection = connect.return_value.__enter__.return_value
+            connection.execute.return_value.fetchone.return_value = (1,)
+            ready = self.client.get("/ready")
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json(), {"status": "database_available", "database": "available", "model_readiness": "unknown"})
+
+        with patch("app.api.connect", side_effect=RuntimeError("database credentials are private")):
+            unavailable = self.client.get("/ready")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.json(), {"status": "database_unavailable", "database": "unavailable", "model_readiness": "unknown"})
+        self.assertNotIn("credentials", unavailable.text)
+
+    def test_operations_summary_is_admin_only_and_contains_no_identifiers(self):
+        qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}"}
+        with patch("app.api.connect") as connect:
+            denied = self.client.get("/v1/operations/summary", headers=qa_headers)
+        self.assertEqual(denied.status_code, 403)
+        connect.assert_not_called()
+
+        admin_headers = {"Authorization": f"Bearer {self.token(subject='admin-user')}"}
+        with patch("app.api.connect") as connect:
+            connection = connect.return_value.__enter__.return_value
+            connection.execute.return_value.fetchone.return_value = (2, 35, 4)
+            response = self.client.get("/v1/operations/summary", headers=admin_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"pending_jobs": 2, "oldest_pending_age_seconds": 35, "incomplete_calls": 4})
+        self.assertEqual(connection.execute.call_args.args[1], ("org-a", 31_536_000))
+
     def test_call_deletion_requires_admin_and_returns_tombstone_status(self):
         qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}"}
         with patch("app.api.connect") as connect:

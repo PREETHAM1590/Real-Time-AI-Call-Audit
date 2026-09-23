@@ -69,6 +69,12 @@ For every prompt/model/rule/config change: run deterministic checks → held-out
 
 Collect call intake rate, audio gaps, STT errors/time-to-final, job age, retries/dead letters, stage durations, incomplete calls, redaction failures, invalid evidence, LLM refusal/schema failure, tokens, GPU memory/utilisation, model load failures, queue wait, SSE disconnects, export volume and review overrides. Do not attach raw text or high-cardinality caller identifiers to metric labels.
 
+### Current observability slice
+
+The worker emits one structured `worker.stage_outcome` log record for each claimed attempt, with only allowlisted stage, bounded attempt number, outcome and elapsed milliseconds. It does not log job/call/tenant identifiers, exception text, transcript text, or model request/response bodies. `GET /health` is a process liveness check. `GET /ready` checks `SELECT 1` and returns database availability with `model_readiness: unknown`; it does not probe or claim local model readiness. `GET /v1/operations/summary` is ADMIN-only and tenant-scoped; it returns pending job count, oldest pending age capped at 365 days, and calls not in READY, with no per-call rows or identifiers. The incomplete count reflects pipeline state (and includes failed/needs-review records), not trusted telephony call completeness.
+
+These are request/log-level checks, not a metrics exporter, time-series store, dashboard, alerting system or spend measurement. Model readiness, STT/LLM capacity, GPU usage, tokens and compute cost remain unknown/unmeasured until deployment instrumentation and selected local models are configured.
+
 Separate latency clocks: call end, object available, job enqueued, local inference request, final received, audit committed and browser rendered. For live calls also measure audio arrival to stable final; windowed Whisper may dominate this interval. Use monotonic durations within a process and synchronised UTC timestamps across services; include clock-skew monitoring.
 
 | Signal | Initial response |

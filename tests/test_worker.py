@@ -1,4 +1,6 @@
 import unittest
+import logging
+import uuid
 from unittest.mock import patch
 
 from app.worker import run_once
@@ -28,10 +30,32 @@ class WorkerTests(unittest.TestCase):
     @patch("app.worker.connect")
     def test_processor_failure_uses_bounded_retry_path(self, connect, claim, retry):
         def fail(_job):
-            raise RuntimeError("synthetic failure")
+            raise RuntimeError("raw transcript: customer secret-value")
 
-        self.assertTrue(run_once("worker-a", {"TRANSCRIBE": fail}))
+        with self.assertLogs("app.worker", level=logging.INFO) as logs:
+            self.assertTrue(run_once("worker-a", {"TRANSCRIBE": fail}))
         retry.assert_called_once_with(connect.return_value.__enter__.return_value, "job", "lease")
+        self.assertNotIn("secret-value", "\n".join(logs.output))
+        event = logs.records[0]
+        self.assertEqual(event.event_name, "worker.stage_outcome")
+        self.assertEqual(event.stage, "TRANSCRIBE")
+        self.assertEqual(event.attempt, 0)
+        self.assertEqual(event.outcome, "RETRY_HANDLED")
+        self.assertFalse(hasattr(event, "call_id"))
+
+    @patch("app.worker.finish_job", return_value=True)
+    @patch("app.worker.claim_job", return_value={"id": "private-job", "call_id": str(uuid.uuid4()), "lease_token": "lease", "stage": "TRANSCRIBE", "attempts": 2})
+    @patch("app.worker.connect")
+    def test_worker_logs_stage_outcome_without_job_or_call_identifiers(self, connect, claim, finish):
+        with self.assertLogs("app.worker", level=logging.INFO) as logs:
+            self.assertTrue(run_once("worker-a", {"TRANSCRIBE": lambda _job: "TRANSCRIBING"}))
+        self.assertEqual(len(logs.records), 1)
+        event = logs.records[0]
+        self.assertEqual((event.stage, event.attempt, event.outcome), ("TRANSCRIBE", 2, "COMMITTED"))
+        self.assertGreaterEqual(event.duration_ms, 0)
+        self.assertNotIn("private-job", "\n".join(logs.output))
+        self.assertFalse(hasattr(event, "job_id"))
+        self.assertFalse(hasattr(event, "call_id"))
 
 
 if __name__ == "__main__":
