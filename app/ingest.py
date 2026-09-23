@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import wave
 from pathlib import Path
 from uuid import uuid4
@@ -15,6 +16,7 @@ from app.storage import LocalPrivateStorage
 MAX_AUDIO_BYTES = 250 * 1024 * 1024
 MAX_DURATION_MS = 120 * 60 * 1000
 MAX_JOB_ATTEMPTS = 5
+_MP3_DECODERS = threading.BoundedSemaphore(2)
 
 
 class IntakeError(ValueError):
@@ -42,6 +44,8 @@ def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
             raise IntakeError("Invalid WAV data") from error
     if audio.startswith(b"ID3") or (len(audio) > 1 and audio[0] == 0xff and audio[1] & 0xe0 == 0xe0):
         # Close before child processes for Windows; never pass upload-derived paths or shell text.
+        if not _MP3_DECODERS.acquire(timeout=5):
+            raise IntakeError("Audio validation capacity is busy")
         source_name = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as source:
@@ -66,11 +70,14 @@ def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, json.JSONDecodeError) as error:
             raise IntakeError("Invalid MP3 data") from error
         finally:
-            if source_name is not None:
-                try:
-                    os.unlink(source_name)
-                except FileNotFoundError:
-                    pass
+            try:
+                if source_name is not None:
+                    try:
+                        os.unlink(source_name)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                _MP3_DECODERS.release()
     raise IntakeError("Unsupported audio format")
 
 
@@ -139,9 +146,9 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
 
 
 def defer_job(connection, job_id: str, lease_token: str) -> bool:
-    """Park work until its processor is installed; do not consume retry attempts."""
+    """Park work until its processor is installed without consuming a retry attempt."""
     with connection.transaction():
-        changed = connection.execute("UPDATE jobs SET state='WAITING_HANDLER',lease_token=NULL,lease_until=NULL WHERE id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (job_id, lease_token)).rowcount
+        changed = connection.execute("UPDATE jobs SET state='WAITING_HANDLER',attempts=GREATEST(0,attempts-1),lease_token=NULL,lease_until=NULL WHERE id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (job_id, lease_token)).rowcount
     return changed == 1
 
 

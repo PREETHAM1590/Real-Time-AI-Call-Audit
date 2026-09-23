@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 import unittest
 
@@ -225,3 +226,20 @@ class ApiContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("idempotency-key", response.headers["access-control-allow-headers"].lower())
+
+    def test_upload_runs_blocking_intake_off_the_event_loop(self):
+        def accept_off_loop(*_args):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return {"id": "call-a", "processing_state": "QUEUED"}
+            self.fail("blocking intake ran on the event loop")
+
+        with patch("app.api.accept_recording", side_effect=accept_off_loop):
+            response = self.client.post(
+                "/v1/calls",
+                headers={"Authorization": f"Bearer {self.token()}", "Idempotency-Key": "request-off-loop"},
+                files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+                data={"external_ref": "external-off-loop"},
+            )
+        self.assertEqual(response.status_code, 202)

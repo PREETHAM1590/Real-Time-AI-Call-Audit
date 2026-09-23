@@ -1,5 +1,7 @@
+import asyncio
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import IdentityLookup, Scope, can_access, scope_dependency
 from app.config import Settings
@@ -23,6 +25,7 @@ def create_app(
     )
     resolve_identity = identity_lookup or (lambda _subject: None)
     get_scope = scope_dependency(settings, resolve_identity)
+    intake_slots = asyncio.Semaphore(4)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -46,17 +49,18 @@ def create_app(
     ) -> dict[str, str]:
         if scope.role != "AGENT" or len(scope.team_ids) != 1:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload requires an agent identity with one server-resolved team")
-        payload = bytearray()
-        while block := await audio.read(1024 * 1024):
-            if len(payload) + len(block) > MAX_AUDIO_BYTES:
-                raise HTTPException(status_code=413, detail="Audio is too large")
-            payload.extend(block)
-        try:
-            result = accept_recording(scope, external_ref, bytes(payload), {"language": language}, idempotency_key)
-        except IdempotencyConflict as error:
-            raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing audio") from error
-        except IntakeError as error:
-            raise HTTPException(status_code=400, detail="Invalid audio") from error
+        async with intake_slots:
+            payload = bytearray()
+            while block := await audio.read(1024 * 1024):
+                if len(payload) + len(block) > MAX_AUDIO_BYTES:
+                    raise HTTPException(status_code=413, detail="Audio is too large")
+                payload.extend(block)
+            try:
+                result = await run_in_threadpool(accept_recording, scope, external_ref, bytes(payload), {"language": language}, idempotency_key)
+            except IdempotencyConflict as error:
+                raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing audio") from error
+            except IntakeError as error:
+                raise HTTPException(status_code=400, detail="Invalid audio") from error
         return result
 
     return app

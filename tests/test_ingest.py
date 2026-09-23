@@ -120,11 +120,14 @@ class PostgresIngestTests(unittest.TestCase):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
         with connect() as connection_a, connect() as connection_b:
             self.assertIsNone(claim_job(connection_a, "worker-a", supported_stages=()))
-            one = claim_job(connection_a, "worker-a", supported_stages=("TRANSCRIBE",))
-            self.assertIsNotNone(one)
-            self.assertTrue(renew_job(connection_a, str(one["id"]), str(one["lease_token"])))
-            self.assertTrue(defer_job(connection_a, str(one["id"]), str(one["lease_token"])))
-            connection_a.commit()
+            for _ in range(6):
+                one = claim_job(connection_a, "worker-a", supported_stages=("TRANSCRIBE",))
+                self.assertIsNotNone(one)
+                self.assertTrue(renew_job(connection_a, str(one["id"]), str(one["lease_token"])))
+                self.assertTrue(defer_job(connection_a, str(one["id"]), str(one["lease_token"])))
+                attempts = connection_a.execute("SELECT attempts FROM jobs WHERE organisation_id=%s AND id=%s", (self.organisation_id, one["id"])).fetchone()[0]
+                self.assertEqual(attempts, 0)
+                connection_a.commit()
             self.assertIsNone(claim_job(connection_b, "worker-b", supported_stages=("ANALYSE",)))
             connection_b.commit()
             self.assertIsNone(claim_job(connection_b, "worker-b", supported_stages=()))
@@ -164,6 +167,22 @@ class StorageCleanupTests(unittest.TestCase):
             self.assertEqual(storage.delete_orphans({"retained.audio"}), 1)
             self.assertFalse(orphan.exists())
             self.assertTrue(retained.exists())
+
+
+@unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
+class MigrationUpgradeTests(unittest.TestCase):
+    def test_existing_v1_jobs_constraint_accepts_waiting_handler_after_v2(self):
+        if not os.environ.get("DATABASE_URL"):
+            self.fail("RUN_POSTGRES_INTEGRATION=1 requires an isolated DATABASE_URL ending in _test")
+        parsed = urlparse(os.environ["DATABASE_URL"])
+        if not (parsed.path or "").lstrip("/").endswith("_test"):
+            self.fail("Refusing integration test unless DATABASE_URL database name ends in _test")
+        migration = Path(__file__).resolve().parent.parent / "migrations" / "002_waiting_handler.sql"
+        with connect() as connection:
+            connection.execute("CREATE TEMP TABLE jobs (state text NOT NULL CONSTRAINT jobs_state_check CHECK (state IN ('QUEUED','RUNNING','DONE','RETRY_WAIT','FAILED'))) ON COMMIT PRESERVE ROWS")
+            connection.execute(migration.read_text(encoding="utf-8"))
+            connection.execute("INSERT INTO jobs(state) VALUES ('WAITING_HANDLER')")
+            self.assertEqual(connection.execute("SELECT state FROM jobs").fetchone()[0], "WAITING_HANDLER")
 
 
 if __name__ == "__main__":
