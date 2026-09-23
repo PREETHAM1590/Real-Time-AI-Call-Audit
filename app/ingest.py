@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from app.db import connect
 from app.auth import Scope
+from app.contracts import PersistedUtterance
 from app.storage import LocalPrivateStorage
 
 MAX_AUDIO_BYTES = 250 * 1024 * 1024
@@ -135,13 +136,41 @@ def claim_job(connection, worker_id: str, lease_seconds: int = 60, supported_sta
 
 def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
     with connection.transaction():
-        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
+        locked = connection.execute("SELECT c.organisation_id,c.id,c.tombstoned_at,c.transcript_revision FROM calls c JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id WHERE j.id=%s FOR UPDATE OF c", (job_id,)).fetchone()
         if locked is None or locked[2] is not None:
             return False
         changed = connection.execute("UPDATE jobs SET state='DONE',lease_token=NULL,lease_until=NULL WHERE organisation_id=%s AND id=%s AND lease_token=%s AND state='RUNNING' AND lease_until>now()", (locked[0], job_id, lease_token)).rowcount
         if changed == 1:
             state = result.get("processing_state", "NEEDS_REVIEW")
-            connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
+            if "utterances" in result:
+                utterances = result["utterances"]
+                model_version = result.get("model_version")
+                if not isinstance(utterances, list) or not isinstance(model_version, str) or not model_version.strip():
+                    raise ValueError("invalid redacted transcript result")
+                revision = locked[3] + 1
+                for source in utterances:
+                    item = PersistedUtterance.model_validate({
+                        **source,
+                        "organisation_id": str(locked[0]),
+                        "call_id": str(locked[1]),
+                        "revision": revision,
+                        "model_version": model_version,
+                    })
+                    if item.is_final is not True:
+                        raise ValueError("only final transcript utterances can be persisted")
+                    connection.execute(
+                        "INSERT INTO transcript_utterances(organisation_id,call_id,revision,id,segment_id,speaker_id,role,start_ms,end_ms,text_redacted,confidence,model_version,is_final) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,true)",
+                        (locked[0], locked[1], revision, item.id, item.segment_id, item.speaker_id, item.role, item.start_ms, item.end_ms, item.text_redacted, item.confidence, item.model_version),
+                    )
+                if state == "ANALYSING" and utterances:
+                    connection.execute(
+                        "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'ANALYSE',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
+                        (locked[0], uuid4(), locked[1], revision),
+                    )
+                connection.execute("UPDATE calls SET processing_state=%s,transcript_revision=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, revision, locked[0], locked[1]))
+            else:
+                connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
     return changed == 1
 
 

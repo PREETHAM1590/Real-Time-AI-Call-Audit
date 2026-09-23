@@ -31,6 +31,19 @@ class LocalPrivateStorage:
             raise ValueError("invalid storage key")
         (self.root / key).unlink(missing_ok=True)
 
+    def get(self, key: str, *, max_bytes: int) -> bytes:
+        """Read one bounded object without accepting path components from callers."""
+        if Path(key).name != key or not key.endswith(".audio") or max_bytes <= 0:
+            raise ValueError("invalid storage key or byte limit")
+        target = self.root / key
+        if target.is_symlink():
+            raise ValueError("audio object must not be a symlink")
+        with target.open("rb") as source:
+            data = source.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("audio object exceeds configured byte limit")
+        return data
+
     def delete_orphans(self, referenced: set[str], *, older_than: timedelta = timedelta(days=1)) -> int:
         cutoff = datetime.now(timezone.utc).timestamp() - older_than.total_seconds()
         removed = 0

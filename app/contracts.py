@@ -36,4 +36,5 @@ class PersistedUtterance(Utterance):
     segment_id: Identifier
     speaker_id: Identifier
     model_version: Identifier
-    confidence: FiniteFloat = Field(ge=0, le=1)
+    # Local ASR confidence is frequently absent or uncalibrated; NULL is honest.
+    confidence: FiniteFloat | None = Field(default=None, ge=0, le=1)

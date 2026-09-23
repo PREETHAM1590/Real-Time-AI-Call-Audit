@@ -9,7 +9,7 @@ from app.db import connect
 from app.ingest import claim_job, defer_job, finish_job, renew_job, retry_job
 from app.storage import LocalPrivateStorage
 
-Processor = Callable[[dict], str]
+Processor = Callable[[dict], str | dict]
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
 
@@ -42,12 +42,12 @@ def run_once(worker_id: str, processors: Mapping[str, Processor] | None = None) 
         thread = threading.Thread(target=heartbeat, name=f"lease-{job_id}", daemon=True)
         thread.start()
         try:
-            state = processor(job)
+            output = processor(job)
+            result = output if isinstance(output, dict) else {"processing_state": output}
+            if not lease_lost.is_set():
+                finish_job(connection, job_id, token, result)
         except Exception:
             retry_job(connection, job_id, token)
-        else:
-            if not lease_lost.is_set():
-                finish_job(connection, job_id, token, {"processing_state": state})
         finally:
             stopping.set()
             thread.join(timeout=HEARTBEAT_SECONDS + 1)
@@ -67,4 +67,10 @@ def drain(worker_id: str | None = None, processors: Mapping[str, Processor] | No
 
 
 if __name__ == "__main__":
-    print(f"Drained {drain()} job(s); TRANSCRIBE awaits a configured local processor.")
+    from app.transcription import make_transcription_processor
+
+    if os.environ.get("FASTER_WHISPER_MODEL_PATH") and os.environ.get("FASTER_WHISPER_MODEL_SHA256") and os.environ.get("FASTER_WHISPER_MODEL_VERSION"):
+        processors = {"TRANSCRIBE": make_transcription_processor()}
+    else:
+        processors = {}
+    print(f"Drained {drain(processors=processors)} job(s); local model artifacts must be provisioned and pinned before transcription.")
