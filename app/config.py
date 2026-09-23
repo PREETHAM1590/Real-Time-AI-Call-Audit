@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     oidc_issuer: str = Field(min_length=1)
     oidc_audience: str = Field(min_length=1)
     oidc_public_key: str = Field(min_length=1, repr=False)
+    csrf_secret: str = Field(min_length=32, repr=False)
     allowed_origins: tuple[str, ...] = Field(min_length=1)
 
     @field_validator("allowed_origins")
@@ -42,3 +43,10 @@ class Settings(BaseSettings):
             if origin != normalized:
                 raise ValueError("allowed origins must be normalized absolute origins")
         return origins
+
+    @field_validator("csrf_secret")
+    @classmethod
+    def reject_placeholder_csrf_secret(cls, secret: str) -> str:
+        if "replace-with" in secret.lower():
+            raise ValueError("csrf_secret must be provisioned with a random secret")
+        return secret

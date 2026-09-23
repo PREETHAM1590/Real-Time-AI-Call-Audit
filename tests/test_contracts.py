@@ -1,6 +1,8 @@
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 import unittest
+from urllib.parse import urlparse
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -8,12 +10,18 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from unittest.mock import patch, MagicMock
+from uuid import uuid4
 
 from app.auth import Scope, can_access
+from app.auth import IdentityStoreError, resolve_identity_from_db
 from app.api import MULTIPART_OVERHEAD_BYTES, UploadBodyLimitMiddleware, create_app
 from app.config import Settings
 from app.contracts import PersistedUtterance, Utterance
+from app.db import connect
 from app.ingest import MAX_AUDIO_BYTES
+from app.migrate import migrate
+
+CSRF_SECRET = "test-only-csrf-secret-at-least-32-bytes-long"
 
 
 class ContractTests(unittest.TestCase):
@@ -91,6 +99,7 @@ class SettingsTests(unittest.TestCase):
             oidc_issuer="https://identity.example.test",
             oidc_audience="call-audit",
             oidc_public_key="test-key",
+            csrf_secret=CSRF_SECRET,
             allowed_origins=("https://audit.example.test",),
         )
         self.assertEqual(settings.allowed_origins, ("https://audit.example.test",))
@@ -106,8 +115,19 @@ class SettingsTests(unittest.TestCase):
                     oidc_issuer="https://identity.example.test",
                     oidc_audience="call-audit",
                     oidc_public_key="test-key",
+                    csrf_secret=CSRF_SECRET,
                     allowed_origins=(origin,),
                 )
+
+    def test_csrf_secret_must_not_be_template_placeholder(self):
+        with self.assertRaises(ValidationError):
+            Settings(
+                oidc_issuer="https://identity.example.test",
+                oidc_audience="call-audit",
+                oidc_public_key="test-key",
+                csrf_secret="replace-with-a-random-secret-at-least-32-bytes",
+                allowed_origins=("https://audit.example.test",),
+            )
 
 
 class ApiContractTests(unittest.TestCase):
@@ -126,27 +146,31 @@ class ApiContractTests(unittest.TestCase):
             oidc_issuer="https://identity.example.test",
             oidc_audience="call-audit",
             oidc_public_key=public_key,
+            csrf_secret=CSRF_SECRET,
             allowed_origins=("https://audit.example.test",),
         )
         identities = {"user-a": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))}
+        self.identity_lookup = MagicMock(side_effect=identities.get)
         self.client = TestClient(
             create_app(
                 self.settings,
-                identity_lookup=identities.get,
+                identity_lookup=self.identity_lookup,
             )
         )
 
     def tearDown(self):
         self.client.close()
 
-    def token(self, subject="user-a", key=None):
+    def token(self, subject="user-a", key=None, claims=None):
+        payload = {
+            "sub": subject,
+            "iss": self.settings.oidc_issuer,
+            "aud": self.settings.oidc_audience,
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        payload.update(claims or {})
         return jwt.encode(
-            {
-                "sub": subject,
-                "iss": self.settings.oidc_issuer,
-                "aud": self.settings.oidc_audience,
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-            },
+            payload,
             key or self.private_key,
             algorithm="RS256",
         )
@@ -170,6 +194,15 @@ class ApiContractTests(unittest.TestCase):
             401,
         )
 
+        for invalid_claims in (
+            {"exp": datetime.now(timezone.utc) - timedelta(minutes=1)},
+            {"iss": "https://wrong-issuer.example.test"},
+            {"aud": "wrong-audience"},
+        ):
+            with self.subTest(claims=invalid_claims):
+                invalid = self.token(claims=invalid_claims)
+                self.assertEqual(self.client.get("/v1/calls/call-a", headers={"Authorization": f"Bearer {invalid}"}).status_code, 401)
+
         headers = {"Authorization": f"Bearer {self.token()}"}
         connection = MagicMock()
         connection.__enter__.return_value.execute.return_value.fetchone.side_effect = [
@@ -182,8 +215,18 @@ class ApiContractTests(unittest.TestCase):
         params = connection.__enter__.return_value.execute.call_args_list
         self.assertEqual(params[0].args[1][0], "org-a")
 
+    def test_default_identity_store_failure_returns_service_unavailable(self):
+        client = TestClient(create_app(self.settings))
+        try:
+            with patch("app.auth.resolve_identity_from_db", side_effect=IdentityStoreError("unavailable")):
+                response = client.get("/v1/csrf", headers={"Authorization": f"Bearer {self.token()}"})
+            self.assertEqual(response.status_code, 503)
+        finally:
+            client.close()
+
     def test_upload_uses_server_identity_and_rejects_unmapped_assignment(self):
         headers = {"Authorization": f"Bearer {self.token()}"}
+        self.identity_lookup.reset_mock()
         with patch("app.api.accept_recording", return_value={"id": "call-a", "processing_state": "QUEUED"}) as accept:
             response = self.client.post(
                 "/v1/calls",
@@ -194,6 +237,7 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(accept.call_args.args[3], {"language": "und"})
         self.assertEqual(accept.call_args.args[0], Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"})))
+        self.identity_lookup.assert_called_once_with("user-a")
 
         app = create_app(self.settings, identity_lookup=lambda _: Scope("org-a", "qa-a", "QA_ANALYST", frozenset()))
         staff = TestClient(app)
@@ -222,11 +266,35 @@ class ApiContractTests(unittest.TestCase):
             headers={
                 "Origin": "https://audit.example.test",
                 "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "authorization,content-type,idempotency-key",
+                "Access-Control-Request-Headers": "authorization,content-type,idempotency-key,x-csrf-token,x-organisation-id",
             },
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("idempotency-key", response.headers["access-control-allow-headers"].lower())
+        self.assertIn("x-csrf-token", response.headers["access-control-allow-headers"].lower())
+        self.assertIn("x-organisation-id", response.headers["access-control-allow-headers"].lower())
+
+    def test_cookie_upload_requires_exact_origin_and_session_csrf(self):
+        self.client.cookies.set("session", self.token())
+        csrf_response = self.client.get("/v1/csrf")
+        self.assertEqual(csrf_response.status_code, 200)
+        self.assertEqual(csrf_response.headers["cache-control"], "no-store")
+        token = csrf_response.json()["csrf_token"]
+        upload = {"files": {"audio": ("call.wav", b"synthetic", "audio/wav")}, "data": {"external_ref": "cookie-call"}}
+        with patch("app.api.accept_recording") as accept:
+            missing = self.client.post("/v1/calls", headers={"Origin": "https://audit.example.test", "Idempotency-Key": "cookie-missing"}, **upload)
+            cross = self.client.post("/v1/calls", headers={"Origin": "https://evil.example.test", "X-CSRF-Token": token, "Idempotency-Key": "cookie-cross"}, **upload)
+        self.assertEqual(missing.status_code, 403)
+        self.assertEqual(cross.status_code, 403)
+        accept.assert_not_called()
+        with patch("app.api.accept_recording", return_value={"id": "call-a", "processing_state": "QUEUED"}) as accept:
+            success = self.client.post(
+                "/v1/calls",
+                headers={"Origin": "https://audit.example.test", "X-CSRF-Token": token, "Idempotency-Key": "cookie-ok"},
+                **upload,
+            )
+        self.assertEqual(success.status_code, 202)
+        accept.assert_called_once()
 
     def test_upload_runs_blocking_intake_off_the_event_loop(self):
         def accept_off_loop(*_args):
@@ -283,10 +351,80 @@ class ApiContractTests(unittest.TestCase):
             async def send(message):
                 sent.append(message)
 
-            middleware = UploadBodyLimitMiddleware(app, max_bytes=5, concurrent_requests=1)
+            async def authenticate(_request):
+                return Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+
+            middleware = UploadBodyLimitMiddleware(app, max_bytes=5, get_scope=authenticate, concurrent_requests=1)
             await middleware({"type": "http", "method": "POST", "path": "/v1/calls", "headers": [(b"content-length", b"1")]}, receive, send)
             return delivered, sent
 
         delivered, sent = asyncio.run(exercise())
         self.assertEqual(delivered, 3)
         self.assertEqual(sent[0]["status"], 413)
+
+    def test_full_upload_slots_reject_without_queueing_or_auth_work(self):
+        async def exercise():
+            auth_called = False
+            sent = []
+
+            async def app(_scope, _receive, _send):
+                self.fail("saturated upload reached multipart parser")
+
+            async def authenticate(_request):
+                nonlocal auth_called
+                auth_called = True
+                return Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+
+            async def receive():
+                self.fail("saturated upload read body")
+
+            async def send(message):
+                sent.append(message)
+
+            middleware = UploadBodyLimitMiddleware(app, max_bytes=5, get_scope=authenticate, concurrent_requests=1)
+            self.assertTrue(middleware.slots.acquire(blocking=False))
+            try:
+                await middleware({"type": "http", "method": "POST", "path": "/v1/calls", "headers": []}, receive, send)
+            finally:
+                middleware.slots.release()
+            return auth_called, sent
+
+        auth_called, sent = asyncio.run(exercise())
+        self.assertFalse(auth_called)
+        self.assertEqual(sent[0]["status"], 503)
+
+
+class IdentityLookupUnitTests(unittest.TestCase):
+    def test_identity_database_failure_raises_closed_error(self):
+        with patch("app.auth.connect", side_effect=RuntimeError("unavailable")):
+            with self.assertRaises(IdentityStoreError):
+                resolve_identity_from_db("verified-subject")
+
+
+@unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
+class IdentityLookupIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        if not os.environ.get("DATABASE_URL"):
+            self.fail("RUN_POSTGRES_INTEGRATION=1 requires DATABASE_URL for an isolated PostgreSQL database ending in _test")
+        if not (urlparse(os.environ["DATABASE_URL"]).path or "").lstrip("/").endswith("_test"):
+            self.fail("Refusing integration test unless DATABASE_URL database name ends in _test")
+        migrate()
+        self.subject = f"oidc-{uuid4()}"
+        self.org_a, self.org_b = uuid4(), uuid4()
+        with connect() as connection:
+            connection.execute("INSERT INTO organisations(id) VALUES (%s),(%s)", (self.org_a, self.org_b))
+            connection.execute("INSERT INTO identity_memberships(subject,organisation_id,user_id,role,team_id) VALUES (%s,%s,'agent-a','AGENT','team-a'),(%s,%s,'agent-b','AGENT','team-b')", (self.subject, self.org_a, self.subject, self.org_b))
+
+    def tearDown(self):
+        with connect() as connection:
+            connection.execute("DELETE FROM identity_memberships WHERE subject=%s", (self.subject,))
+            connection.execute("DELETE FROM organisations WHERE id=ANY(%s)", ([self.org_a, self.org_b],))
+
+    def test_org_selector_must_match_server_owned_subject_membership(self):
+        self.assertIsNone(resolve_identity_from_db(self.subject))
+        selected = resolve_identity_from_db(self.subject, str(self.org_a))
+        self.assertEqual(selected, Scope(str(self.org_a), "agent-a", "AGENT", frozenset({"team-a"})))
+        self.assertIsNone(resolve_identity_from_db(self.subject, str(uuid4())))
+        with connect() as connection:
+            connection.execute("INSERT INTO identity_memberships(subject,organisation_id,user_id,role,team_id) VALUES (%s,%s,'other-agent','AGENT','team-a')", (self.subject, self.org_a))
+        self.assertIsNone(resolve_identity_from_db(self.subject, str(self.org_a)))

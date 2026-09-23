@@ -1,10 +1,12 @@
-import asyncio
+import threading
+
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
+from starlette.requests import Request
 from starlette.concurrency import run_in_threadpool
 
-from app.auth import IdentityLookup, Scope, can_access, scope_dependency
+from app.auth import IdentityLookup, Scope, can_access, csrf_token_for_session, scope_dependency
 from app.config import Settings
 from app.db import connect
 from app.ingest import IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept_recording
@@ -19,26 +21,39 @@ class _RequestBodyTooLarge(Exception):
 class UploadBodyLimitMiddleware:
     """Bound upload bytes and parsing concurrency before multipart spooling begins."""
 
-    def __init__(self, app, *, max_bytes: int, concurrent_requests: int = 4):
+    def __init__(self, app, *, max_bytes: int, get_scope, concurrent_requests: int = 4):
         self.app = app
         self.max_bytes = max_bytes
-        self.slots = asyncio.Semaphore(concurrent_requests)
+        self.get_scope = get_scope
+        self.slots = threading.BoundedSemaphore(concurrent_requests)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/v1/calls":
             await self.app(scope, receive, send)
             return
 
-        async with self.slots:
-            headers = dict(scope.get("headers", ()))
+        headers = dict(scope.get("headers", ()))
+        try:
+            content_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            content_length = 0
+        if content_length > self.max_bytes:
+            await JSONResponse({"detail": "Audio is too large"}, status_code=413)(scope, receive, send)
+            return
+        if not self.slots.acquire(blocking=False):
+            response = JSONResponse({"detail": "Upload capacity is busy"}, status_code=503, headers={"Retry-After": "1"})
+            await response(scope, receive, send)
+            return
+        try:
             try:
-                content_length = int(headers.get(b"content-length", b"0"))
-            except ValueError:
-                content_length = 0
-            if content_length > self.max_bytes:
-                await JSONResponse({"detail": "Audio is too large"}, status_code=413)(scope, receive, send)
+                auth_scope = await self.get_scope(Request(scope, receive))
+            except HTTPException as error:
+                await JSONResponse({"detail": error.detail}, status_code=error.status_code)(scope, receive, send)
                 return
-
+            if auth_scope.role != "AGENT" or len(auth_scope.team_ids) != 1:
+                await JSONResponse({"detail": "Upload requires an agent identity with one server-resolved team"}, status_code=403)(scope, receive, send)
+                return
+            scope.setdefault("state", {})["auth_scope"] = auth_scope
             received = 0
 
             async def limited_receive():
@@ -54,6 +69,8 @@ class UploadBodyLimitMiddleware:
                 await self.app(scope, limited_receive, send)
             except _RequestBodyTooLarge:
                 await JSONResponse({"detail": "Audio is too large"}, status_code=413)(scope, receive, send)
+        finally:
+            self.slots.release()
 
 
 def create_app(
@@ -63,12 +80,19 @@ def create_app(
 ) -> FastAPI:
     """Create the API with OIDC validation and server-owned scope lookups."""
     app = FastAPI()
-    resolve_identity = identity_lookup or (lambda _subject: None)
-    get_scope = scope_dependency(settings, resolve_identity)
+    get_scope = scope_dependency(settings, identity_lookup)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/v1/csrf")
+    async def get_csrf_token(request: Request, response: Response, _scope: Scope = Depends(get_scope)) -> dict[str, str]:
+        session_token = request.cookies.get("session")
+        if not session_token or request.headers.get("Authorization"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cookie session required")
+        response.headers["Cache-Control"] = "no-store"
+        return {"csrf_token": csrf_token_for_session(session_token, settings.csrf_secret)}
 
     @app.get("/v1/calls/{call_id}")
     async def get_call(call_id: str, scope: Scope = Depends(get_scope)) -> dict[str, str]:
@@ -101,11 +125,11 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid audio") from error
         return result
 
-    limited_app = UploadBodyLimitMiddleware(app, max_bytes=MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES)
+    limited_app = UploadBodyLimitMiddleware(app, max_bytes=MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES, get_scope=get_scope)
     return CORSMiddleware(
         limited_app,
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-CSRF-Token", "X-Organisation-ID"],
     )
