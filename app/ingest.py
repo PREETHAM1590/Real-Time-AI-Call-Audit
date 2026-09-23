@@ -90,6 +90,8 @@ def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
 def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: dict, idempotency_key: str, *, storage: LocalPrivateStorage | None = None) -> dict:
     if scope.role != "AGENT" or not scope.organisation_id.strip() or not scope.user_id.strip() or len(scope.team_ids) != 1 or not next(iter(scope.team_ids)).strip():
         raise IntakeError("Recording intake requires an agent identity and one server-resolved team")
+    agent_id = scope.user_id
+    team_id = next(iter(scope.team_ids))
     if not idempotency_key or len(idempotency_key) > 200 or not external_ref or len(external_ref) > 300:
         raise IntakeError("Invalid idempotency key or external reference")
     language = metadata.get("language", "und")
@@ -104,11 +106,11 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
     try:
         with connect() as connection:
             with connection.transaction():
-                inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, scope.user_id if scope.role == "AGENT" else "", next(iter(scope.team_ids)) if scope.role == "AGENT" and len(scope.team_ids) == 1 else "", language)).fetchone()
+                inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, agent_id, team_id, language)).fetchone()
                 if inserted is None:
-                    existing = connection.execute("SELECT id,payload_sha256,processing_state,external_ref,language FROM calls WHERE organisation_id=%s AND idempotency_key=%s", (scope.organisation_id, idempotency_key)).fetchone()
+                    existing = connection.execute("SELECT id,payload_sha256,processing_state,external_ref,language,agent_id,team_id FROM calls WHERE organisation_id=%s AND idempotency_key=%s", (scope.organisation_id, idempotency_key)).fetchone()
                     if existing is not None:
-                        if existing[3] != external_ref or existing[4] != language or existing[1] != checksum:
+                        if existing[3] != external_ref or existing[4] != language or existing[1] != checksum or existing[5] != agent_id or existing[6] != team_id:
                             raise IdempotencyConflict("Idempotency key reused with different upload details")
                         result = {"id": str(existing[0]), "processing_state": existing[2]}
                     else:

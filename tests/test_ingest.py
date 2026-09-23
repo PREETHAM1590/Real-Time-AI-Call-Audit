@@ -124,6 +124,10 @@ class PostgresIngestTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             raced = list(pool.map(lambda _: accept_recording(self.scope, "ext-1", data, {}, "idem-1", storage=self.storage), range(2)))
         self.assertEqual(raced, [first, first])
+        different_assignment = Scope(str(self.organisation_id), "agent-other", "AGENT", frozenset({"team-other"}))
+        with self.assertRaises(IdempotencyConflict) as assignment_conflict:
+            accept_recording(different_assignment, "ext-1", data, {}, "idem-1", storage=self.storage)
+        self.assertNotIn(first["id"], str(assignment_conflict.exception))
         with self.assertRaises(IdempotencyConflict):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
         with self.assertRaises(IdempotencyConflict):
