@@ -17,6 +17,16 @@ function timestamp(ms) {
   return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
 }
 
+function age(createdAt) {
+  const created = Date.parse(createdAt);
+  if (!Number.isFinite(created)) return "Age unavailable";
+  const minutes = Math.max(0, Math.floor((Date.now() - created) / 60000));
+  if (minutes < 60) return `${minutes}m old`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h old`;
+  return `${Math.floor(hours / 24)}d old`;
+}
+
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
@@ -44,12 +54,22 @@ async function request(path, options = {}) {
 function renderQueue() {
   const list = byId("queue-list");
   list.replaceChildren();
+  byId("queue-order").textContent = "Server order: NEEDS_REVIEW, then FAIL, then other decisions; newest calls first within each group.";
   for (const item of state.queue) {
     const row = element("li");
     const label = `Call ${item.call_id}, ${item.machine_decision}, machine score ${item.machine_score ?? "unavailable"}`;
     const button = element("button", label);
     button.type = "button";
     button.setAttribute("aria-current", String(item.call_id === state.callId));
+    const context = element("span", undefined, "queue-context");
+    context.append(
+      element("span", `Decision: ${item.machine_decision}`),
+      element("span", `Processing: ${item.processing_state}`),
+      element("span", `Age: ${age(item.created_at)}`),
+      element("span", `Agent: ${item.agent_id}`),
+      element("span", `Team: ${item.team_id}`),
+    );
+    button.append(context);
     button.addEventListener("click", () => loadCall(item.call_id));
     row.append(button);
     list.append(row);
@@ -73,11 +93,24 @@ async function loadQueue() {
 function addEvidenceButton(container, evidence, byUtterance) {
   const utterance = byUtterance.get(evidence.utterance_id);
   if (!utterance) return;
-  const button = element("button", `Open ${utterance.role} evidence at ${timestamp(utterance.start_ms)}`, "evidence-link");
+  const quote = typeof evidence.quote === "string" ? evidence.quote : utterance.text_redacted;
+  const button = element("button", `“${quote}” · Open ${utterance.role} evidence at ${timestamp(utterance.start_ms)}`, "evidence-link");
+  button.setAttribute("aria-label", `Open ${utterance.role} evidence “${quote}” at ${timestamp(utterance.start_ms)}`);
   button.type = "button";
   button.addEventListener("click", () => {
     const selected = byUtterance.get(evidence.utterance_id);
     const target = selected.node;
+    for (const prior of document.querySelectorAll(".transcript-row mark")) {
+      prior.replaceWith(document.createTextNode(prior.textContent));
+    }
+    const paragraph = target.querySelector("p");
+    const text = selected.text_redacted;
+    const start = text.indexOf(quote);
+    paragraph.replaceChildren();
+    if (start >= 0 && quote) {
+      paragraph.append(document.createTextNode(text.slice(0, start)));
+      paragraph.append(element("mark", quote, "selected-evidence"), document.createTextNode(text.slice(start + quote.length)));
+    } else paragraph.textContent = text;
     target.focus();
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     if (state.audioGranted) {
@@ -115,20 +148,44 @@ function renderCall(data) {
     card.append(element("strong", title), element("span", value));
     summary.append(card);
   }
-  host.append(summary);
+  const workspace = element("div", undefined, "review-workspace");
+  const evidenceColumn = element("div", undefined, "evidence-column");
+  const reviewRail = element("aside", undefined, "review-rail");
+  reviewRail.setAttribute("aria-label", "Audit findings and review actions");
+  workspace.append(evidenceColumn, reviewRail);
+  host.append(summary, workspace);
+  const alreadyTriaged = data.reviews?.some((review) => review.action === "TRIAGE" && review.effective_decision === "NEEDS_REVIEW");
+  if (audit && !audit.superseded && alreadyTriaged) {
+    reviewRail.append(element("p", "This call has been triaged and remains in the review queue. Its evidence is still insufficient for a score.", "status"));
+  } else if (audit && !audit.superseded) renderReviewForm(reviewRail, audit, data);
+  else if (audit?.superseded) byId("call-status").textContent = "This audit uses superseded transcript evidence. Scoring actions are disabled; reload the current review queue.";
 
   const transcriptBlock = element("section", undefined, "block");
   transcriptBlock.append(element("h3", "Final redacted transcript"));
+  const transcriptColumns = element("div", undefined, "transcript-columns");
+  for (const label of ["Time", "Speaker", "Transcript"]) transcriptColumns.append(element("span", label));
+  transcriptColumns.setAttribute("aria-hidden", "true");
+  transcriptBlock.append(transcriptColumns);
+  const transcriptList = element("div", undefined, "transcript-list");
   const utteranceIndex = new Map();
-  for (const row of data.transcript) {
+  for (const row of data.transcript || []) {
     const node = element("article", undefined, "transcript-row");
+    const linkedFindings = (data.findings || []).filter((finding) => (finding.evidence_ids || []).includes(row.id));
     node.tabIndex = -1;
-    node.append(element("span", `${row.role} · ${timestamp(row.start_ms)}–${timestamp(row.end_ms)}`, "role"));
+    node.setAttribute("aria-label", `${row.role}, ${timestamp(row.start_ms)} to ${timestamp(row.end_ms)}`);
+    node.append(element("span", `${timestamp(row.start_ms)}–${timestamp(row.end_ms)}`, "transcript-time"));
+    node.append(element("span", row.role, `speaker speaker-${String(row.role).toLowerCase()}`));
     node.append(element("p", row.text_redacted));
+    if (linkedFindings.length) {
+      node.classList.add("has-policy-evidence");
+      node.append(element("span", `${linkedFindings.length} policy finding${linkedFindings.length === 1 ? "" : "s"} linked`, "policy-evidence-marker"));
+    }
     utteranceIndex.set(row.id, { ...row, node });
-    transcriptBlock.append(node);
+    transcriptList.append(node);
   }
-  host.append(transcriptBlock);
+  if (!data.transcript?.length) transcriptList.append(element("p", "No final transcript is available for this call.", "empty-state"));
+  transcriptBlock.append(transcriptList);
+  evidenceColumn.append(transcriptBlock);
 
   if (audit) {
     const dimensionBlock = element("section", undefined, "block");
@@ -145,16 +202,28 @@ function renderCall(data) {
       dimensionsHost.append(card);
     }
     dimensionBlock.append(dimensionsHost);
-    host.append(dimensionBlock);
+    reviewRail.append(dimensionBlock);
   }
 
   if (data.findings?.length) {
     const findingsBlock = element("section", undefined, "block");
     findingsBlock.append(element("h3", "Policy findings"));
     const rows = element("div", undefined, "finding-list");
-    for (const finding of data.findings) rows.append(element("article", `${finding.rule_id} · ${finding.status} · ${finding.severity}: ${finding.remediation}`, "finding"));
+    for (const finding of data.findings) {
+      const card = element("article", undefined, "finding");
+      card.append(element("strong", `${finding.rule_id} · ${finding.status} · ${finding.severity}`), element("p", finding.remediation));
+      const links = element("div", undefined, "evidence-links");
+      for (const utteranceId of finding.evidence_ids || []) addEvidenceButton(links, { utterance_id: utteranceId }, utteranceIndex);
+      if (!links.childElementCount) links.append(element("span", "No transcript evidence attached."));
+      card.append(links);
+      rows.append(card);
+    }
     findingsBlock.append(rows);
-    host.append(findingsBlock);
+    reviewRail.append(findingsBlock);
+  } else {
+    const findingsBlock = element("section", undefined, "block");
+    findingsBlock.append(element("h3", "Policy findings"), element("p", "No policy findings are available for this call.", "empty-state"));
+    reviewRail.append(findingsBlock);
   }
   if (data.reviews?.length) {
     const reviewBlock = element("section", undefined, "block");
@@ -162,7 +231,7 @@ function renderCall(data) {
     const rows = element("div", undefined, "review-list");
     for (const review of data.reviews) rows.append(element("article", `Review ${review.version} · ${review.action} · ${review.effective_decision} · ${review.reason}`, "review-entry"));
     reviewBlock.append(rows);
-    host.append(reviewBlock);
+    reviewRail.append(reviewBlock);
   }
   const playback = element("section", undefined, "block");
   playback.append(element("h3", "Call audio"));
@@ -193,13 +262,7 @@ function renderCall(data) {
     }
   });
   playback.append(accessButton, element("p", "Playback access is recorded before a 60-second, user-bound audio URL is issued. Renew access before expiry to continue listening.", "status"));
-  host.append(playback);
-  const alreadyTriaged = data.reviews?.some((review) => review.action === "TRIAGE" && review.effective_decision === "NEEDS_REVIEW");
-  if (audit && !audit.superseded && alreadyTriaged) {
-    const triageStatus = element("p", "This call has been triaged and remains in the review queue. Its evidence is still insufficient for a score.", "status");
-    host.append(triageStatus);
-  } else if (audit && !audit.superseded) renderReviewForm(host, audit, data);
-  else if (audit?.superseded) byId("call-status").textContent = "This audit uses superseded transcript evidence. Scoring actions are disabled; reload the current review queue.";
+  reviewRail.append(playback);
 }
 
 function renderReviewForm(host, audit, data) {

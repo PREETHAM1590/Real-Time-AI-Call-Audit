@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Provider coverage · Call Audit</title>
+    <link rel="stylesheet" href="/analyst-assets/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/analyst">Call Audit</a>
+      <nav aria-label="Primary navigation" class="primary-nav">
+        <a href="/analyst">Review</a>
+        <a href="/quality">Quality</a>
+        <a href="/providers" aria-current="page">Provider coverage</a>
+      </nav>
+      <span class="connection-state"><span aria-hidden="true" class="state-dot"></span>Provider status: Not connected</span>
+    </header>
+    <main class="report-layout providers-page">
+      <div class="page-intro"><h1>Provider coverage</h1><span>Research signals only · No provider adapter is connected</span></div>
+      <p class="coverage-note">This is a starting research set, not an exhaustive list of providers or a claim of project support. Vendor documentation and account entitlements need review before each adapter is qualified.</p>
+      <div class="table-scroll" role="region" aria-label="Provider capabilities" tabindex="0">
+        <table class="provider-table">
+          <caption>Public documentation signals and project qualification status</caption>
+          <thead>
+            <tr><th scope="col">Provider / product</th><th scope="col">Live audio</th><th scope="col">Post-call recording</th><th scope="col">Call events</th><th scope="col">Official references</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">Exotel<br><span class="product-name">AgentStream / Programmable Voice</span></th>
+              <td><span class="capability documented">Documented</span><small>Listen-only docs describe customer-leg audio; agent-leg coverage and role attribution for this audit remain unverified.</small></td>
+              <td><span class="capability pending">Unverified</span><small>No post-call recording path qualified here.</small></td>
+              <td><span class="capability documented">Documented</span><small>Official documentation describes gRPC call-leg events; project adapter and agent attribution remain unverified.</small></td>
+              <td><a href="https://docs.exotel.com/exotel-agentstream">AgentStream</a><br><a href="https://docs.exotel.com/exotel-agentstream/programmable-voice-apis-with-agentstream">Programmable Voice APIs</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Airtel IQ<br><span class="product-name">Voice API</span></th>
+              <td><span class="capability documented">Documented</span><small>Media streaming is stated; protocol, direction, plan and adapter unverified.</small></td>
+              <td><span class="capability documented">Documented</span><small>Buying guide lists call recording; retrieval path unverified.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Project event intake unverified.</small></td>
+              <td><a href="https://www.airtel.in/business/b2b/airtel-iq/api-docs/voice/callflow-component-apis">Voice Callflow API</a><br><a href="https://assets.airtel.in/static-assets/cms/b2b/widgets/docs/Airtel-IQ-Buying-Guide-with-metadata.pdf">Buying guide</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Knowlarity<br><span class="product-name">SuperReceptionist</span></th>
+              <td><span class="capability pending">Unverified</span><small>No live audio feed verified in this research.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Post-call hooks documented; recording retrieval unverified.</small></td>
+              <td><span class="capability documented">Documented</span><small>REST APIs and post-call hooks; adapter unverified.</small></td>
+              <td><a href="https://knowlaritycommunications.zohodesk.com/portal/en/kb/faq/superreceptionist/crm-integrations/integration-apis">Developer FAQ</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Ozonetel<br><span class="product-name">CloudAgent</span></th>
+              <td><span class="capability pending">Unverified</span><small>Call-record control does not establish a live media feed.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Recording retrieval not established by the cited control API.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Project event intake unverified.</small></td>
+              <td><a href="https://docs.ozonetel.com/reference/get_caservices-call-record-php">Call-record control</a></td>
+            </tr>
+            <tr>
+              <th scope="row">MyOperator<br><span class="product-name">Cloud telephony</span></th>
+              <td><span class="capability pending">Unverified</span><small>Live media feed unverified.</small></td>
+              <td><span class="capability documented">Documented</span><small>Recording-link retrieval; access scope and lifetime unverified.</small></td>
+              <td><span class="capability documented">Documented</span><small>Call events described; adapter unverified.</small></td>
+              <td><a href="https://signup.myoperator.com/api/">API index</a><br><a href="https://support.myoperator.com/portal/en/kb/articles/myoperator-api-reference-postman-documentation-links">API reference</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Servetel<br><span class="product-name">Tata Tele Business Services</span></th>
+              <td><span class="capability pending">Unverified</span><small>No live media feed verified in this research.</small></td>
+              <td><span class="capability documented">Documented</span><small>Call detail records expose recording URLs; adapter unverified.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Active-call metadata is documented; event delivery is unverified.</small></td>
+              <td><a href="https://docs.servetel.in/reference/call-detail-records-2">Call detail records</a><br><a href="https://docs.servetel.in/reference/fetch-details-of-active-calls">Active-call details</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Other / custom integration</th>
+              <td><span class="capability pending">Unverified</span><small>Provide product/version and media contract for assessment.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Recording path and access terms require review.</small></td>
+              <td><span class="capability pending">Unverified</span><small>Event contract and tenant mapping require review.</small></td>
+              <td>Owner-supplied documentation and test account required.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="qualification-note"><strong>Qualification required:</strong> provider authentication, media format, tenant and agent mapping, account entitlements, and end-to-end behavior must be verified before enabling intake. Audio processing remains self-hosted.</p>
+    </main>
+  </body>
+</html>

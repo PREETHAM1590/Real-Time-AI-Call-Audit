@@ -6,6 +6,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 import unittest
+import re
 from urllib.parse import urlsplit
 from contextlib import contextmanager
 
@@ -17,6 +18,8 @@ except ImportError:
 
 class QuietHandler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
+        page_routes = {"/analyst": "/index.html", "/quality": "/quality.html", "/providers": "/providers.html"}
+        path = page_routes.get(path.split("?", 1)[0], path)
         if path.startswith("/analyst-assets/"):
             path = path[len("/analyst-assets"):]
         return super().translate_path(path)
@@ -98,3 +101,24 @@ class QualityReportBrowserTests(unittest.TestCase):
             self.assertIn("3.5", text)
             self.assertIn("team-b", text)
             self.assertIn("Fewer than five agents", text)
+
+    def test_provider_route_navigation_and_capability_matrix_are_explicit(self):
+        def handle(route):
+            route.fulfill(status=404, content_type="application/json", body="{}")
+
+        with self.run_report_page(handle) as page:
+            page.goto(page.url.replace("/quality.html", "/providers"))
+            page.get_by_role("heading", name="Provider coverage").wait_for()
+            self.assertIn("Not connected", page.locator(".connection-state").inner_text())
+            table = page.get_by_role("table", name="Public documentation signals and project qualification status")
+            for header in ["Live audio", "Post-call recording", "Call events"]:
+                self.assertTrue(table.get_by_role("columnheader", name=header).count())
+            self.assertTrue(table.get_by_role("rowheader", name="Exotel AgentStream / Programmable Voice").count())
+            exotel_events = table.get_by_role("row", name=re.compile("Exotel")).locator("td").nth(2)
+            self.assertEqual(exotel_events.locator(".capability").inner_text(), "Documented")
+            self.assertIn("gRPC call-leg events", exotel_events.inner_text())
+            self.assertIn("project adapter and agent attribution remain unverified", exotel_events.inner_text())
+            self.assertTrue(table.get_by_text("Other / custom integration").count())
+            self.assertTrue(table.get_by_text("agent-leg coverage and role attribution for this audit remain unverified.").count())
+            page.get_by_role("link", name="Quality", exact=True).click()
+            page.get_by_role("heading", name="Quality reports").wait_for()
