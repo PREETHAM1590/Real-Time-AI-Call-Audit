@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from typing import Any, Literal, TypedDict
 
 MIN_WINDOW_SAMPLES = 3
@@ -45,8 +46,8 @@ def _validated_offset(value: Any, name: str) -> int:
     return value
 
 
-def _at_least(value: float, threshold: float) -> bool:
-    return value >= threshold or math.isclose(value, threshold, rel_tol=0, abs_tol=1e-12)
+def _decimal_mean(values: Sequence[float]) -> Decimal:
+    return sum((Decimal(str(value)) for value in values), Decimal(0)) / len(values)
 
 
 def _validated_window(scores: Any, name: str) -> list[float]:
@@ -77,9 +78,7 @@ def sentiment_drop(previous: list[float], current: list[float]) -> bool:
     recent = _validated_window(current, "current")
     if len(prior) < MIN_WINDOW_SAMPLES or len(recent) < MIN_WINDOW_SAMPLES:
         return False
-    prior_mean = math.fsum(prior) / len(prior)
-    recent_mean = math.fsum(recent) / len(recent)
-    return _at_least(prior_mean - recent_mean, SENTIMENT_DROP_THRESHOLD)
+    return _decimal_mean(prior) - _decimal_mean(recent) >= Decimal(str(SENTIMENT_DROP_THRESHOLD))
 
 
 def sentiment_alert_times(signals: Sequence[SentimentSignal]) -> list[int]:
@@ -103,7 +102,7 @@ def sentiment_alert_times(signals: Sequence[SentimentSignal]) -> list[int]:
         if signal_id in seen_ids:
             raise ValueError("duplicate sentiment signal ID")
         seen_ids.add(signal_id)
-        if role not in {"AGENT", "CUSTOMER", "UNKNOWN", "IVR"} or type(is_final) is not bool:
+        if not isinstance(role, str) or role not in {"AGENT", "CUSTOMER", "UNKNOWN", "IVR"} or type(is_final) is not bool:
             raise ValueError("sentiment signal has an invalid role or finality")
         if not is_final or role != "CUSTOMER":
             continue
@@ -126,8 +125,7 @@ def sentiment_alert_times(signals: Sequence[SentimentSignal]) -> list[int]:
         ):
             continue
         probabilities = [probability for _, probability in previous + current]
-        confidence_margin = math.fsum(probability - MIN_TOP_CLASS_PROBABILITY for probability in probabilities)
-        if confidence_margin < 0 and not math.isclose(confidence_margin, 0, rel_tol=0, abs_tol=1e-12):
+        if _decimal_mean(probabilities) < Decimal(str(MIN_TOP_CLASS_PROBABILITY)):
             continue
         alert_ms = (current_index + 1) * WINDOW_MS
         if last_alert_ms is None or alert_ms - last_alert_ms >= ALERT_COOLDOWN_MS:

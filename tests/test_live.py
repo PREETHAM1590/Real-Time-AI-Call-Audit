@@ -73,6 +73,18 @@ class SentimentAlertTests(unittest.TestCase):
         signals.extend(self.signal(30_000 + i * 100, 0.1, probability=0.7) for i in range(3))
         self.assertEqual(sentiment_alert_times(signals), [60_000])
 
+        signals = [self.signal(i * 100, 0.6, probability=0.7) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.2, probability=0.7) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [60_000])
+
+        signals = [self.signal(i * 100, 0.6, probability=0.7) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.2000000000005, probability=0.7) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [])
+
+        signals = [self.signal(i * 100, 0.8, probability=0.6999999999999) for i in range(3)]
+        signals.extend(self.signal(30_000 + i * 100, 0.0, probability=0.6999999999999) for i in range(3))
+        self.assertEqual(sentiment_alert_times(signals), [])
+
     def test_enforces_ninety_second_cooldown(self):
         scores = [0.8, 0.0, 0.8, 0.8, 0.0]
         signals = [self.signal(i * 30_000 + j, scores[i])
@@ -112,6 +124,11 @@ class SentimentAlertTests(unittest.TestCase):
     def test_rejects_non_mapping_signals(self):
         with self.assertRaises(ValueError):
             sentiment_alert_times([None])
+
+    def test_rejects_non_string_roles(self):
+        for role in ([], {}):
+            with self.subTest(role=role), self.assertRaises(ValueError):
+                sentiment_alert_times([self.signal(0, 0.5, role=role)])
 
 
 if __name__ == "__main__":
