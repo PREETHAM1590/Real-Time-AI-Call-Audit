@@ -1,10 +1,11 @@
 from collections.abc import Mapping
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import IdentityLookup, Scope, can_access, scope_dependency
 from app.config import Settings
+from app.ingest import IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept_recording
 
 CallScope = tuple[str, str, str]
 
@@ -21,7 +22,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "Content-Type"],
     )
     resolve_identity = identity_lookup or (lambda _subject: None)
@@ -38,5 +39,28 @@ def create_app(
         if record is None or not can_access(scope, *record):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         return {"id": call_id}
+
+    @app.post("/v1/calls", status_code=status.HTTP_202_ACCEPTED)
+    async def upload_call(
+        audio: UploadFile = File(...),
+        external_ref: str = Form(...),
+        agent_id: str = Form(...),
+        team_id: str = Form(...),
+        language: str = Form("und"),
+        idempotency_key: str = Header(alias="Idempotency-Key"),
+        scope: Scope = Depends(get_scope),
+    ) -> dict[str, str]:
+        payload = bytearray()
+        while block := await audio.read(1024 * 1024):
+            if len(payload) + len(block) > MAX_AUDIO_BYTES:
+                raise HTTPException(status_code=413, detail="Audio is too large")
+            payload.extend(block)
+        try:
+            result = accept_recording(scope, external_ref, bytes(payload), {"agent_id": agent_id, "team_id": team_id, "language": language}, idempotency_key)
+        except IdempotencyConflict as error:
+            raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing audio") from error
+        except IntakeError as error:
+            raise HTTPException(status_code=400, detail="Invalid audio") from error
+        return result
 
     return app
