@@ -1,0 +1,4 @@
+{"case_id":"case-zero-positive","excluded":false,"abstained":false,"gold_findings":[],"predicted_findings":[],"gold_dimensions":{"clarity":3},"predicted_dimensions":{"clarity":3}}
+{"case_id":"case-critical-missed","excluded":false,"abstained":false,"gold_findings":[{"rule_id":"critical_disclosure","critical":true}],"predicted_findings":[],"gold_dimensions":{"clarity":4},"predicted_dimensions":{"clarity":2}}
+{"case_id":"case-abstained","excluded":false,"abstained":true,"gold_findings":[],"predicted_findings":[],"gold_dimensions":{"clarity":5},"predicted_dimensions":{}}
+{"case_id":"case-excluded","excluded":true,"abstained":false,"gold_findings":[{"rule_id":"excluded_finding","critical":false}],"predicted_findings":[],"gold_dimensions":{},"predicted_dimensions":{}}

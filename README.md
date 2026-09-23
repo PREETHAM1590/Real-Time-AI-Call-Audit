@@ -2,7 +2,7 @@
 
 Self-hosted call auditing and configurable disposition platform: transcribe calls, check configured policies, identify interaction outcomes, propose evidence-backed quality scores, and support human review and live supervision.
 
-**Status:** post-call implementation in progress. Identity-scoped APIs, durable recording intake, final redacted transcription, configurable disposition, versioned policy findings, immutable seven-dimension audits, append-only human reviews, a small analyst review page and scoped quality reports have runnable checks. Timed policy findings remain UNKNOWN without trusted telephony context. Live monitoring, production model approval, quality/capacity qualification and deployment remain incomplete. Nothing is deployed.
+**Status:** post-call implementation in progress. Identity-scoped APIs, durable recording intake, final redacted transcription, configurable disposition, versioned policy findings, immutable seven-dimension audits, append-only human reviews, a small analyst review page, scoped quality reports, tombstone-first retention helpers and a deterministic synthetic evaluator have runnable checks. Timed policy findings remain UNKNOWN without trusted telephony context. Retention purge intentionally preserves immutable audit/review history pending an approved erasure policy; expiry has no automatic default and its purge helpers are not scheduled. Live monitoring, production model approval, quality/capacity/recovery qualification and deployment remain incomplete. Nothing is deployed.
 
 ## Read in this order
 

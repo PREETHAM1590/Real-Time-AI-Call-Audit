@@ -27,6 +27,7 @@ from app.audio_access import issue_audio_capability, verify_audio_capability
 from app.storage import LocalPrivateStorage
 from app.privacy import redact_text
 from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavailable, export_findings, own_scores, team_report
+from app.retention import request_call_deletion
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -415,6 +416,22 @@ def create_app(
             return {"call_id": call_id, "status": "PENDING"}
         return {"call_id": call_id, "revision": row[0], "transcript_revision": row[1], "config_id": row[2], "config_version": row[3], "config_hash": row[4].strip(), "schema_version": row[5], "model_artifact": row[6], "adapter_version": row[7], "processing_path": row[8], "status": row[9], "code": row[10], "parent_code": row[11], "confidence": row[12], "requires_review": row[13], "review_reason": row[14], "matched_rule_id": row[15], "signals": row[16], "usage": row[17], "created_at": row[18].isoformat()}
 
+    @app.delete("/v1/calls/{call_id}", status_code=202)
+    def delete_call(call_id: str, scope: Scope = Depends(get_scope)) -> dict:
+        if scope.role != "ADMIN":
+            raise HTTPException(status_code=403, detail="Administrator role required")
+        try:
+            canonical_call_id = str(UUID(call_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=404, detail="Call not found") from None
+        with connect() as connection:
+            result = request_call_deletion(connection, scope.organisation_id, canonical_call_id, scope.user_id)
+        if result["status"] == "NOT_FOUND":
+            raise HTTPException(status_code=404, detail="Call not found")
+        if result["status"] == "HELD":
+            raise HTTPException(status_code=409, detail="Call is under legal hold")
+        return {"call_id": canonical_call_id, **result}
+
     def require_admin(scope: Scope) -> None:
         if scope.role != "ADMIN":
             raise HTTPException(status_code=403, detail="Administrator role required")
@@ -578,6 +595,6 @@ def create_app(
         limited_app,
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-CSRF-Token", "X-Organisation-ID", "X-Request-ID"],
     )

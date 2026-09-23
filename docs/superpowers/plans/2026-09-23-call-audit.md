@@ -493,9 +493,13 @@ def csv_cell(value):
 
 **Files:** Create retention/metrics/evaluation modules, `tests/test_operations.py`, container/CI files and `tests/fixtures/golden.jsonl`; update operations guide with actual commands and measured results. Golden data committed to Git is synthetic/redacted, not customer recordings.
 
-**Interfaces:** `due_for_deletion(expires_at: datetime, now: datetime, legal_hold: bool) -> bool`; `purge_call(connection, organisation_id: str, call_id: str) -> dict`; `python -m app.evaluate --dataset PATH --output PATH` writes sample counts, coverage, per-rule precision/recall and score agreement. Evaluation reports are artifacts rather than modifying expected labels.
+**Interfaces:** `due_for_deletion(expires_at: datetime, now: datetime, legal_hold: bool) -> bool`; `request_call_deletion(...)` tombstones an ADMIN-requested deletion; `tombstone_expired_calls(..., limit<=100)` applies bounded expiry tombstones; `purge_call(connection, organisation_id: str, call_id: str, storage) -> dict` removes mutable content after a tombstone and reports retained immutable-history counts; `python -m app.evaluate --dataset PATH --output PATH` writes sample counts, coverage, per-rule precision/recall and score agreement. Evaluation reports are artifacts rather than modifying expected labels.
 
-- [ ] **1. Write retention boundary check:**
+**Implemented pilot slice (2026-09-23):** migrations 013–014 add retention/hold/tombstone lifecycle fields and structured immutable access-event details. The ADMIN DELETE API only requests deletion and tombstones immediately; bounded expiry and purge operations are library functions, not a scheduled worker or an operator purge endpoint. Purge removes audio objects, transcript utterances, findings and jobs, and scrubs mutable call identity fields. It deliberately preserves immutable audits, dispositions, reviews and access events; the result identifies `PARTIAL_IMMUTABLE_HISTORY` and counts the retained records. Full erasure remains gated on an approved, verifiable immutable-history retention or crypto-erasure policy. No expiry policy is assigned automatically. Task 10 does not qualify production retention, recovery, hardware, model quality, capacity or deployment.
+
+**Verification evidence:** on 2026-09-23, `python -m compileall -q app tests`, `python -m app.evaluate --dataset tests/fixtures/golden.jsonl --output <temporary report>`, `git diff --check`, and `python -m unittest discover -s tests -v` passed; the full run was 124/124 using a newly created `call_audit_task10release_test` PostgreSQL database with `RUN_POSTGRES_INTEGRATION=1`. The report is a synthetic fixture smoke test only; its counts are not model-quality measurements. No restore, load, pinned-model, CI/container or production-deletion qualification ran.
+
+- [x] **1. Write retention boundary check:** exact-expiry, hold, non-due and timezone-awareness checks in `tests/test_operations.py`.
 
 ```python
 import unittest
@@ -510,8 +514,8 @@ class RetentionTests(unittest.TestCase):
         self.assertFalse(due_for_deletion(now + timedelta(seconds=1), now, False))
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_operations -v`; expect missing lifecycle code.
-- [ ] **3. Implement lifecycle predicate and idempotent purge:**
+- [x] **2. Run:** `python -m unittest tests.test_operations -v`; the initial test-first run failed before the modules existed; focused reruns now pass. PostgreSQL lifecycle checks require `RUN_POSTGRES_INTEGRATION=1` and a database ending `_test`.
+- [x] **3. Implement lifecycle predicate and bounded tombstone-first partial purge:**
 
 ```python
 def due_for_deletion(expires_at, now, legal_hold):
@@ -520,9 +524,9 @@ def due_for_deletion(expires_at, now, legal_hold):
     return not legal_hold and expires_at <= now
 ```
 
-Purge follows the operations guide's tombstone-first sequence. Repeated purge is safe. Integrate call tombstone checks into lease completion and local inference submission. Preserve restricted deletion records without content.
-- [ ] **4. Add observability** for every stage and attempt, safe error codes, health/readiness and spend. Use structured logs without content; expose queue age and incomplete calls. Test that a running worker cannot commit after tombstoning and that held data is not physically purged.
-- [ ] **5. Implement evaluation report** with explicit denominator rules:
+Purge follows tombstoning and is idempotent. The current implementation preserves immutable audit/disposition/review/access rows, so it is partial content purge and does not meet a full-erasure policy. Existing worker tombstone checks are covered by a race regression. The lifecycle functions are not scheduled or exposed as a purge endpoint.
+- [ ] **4. Add complete observability** for every stage and attempt, health/readiness and spend. Existing structured states and safe error codes do not yet provide a complete metrics/alerting layer.
+- [x] **5. Implement deterministic evaluation report** with explicit denominator rules:
 
 ```python
 def precision_recall(tp, fp, fn):
@@ -531,10 +535,10 @@ def precision_recall(tp, fp, fn):
     return {"precision": precision, "recall": recall}
 ```
 
-Undefined ratios remain null, never perfect scores. Score agreement uses only adjudicated applicable dimensions; report abstentions and excluded counts alongside it. Add one synthetic evaluation case with zero positives and one with a missed critical finding.
-- [ ] **6. Wire CI and packaging:** install locked dependencies, migrate an isolated PostgreSQL service, run backend checks and browser build/tests, scan committed files for secrets, build non-root containers. If the repository is not on GitHub, use its native CI instead of creating unused GitHub configuration.
-- [ ] **7. Run full verification:** `python -m unittest discover -s tests -v`, browser build and E2E; pinned-model contract suite; golden-set evaluation; 100-call/25-viewer steady load and double-load burst on selected GPU hardware. Publish achieved p50/p95/p99, audio-to-final latency, memory use and error rates, including timeouts.
-- [ ] **8. Perform restore/deletion drills** in staging, confirm role controls and redaction with QA/privacy owner, record exact licenses/artifact checksums, offline inference proof and compute cost projection, then follow staged rollout in the operations guide.
+Undefined ratios remain null, never perfect scores. Score agreement uses only adjudicated applicable dimensions; report abstentions and excluded counts alongside it. The committed JSONL fixture is synthetic and contains a zero-positive case, a missed critical finding, an abstention and an excluded case. The strict input rejects transcript/raw-text fields. The report is deterministic and includes a dataset hash.
+- [ ] **6. Wire CI and packaging:** install locked dependencies, migrate an isolated PostgreSQL service, run backend checks and browser checks, scan committed files for secrets, build non-root containers. No CI/container qualification is claimed by this slice.
+- [ ] **7. Run full operational verification:** backend suite and migration checks are runnable; browser/report suite and synthetic evaluator are available. Pinned-model contract/quality, 100-call/25-viewer load, selected-hardware percentiles, memory use and error-rate measurements remain unrun release gates.
+- [ ] **8. Perform restore/deletion drills** in staging, approve immutable-history disposition and retention, confirm role controls/redaction with QA/privacy owner, record exact licenses/artifact checksums, offline inference proof and compute cost projection, then follow staged rollout. These are not evidenced by local synthetic tests.
 - [ ] **9. Commit** `feat: qualify call audit operations` only after recording failures and resolved gates. A failing operational gate keeps production release pending; synthetic demonstration can still be complete.
 
 ## Requirement and source coverage review

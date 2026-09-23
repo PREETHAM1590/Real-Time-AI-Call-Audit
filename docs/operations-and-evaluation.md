@@ -102,12 +102,24 @@ Proposed pilot RPO: ≤24 hours using daily encrypted backups. Proposed RTO: ≤
 1. Authorise and append deletion request; check recorded hold status.
 2. Tombstone call; deny APIs/playback and cancel queued work.
 3. Workers check tombstone before inference requests and before commit.
-4. Delete audio, transient objects, transcript, findings, audits, reviews, export artifacts and eligible event payloads under the approved policy.
-5. Retain only the minimal non-content deletion/access record permitted by that policy.
-6. Verify object versions, replicas, local inference caches and backup expiry; record any telephony or identity retention limits.
-7. Reapply deletion records during restore before serving traffic.
+4. Delete audio, transient objects, transcript, findings and jobs only after the tombstone is committed. Current `purge_call` scrubs mutable call identity fields and removes bounded private audio objects and those mutable derivatives.
+5. **Current restriction:** machine audits, disposition revisions, human reviews and access events are immutable and remain in PostgreSQL after this content purge. `purge_call` returns `PARTIAL_IMMUTABLE_HISTORY` with per-table counts when they remain. Their redacted evidence/reason fields can still identify a person or call. This is not full deletion or verified erasure.
+6. Production retention and purge are blocked until the privacy/policy owner approves immutable-history retention or an independently verifiable crypto-erasure design, including exports, backups and restored copies. Do not bypass immutability triggers or report content as fully erased.
+7. The ADMIN `DELETE /v1/calls/{id}` request commits the tombstone and access event, marks the call DELETING, and cancels queued work before returning 202. Expiry uses `retention_expires_at` and `legal_hold`; no default expiry is assigned. `tombstone_expired_calls` is bounded to 100 rows per call and supports an organisation scope for controlled operation. These library operations are not scheduled, exposed as a purge API, or deployed as a background service.
+8. Synthetic PostgreSQL tests exercise hold, future expiry, exact expiry, repeated purge, immutable-history preservation and a worker finish racing a tombstone. They do not verify object-store versions, replicas, model caches, backup expiry or restore-time tombstone replay.
+9. Before serving restored data, reapply deletion records and verify all relevant storage layers under the approved policy.
 
-Do not claim immediate deletion from immutable backups; document their expiry and restore restrictions. Retention tests use an injectable clock, never wait days in CI.
+Do not claim immediate deletion from immutable backups; document their expiry and restore restrictions. Retention tests use an injectable clock, never wait days in CI. No retention duration, legal-hold mutation workflow, purge scheduler, restore drill, or verified-erasure claim is currently approved or implemented.
+
+## Current synthetic evaluation command
+
+The evaluator accepts bounded JSONL records containing only pseudonymous case IDs, adjudicated finding labels, prediction statuses and dimension scores. It rejects transcript/raw-text fields. It writes a deterministic JSON report with dataset SHA-256, sample/exclusion/abstention counts, coverage, per-rule precision/recall, critical misses and score agreement. Undefined precision/recall and score-agreement ratios are `null`, not zero or perfect. `tests/fixtures/golden.jsonl` is synthetic test data, not an estimate of model quality.
+
+```powershell
+python -m app.evaluate --dataset tests/fixtures/golden.jsonl --output evaluation-report.json
+```
+
+This local report is a tool check only. There is no approved human-labelled quality dataset, pinned production model, measured quality result, restore/load result, or production readiness claim.
 
 ## Capacity and cost model
 

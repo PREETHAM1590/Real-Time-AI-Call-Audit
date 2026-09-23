@@ -151,7 +151,11 @@ class ApiContractTests(unittest.TestCase):
             csrf_secret=CSRF_SECRET,
             allowed_origins=("https://audit.example.test",),
         )
-        identities = {"user-a": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))}
+        identities = {
+            "user-a": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"})),
+            "admin-user": Scope("org-a", "admin-user", "ADMIN", frozenset()),
+            "qa-user": Scope("org-a", "qa-user", "QA_ANALYST", frozenset()),
+        }
         self.identity_lookup = MagicMock(side_effect=identities.get)
         self.client = TestClient(
             create_app(
@@ -180,6 +184,25 @@ class ApiContractTests(unittest.TestCase):
     def test_health_and_call_routes_require_valid_scoped_identity(self):
         self.assertEqual(self.client.get("/health").status_code, 200)
         self.assertEqual(self.client.get("/v1/calls/call-a").status_code, 401)
+
+    def test_call_deletion_requires_admin_and_returns_tombstone_status(self):
+        qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}"}
+        with patch("app.api.connect") as connect:
+            denied = self.client.delete(f"/v1/calls/{uuid4()}", headers=qa_headers)
+        self.assertEqual(denied.status_code, 403)
+        connect.assert_not_called()
+
+        admin_headers = {"Authorization": f"Bearer {self.token(subject='admin-user')}"}
+        call_id = uuid4()
+        with patch("app.api.connect"), patch("app.api.request_call_deletion", return_value={"status": "TOMBSTONED", "cancelled_jobs": 2}) as request_delete:
+            accepted = self.client.delete(f"/v1/calls/{call_id}", headers=admin_headers)
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(accepted.json(), {"call_id": str(call_id), "status": "TOMBSTONED", "cancelled_jobs": 2})
+        self.assertEqual(request_delete.call_args.args[1:], ("org-a", str(call_id), "admin-user"))
+
+        with patch("app.api.connect"), patch("app.api.request_call_deletion", return_value={"status": "HELD"}):
+            held = self.client.delete(f"/v1/calls/{call_id}", headers=admin_headers)
+        self.assertEqual(held.status_code, 409)
 
         forged_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         forged = self.token(
