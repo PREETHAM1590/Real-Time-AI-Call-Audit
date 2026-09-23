@@ -185,6 +185,17 @@ class PolicyPersistenceIntegrationTests(unittest.TestCase):
         organisation_id, call_id, job_id = uuid4(), uuid4(), uuid4()
         other_organisation = uuid4()
         token = uuid4()
+
+        def cleanup():
+            with connect() as connection:
+                connection.execute("DELETE FROM jobs WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM findings WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM transcript_utterances WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id))
+                connection.execute("DELETE FROM organisations WHERE id=ANY(%s)", ([organisation_id, other_organisation],))
+
+        self.addCleanup(cleanup)
         with connect() as connection:
             connection.execute("INSERT INTO organisations(id) VALUES (%s),(%s)", (organisation_id, other_organisation))
             connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state,transcript_revision) VALUES (%s,%s,%s,%s,%s,'agent','team','en','ANALYSING',1)", (organisation_id, call_id, f"policy-{call_id}", f"policy-{call_id}", "c" * 64))

@@ -189,13 +189,25 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb) ON CONFLICT (organisation_id,call_id,transcript_revision,config_id,config_version,model_artifact,adapter_version) DO NOTHING RETURNING id",
                     (locked[0], uuid4(), locked[1], revision, disposition["transcript_revision"], disposition["config_id"], disposition["config_version"], disposition["config_hash"], disposition["schema_version"], disposition["model_artifact"], disposition["adapter_version"], disposition["processing_path"], disposition["status"], disposition["code"], disposition["parent_code"], disposition["confidence"], disposition["requires_review"], disposition["review_reason"], disposition["matched_rule_id"], json.dumps(disposition["signals"]), json.dumps(disposition["usage"])),
                 ).fetchone()
-                # ANALYSE is disposition-only in this slice. Never mark a call READY;
-                # QA policy/audit stages have not been implemented yet.
+                # ANALYSE is disposition-only; never mark a call READY.
                 connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
             elif "findings" in result:
                 if locked[4] != "POLICY" or locked[5] != locked[3]:
                     raise ValueError("stale or misrouted policy result")
                 persist_policy_findings(connection, locked[0], locked[1], locked[3], result["findings"])
+                connection.execute(
+                    "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'AUDIT',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
+                    (locked[0], uuid4(), locked[1], locked[3]),
+                )
+            elif "audit" in result:
+                if locked[4] != "AUDIT" or locked[5] != locked[3]:
+                    raise ValueError("stale or misrouted audit result")
+                from app.audit import persist_audit
+
+                persist_audit(connection, locked[0], locked[1], locked[3], result["audit"])
+                # Task 6 human review and later lifecycle gates are not present;
+                # an audit result therefore cannot advance a call to READY.
+                connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
             else:
                 connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
     return changed == 1

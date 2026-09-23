@@ -11,6 +11,7 @@ from app.storage import LocalPrivateStorage
 from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
 from app.compliance import evaluate_rules, load_ruleset
+from app.audit import audit_call, load_pinned_text, load_rubric
 
 Processor = Callable[[dict], str | dict]
 LEASE_SECONDS = 60
@@ -78,6 +79,33 @@ def make_policy_processor(ruleset):
     return process
 
 
+def make_audit_processor(adapter, rubric, prompt: str, *, prompt_version: str = "audit_prompt_v1"):
+    """Build AUDIT over one tenant-scoped final transcript revision."""
+    def process(job: dict) -> dict:
+        with connect() as connection:
+            call_row = connection.execute(
+                "SELECT c.transcript_revision,c.call_type,c.language FROM calls c "
+                "WHERE c.organisation_id=%s AND c.id=%s AND c.tombstoned_at IS NULL",
+                (job["organisation_id"], job["call_id"]),
+            ).fetchone()
+            if call_row is None or call_row[0] != job["input_revision"]:
+                raise RuntimeError("audit transcript revision is stale or unavailable")
+            rows = connection.execute(
+                "SELECT id,role,start_ms,end_ms,text_redacted,is_final FROM transcript_utterances "
+                "WHERE organisation_id=%s AND call_id=%s AND revision=%s ORDER BY start_ms,id",
+                (job["organisation_id"], job["call_id"], job["input_revision"]),
+            ).fetchall()
+            finding_rows = connection.execute(
+                "SELECT rule_id,ruleset_version,ruleset_hash,status,severity,evidence_ids FROM findings WHERE organisation_id=%s AND call_id=%s AND transcript_revision=%s ORDER BY rule_id",
+                (job["organisation_id"], job["call_id"], job["input_revision"]),
+            ).fetchall()
+        utterances = [{"id": row[0], "role": row[1], "start_ms": row[2], "end_ms": row[3], "text_redacted": row[4], "is_final": row[5]} for row in rows]
+        findings = [{"rule_id": row[0], "ruleset_version": row[1], "ruleset_hash": row[2], "status": row[3], "severity": row[4], "evidence_ids": row[5]} for row in finding_rows]
+        call = {"organisation_id": str(job["organisation_id"]), "call_id": str(job["call_id"]), "transcript_revision": job["input_revision"], "call_type": call_row[1], "language": call_row[2]}
+        return {"audit": audit_call(call, utterances, findings, adapter, rubric, prompt, prompt_version=prompt_version)}
+    return process
+
+
 def run_once(worker_id: str, processors: Mapping[str, Processor] | None = None) -> bool:
     processors = processors or {}
     with connect() as connection:
@@ -142,6 +170,16 @@ if __name__ == "__main__":
             raise RuntimeError("Both POLICY_RULESET_PATH and POLICY_RULESET_SHA256 are required")
         policy_ruleset = load_ruleset(policy_path, policy_digest)
         processors["POLICY"] = make_policy_processor(policy_ruleset)
+    audit_vars = ("AUDIT_MODEL_PATH", "AUDIT_MODEL_SHA256", "AUDIT_LOCAL_URL", "AUDIT_LOCAL_MODEL_NAME", "AUDIT_RUBRIC_PATH", "AUDIT_RUBRIC_SHA256", "AUDIT_PROMPT_PATH", "AUDIT_PROMPT_SHA256")
+    configured_audit = any(os.environ.get(name) for name in audit_vars)
+    if configured_audit:
+        if not all(os.environ.get(name) for name in audit_vars):
+            raise RuntimeError("All AUDIT model, rubric and prompt pin settings are required")
+        from app.audit import LocalVllmAuditAdapter
+
+        audit_rubric = load_rubric(os.environ["AUDIT_RUBRIC_PATH"], os.environ["AUDIT_RUBRIC_SHA256"])
+        audit_prompt = load_pinned_text(os.environ["AUDIT_PROMPT_PATH"], os.environ["AUDIT_PROMPT_SHA256"])
+        processors["AUDIT"] = make_audit_processor(LocalVllmAuditAdapter.from_environment(), audit_rubric, audit_prompt, prompt_version=os.environ.get("AUDIT_PROMPT_VERSION", "audit_prompt_v1"))
     if os.environ.get("FASTER_WHISPER_MODEL_PATH") and os.environ.get("FASTER_WHISPER_MODEL_SHA256") and os.environ.get("FASTER_WHISPER_MODEL_VERSION"):
         processors["TRANSCRIBE"] = make_transcription_processor(ruleset=policy_ruleset)
     if os.environ.get("DISPOSITION_MODEL_SHA256"):

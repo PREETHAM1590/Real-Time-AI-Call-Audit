@@ -295,7 +295,7 @@ This helper's input must already be clipped to the eligible window. `evaluate_ru
 
 **Interfaces:** `validate_evidence(evidence: list[dict], utterances: list[Utterance]) -> None`; `weighted_score(scores: dict[str, int | None], weights: dict[str, int]) -> float | None`; `audit_call(call: dict, utterances: list[Utterance], findings: list[dict]) -> dict` returns a validated immutable audit or review status.
 
-- [ ] **1. Write citation checks:**
+- [x] **1. Write citation checks:**
 
 ```python
 import unittest
@@ -313,8 +313,8 @@ class AuditTests(unittest.TestCase):
             validate_evidence([{"utterance_id": "other-call", "quote": "help"}], rows)
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_audit -v`; expect missing validation.
-- [ ] **3. Implement strict evidence validation:**
+- [x] **2. Run the new checks first** and confirm the initial missing implementation fails.
+- [x] **3. Implement strict evidence validation:**
 
 ```python
 def validate_evidence(evidence, utterances):
@@ -327,10 +327,12 @@ def validate_evidence(evidence, utterances):
 ```
 
 The caller fetches only the authorised call's pinned transcript revision. Validate score/evidence relationship and speaker role after substring validation; matching words alone do not establish the judgment's truth.
-- [ ] **4. Implement audit schema/prompt** using the seven exact IDs/weights from spec §10, strict enum/range/unique-dimension validation, explicit refusal/incomplete handling and server-derived identity/timestamps/decision. Check token budget before calling; no silent truncation.
-- [ ] **5. Implement bounded local vLLM calls**, total three attempts, one repair within that budget, persisted attempt/token/latency data and review on exhaustion. Provision pinned Qwen3-8B artifact/checksum and runtime behind a private network endpoint with no runtime download or hosted fallback. Set request deadline from measured local throughput. Never log raw request/response bodies. Use the same model artifact for initial calibration.
-- [ ] **6. Add score checks:** all scores 3 gives 3.00; objection N/A renormalises; missing required score yields null/NEEDS_REVIEW; duplicate dimensions, nonfinite scores, out-of-range values and unsupported citations are rejected. Include transcript text that says “ignore the rubric”; assert it remains data and cannot change server identity or scoring rules.
-- [ ] **7. Run module plus transcription/compliance tests**, then commit `feat: add validated call audits`.
+- [x] **4. Implement audit schema/prompt** using the seven exact IDs/weights from spec §10, strict enum/range/unique-dimension validation, explicit refusal/incomplete handling and server-derived identity/timestamps/decision. Character ceilings fail closed without truncation; they are not tokenizer-measured budgets.
+- [x] **5. Implement bounded local vLLM calls**, total three attempts, one validation repair within that budget, persisted attempt/latency data and review on exhaustion. Verify a pinned local artifact and the serving manifest's model ID and artifact root. No runtime download or hosted fallback; never log raw request/response bodies.
+- [x] **6. Add score checks:** all scores 3 gives 3.00; objection N/A requires a server fact; missing required score yields null/NEEDS_REVIEW; duplicate dimensions, nonfinite scores, out-of-range values and unsupported citations are rejected. Transcript instructions remain untrusted data.
+- [x] **7. Run the full suite with PostgreSQL integrations on an isolated `_test` database**, then commit `feat: add validated call audits`.
+
+**Implemented limitation/release gate:** audit code, persistence and worker integration use deterministic fakes in tests, but no approved production model artifact, hardware, quality dataset, token-budget calibration or load/latency measurement exists. Calls remain `NEEDS_REVIEW` because the analyst review stage is Task 6 and trusted timed-policy inputs are not integrated. This slice does not establish production readiness.
 
 ## Task 6: Deliver analyst review and evidence navigation
 

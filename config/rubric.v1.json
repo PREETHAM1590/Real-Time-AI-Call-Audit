@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "rubric_version": "synthetic_pilot_v1",
+  "pass_threshold": 3.0,
+  "dimensions": [
+    {"id": "greeting", "weight": 10, "anchors": ["Missing or unprofessional greeting.", "Identifies self and purpose.", "Clear, tailored opening."]},
+    {"id": "listening", "weight": 15, "anchors": ["Repeatedly ignores the stated issue.", "Acknowledges and confirms the issue.", "Accurate clarification and response."]},
+    {"id": "resolution", "weight": 25, "anchors": ["No useful action.", "Correct actionable next step.", "Complete supported resolution and expectation setting."]},
+    {"id": "compliance", "weight": 20, "anchors": ["Supported policy failures.", "Required observed steps.", "Complete, clear execution; does not certify legal compliance."]},
+    {"id": "clarity", "weight": 10, "anchors": ["Confusing or contradictory.", "Understandable explanation.", "Concise, tailored explanation."]},
+    {"id": "objection", "weight": 10, "anchors": ["Dismisses concern.", "Addresses concern.", "Acknowledges, clarifies and resolves concern."]},
+    {"id": "closing", "weight": 10, "anchors": ["Abrupt or misleading close.", "Next steps and closure.", "Recap and confirmation of understanding."]}
+  ]
+}
