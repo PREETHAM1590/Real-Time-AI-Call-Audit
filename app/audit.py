@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 import os
 import re
@@ -126,7 +127,7 @@ def compile_rubric(raw: Mapping[str, Any]) -> dict[str, Any]:
     if raw.get("schema_version") != "1.0.0" or not isinstance(raw.get("rubric_version"), str) or not raw["rubric_version"] or len(raw["rubric_version"]) > 128:
         raise AuditValidationError("INVALID_RUBRIC")
     threshold = raw.get("pass_threshold")
-    if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not 1 <= threshold <= 5:
+    if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not 1 <= threshold <= 5 or round(float(threshold), 2) != float(threshold):
         raise AuditValidationError("INVALID_RUBRIC")
     dimensions = raw.get("dimensions")
     if not isinstance(dimensions, list) or len(dimensions) != len(DIMENSION_IDS):
@@ -247,6 +248,7 @@ def _review_result(call: Mapping[str, Any], rubric: Mapping[str, Any], reason: s
         "transcript_revision": call["transcript_revision"], "model_artifact": model_artifact,
         "inference_runtime": inference_runtime, "prompt_version": prompt_version, "prompt_hash": prompt_hash,
         "rubric_version": rubric["rubric_version"], "rubric_hash": rubric["rubric_hash"],
+        "pass_threshold": rubric["pass_threshold"],
         "dimensions": [], "overall_score": None, "decision": "NEEDS_REVIEW", "review_reason": reason,
         "coaching_narrative": {"text": "", "evidence": []}, "highlights": [], "improvement_areas": [],
         "usage": dict(usage or {}), "attempts": attempts, "latency_ms": latency_ms,
@@ -336,6 +338,7 @@ def audit_call(call: Mapping[str, Any], utterances: Sequence[Utterance | Mapping
         "transcript_revision": call["transcript_revision"], "model_artifact": artifact,
         "inference_runtime": runtime, "prompt_version": prompt_version, "prompt_hash": prompt_hash,
         "rubric_version": compiled["rubric_version"], "rubric_hash": compiled["rubric_hash"],
+        "pass_threshold": compiled["pass_threshold"],
         **validated, "decision": decision, "review_reason": review_reason, "attempts": attempts,
         "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
         "policy_provenance": policy_provenance, "policy_fingerprint": policy_fingerprint,
@@ -418,7 +421,7 @@ class LocalVllmAuditAdapter:
 
 def persist_audit(connection, organisation_id, call_id, transcript_revision: int, audit: Mapping[str, Any]) -> None:
     """Persist one immutable audit after rechecking tenant/revision citations."""
-    allowed = {"organisation_id", "call_id", "transcript_revision", "model_artifact", "inference_runtime", "prompt_version", "prompt_hash", "rubric_version", "rubric_hash", "dimensions", "overall_score", "decision", "review_reason", "coaching_narrative", "highlights", "improvement_areas", "usage", "attempts", "latency_ms", "policy_provenance", "policy_fingerprint"}
+    allowed = {"organisation_id", "call_id", "transcript_revision", "model_artifact", "inference_runtime", "prompt_version", "prompt_hash", "rubric_version", "rubric_hash", "pass_threshold", "dimensions", "overall_score", "decision", "review_reason", "coaching_narrative", "highlights", "improvement_areas", "usage", "attempts", "latency_ms", "policy_provenance", "policy_fingerprint"}
     if not isinstance(audit, Mapping) or set(audit) != allowed:
         raise AuditValidationError("INVALID_AUDIT_RECORD")
     if str(audit["organisation_id"]) != str(organisation_id) or str(audit["call_id"]) != str(call_id) or audit["transcript_revision"] != transcript_revision:
@@ -433,6 +436,9 @@ def persist_audit(connection, organisation_id, call_id, transcript_revision: int
     for field in ("prompt_hash", "rubric_hash"):
         if not isinstance(audit[field], str) or not re.fullmatch(r"[0-9a-f]{64}", audit[field]):
             raise AuditValidationError("INVALID_AUDIT_PROVENANCE")
+    threshold = audit["pass_threshold"]
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or not 1 <= threshold <= 5:
+        raise AuditValidationError("INVALID_AUDIT_THRESHOLD")
     policy_provenance = audit["policy_provenance"]
     if not isinstance(policy_provenance, list) or len(policy_provenance) > 64 or any(not isinstance(item, Mapping) or set(item) != {"version", "hash"} or not isinstance(item["version"], str) or not item["version"] or len(item["version"]) > 64 or not isinstance(item["hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["hash"]) for item in policy_provenance):
         raise AuditValidationError("INVALID_POLICY_PROVENANCE")
@@ -496,8 +502,8 @@ def persist_audit(connection, organisation_id, call_id, transcript_revision: int
         raise AuditValidationError("INVALID_AUDIT_METRICS")
     revision = connection.execute("SELECT COALESCE(MAX(revision),0)+1 FROM audits WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0]
     connection.execute(
-        "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,review_reason,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s) "
+        "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,pass_threshold,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,review_reason,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s) "
         "ON CONFLICT (organisation_id,call_id,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_hash,policy_fingerprint) DO NOTHING",
-        (organisation_id, uuid4(), call_id, revision, transcript_revision, audit["model_artifact"], audit["inference_runtime"], audit["prompt_version"], audit["prompt_hash"], audit["rubric_version"], audit["rubric_hash"], json.dumps(policy_records, sort_keys=True), policy_fingerprint, json.dumps(audit["dimensions"], ensure_ascii=False), audit["overall_score"], audit["decision"], audit["review_reason"], json.dumps(audit["coaching_narrative"], ensure_ascii=False), json.dumps(audit["highlights"], ensure_ascii=False), json.dumps(audit["improvement_areas"], ensure_ascii=False), json.dumps(audit["usage"], ensure_ascii=False), attempts, latency_ms),
+        (organisation_id, uuid4(), call_id, revision, transcript_revision, audit["model_artifact"], audit["inference_runtime"], audit["prompt_version"], audit["prompt_hash"], audit["rubric_version"], audit["rubric_hash"], threshold, json.dumps(policy_records, sort_keys=True), policy_fingerprint, json.dumps(audit["dimensions"], ensure_ascii=False), audit["overall_score"], audit["decision"], audit["review_reason"], json.dumps(audit["coaching_narrative"], ensure_ascii=False), json.dumps(audit["highlights"], ensure_ascii=False), json.dumps(audit["improvement_areas"], ensure_ascii=False), json.dumps(audit["usage"], ensure_ascii=False), attempts, latency_ms),
     )

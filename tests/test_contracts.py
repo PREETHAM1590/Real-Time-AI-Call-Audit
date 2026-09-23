@@ -1,5 +1,6 @@
 import asyncio
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 import unittest
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ from app.contracts import PersistedUtterance, Utterance
 from app.db import connect
 from app.ingest import MAX_AUDIO_BYTES
 from app.migrate import migrate
+from app.reviews import ReviewNotFound
 
 CSRF_SECRET = "test-only-csrf-secret-at-least-32-bytes-long"
 
@@ -210,10 +212,14 @@ class ApiContractTests(unittest.TestCase):
             None,
         ]
         with patch("app.api.connect", return_value=connection):
-            self.assertEqual(self.client.get("/v1/calls/call-a", headers=headers).json(), {"id": "call-a", "processing_state": "QUEUED"})
-            self.assertEqual(self.client.get("/v1/calls/call-b", headers=headers).status_code, 404)
-        params = connection.__enter__.return_value.execute.call_args_list
-        self.assertEqual(params[0].args[1][0], "org-a")
+            with patch("app.api.call_detail", side_effect=[{"call": {"id": "call-a", "processing_state": "QUEUED"}}, ReviewNotFound()]):
+                self.assertEqual(self.client.get("/v1/calls/call-a", headers=headers).json(), {"call": {"id": "call-a", "processing_state": "QUEUED"}})
+                self.assertEqual(self.client.get("/v1/calls/call-b", headers=headers).status_code, 404)
+        invalid_uuid_connection = MagicMock()
+        invalid_uuid_connection.__enter__.return_value = invalid_uuid_connection
+        with patch("app.api.connect", return_value=invalid_uuid_connection):
+            self.assertEqual(self.client.get("/v1/calls/not-a-uuid", headers=headers).status_code, 404)
+        invalid_uuid_connection.execute.assert_not_called()
 
     def test_default_identity_store_failure_returns_service_unavailable(self):
         client = TestClient(create_app(self.settings))
@@ -273,6 +279,110 @@ class ApiContractTests(unittest.TestCase):
         self.assertIn("idempotency-key", response.headers["access-control-allow-headers"].lower())
         self.assertIn("x-csrf-token", response.headers["access-control-allow-headers"].lower())
         self.assertIn("x-organisation-id", response.headers["access-control-allow-headers"].lower())
+
+    def test_review_api_enforces_analyst_role_and_maps_stale_conflict(self):
+        from app.reviews import ReviewConflict
+
+        self.identity_lookup.side_effect = lambda subject: {
+            "qa-user": Scope("org-a", "qa-user", "QA_ANALYST", frozenset()),
+            "agent-user": Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"})),
+        }.get(subject)
+        qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}", "X-Request-ID": "review-request-1"}
+        body = {"action": "ACCEPT", "base_review_version": 0, "scores": {}, "reason": "Synthetic review confirmation"}
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        with patch("app.api.connect", return_value=connection), patch("app.api.append_review", return_value={"version": 1, "action": "ACCEPT"}) as append:
+            saved = self.client.post("/v1/audits/00000000-0000-4000-8000-000000000001/reviews", headers=qa_headers, json=body)
+            self.assertEqual(saved.status_code, 201)
+            self.assertEqual(append.call_args.args[1], Scope("org-a", "qa-user", "QA_ANALYST", frozenset()))
+            self.assertEqual(append.call_args.kwargs["request_id"], "review-request-1")
+
+        agent_headers = {"Authorization": f"Bearer {self.token(subject='agent-user')}"}
+        denied = self.client.post("/v1/audits/00000000-0000-4000-8000-000000000001/reviews", headers=agent_headers, content=b"not-json")
+        self.assertEqual(denied.status_code, 403)
+        self.identity_lookup.side_effect = lambda subject: Scope("org-a", "qa-user", "QA_ANALYST", frozenset()) if subject == "qa-user" else None
+        with patch("app.api.connect", return_value=connection), patch("app.api.append_review", side_effect=ReviewConflict("stale")):
+            stale = self.client.post("/v1/audits/00000000-0000-4000-8000-000000000001/reviews", headers=qa_headers, json={**body, "action": "OVERRIDE", "scores": {"clarity": 2}})
+        self.assertEqual(stale.status_code, 409)
+
+    def test_review_body_is_bounded_before_json_parse_and_queue_requires_qa(self):
+        qa = Scope("org-a", "qa-user", "QA_ANALYST", frozenset())
+        self.identity_lookup.side_effect = lambda subject: qa if subject == "qa-user" else Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+        oversized = self.client.post(
+            "/v1/audits/00000000-0000-4000-8000-000000000001/reviews",
+            headers={"Authorization": f"Bearer {self.token(subject='qa-user')}"},
+            content=b"{" + b" " * 32768,
+        )
+        self.assertEqual(oversized.status_code, 413)
+        with patch("app.api.review_queue", return_value=[]):
+            self.assertEqual(self.client.get("/v1/reviews/queue", headers={"Authorization": f"Bearer {self.token(subject='qa-user')}"}).json(), {"items": []})
+        with patch("app.api.connect"):
+            denied = self.client.get("/v1/reviews/queue", headers={"Authorization": f"Bearer {self.token(subject='agent-user')}"})
+        self.assertEqual(denied.status_code, 403)
+
+    def test_audio_access_is_logged_streamed_by_range_and_rechecks_permission(self):
+        from pathlib import Path
+
+        organisation_id = "00000000-0000-4000-8000-000000000010"
+        call_id = "00000000-0000-4000-8000-000000000011"
+        audio_id = "00000000-0000-4000-8000-000000000012"
+        role = {"current": "QA_ANALYST"}
+        self.identity_lookup.side_effect = lambda subject: (
+            Scope(organisation_id, "qa-user", role["current"], frozenset({"team-a"}))
+            if subject == "qa-user" else Scope(organisation_id, "agent-a", "AGENT", frozenset({"team-a"})) if subject == "agent-user" else None
+        )
+        qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}"}
+        agent_headers = {"Authorization": f"Bearer {self.token(subject='agent-user')}"}
+        denied = self.client.post(f"/v1/calls/{call_id}/audio-access", headers=agent_headers)
+        self.assertEqual(denied.status_code, 403)
+
+        grant_connection = MagicMock()
+        grant_connection.__enter__.return_value = grant_connection
+        grant_connection.execute.return_value.fetchone.return_value = (audio_id, "fixture.audio", "wav", "qa-user", "team-a")
+        with patch("app.api.connect", return_value=grant_connection):
+            grant = self.client.post(f"/v1/calls/{call_id}/audio-access", headers=qa_headers)
+        self.assertEqual(grant.status_code, 200)
+        self.assertEqual(grant.json()["expires_in_seconds"], 60)
+        event_calls = [call.args[0] for call in grant_connection.execute.call_args_list]
+        self.assertTrue(any("AUDIO_ACCESS_GRANTED" in query for query in event_calls))
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "fixture.audio").write_bytes(b"0123456789")
+            stream_connection = MagicMock()
+            stream_connection.__enter__.return_value = stream_connection
+            stream_connection.execute.return_value.fetchone.return_value = ("fixture.audio", "wav", "qa-user", "team-a", None)
+            with patch("app.api.connect", return_value=stream_connection), patch.dict(os.environ, {"AUDIO_STORAGE_PATH": directory}):
+                streamed = self.client.get(grant.json()["url"], headers={**qa_headers, "Range": "bytes=2-5"})
+            self.assertEqual(streamed.status_code, 206)
+            self.assertEqual(streamed.content, b"2345")
+            self.assertEqual(streamed.headers["content-range"], "bytes 2-5/10")
+            with patch("app.api.connect", return_value=stream_connection), patch.dict(os.environ, {"AUDIO_STORAGE_PATH": directory}):
+                zero_suffix = self.client.get(grant.json()["url"], headers={**qa_headers, "Range": "bytes=-0"})
+                huge_range = self.client.get(grant.json()["url"], headers={**qa_headers, "Range": "bytes=" + "9" * 5000 + "-"})
+            self.assertEqual(zero_suffix.status_code, 416)
+            self.assertEqual(huge_range.status_code, 416)
+
+            Path(directory, "fixture.audio").write_bytes(b"")
+            empty_connection = MagicMock()
+            empty_connection.__enter__.return_value = empty_connection
+            empty_connection.execute.return_value.fetchone.return_value = ("fixture.audio", "wav", "qa-user", "team-a", None)
+            with patch("app.api.connect", return_value=empty_connection), patch.dict(os.environ, {"AUDIO_STORAGE_PATH": directory}):
+                empty = self.client.get(grant.json()["url"], headers=qa_headers)
+            self.assertEqual(empty.status_code, 404)
+
+            role["current"] = "AGENT"
+            with patch("app.api.connect") as connect:
+                revoked = self.client.get(grant.json()["url"], headers=qa_headers)
+            self.assertEqual(revoked.status_code, 403)
+            connect.assert_not_called()
+
+            role["current"] = "QA_ANALYST"
+            tombstoned_connection = MagicMock()
+            tombstoned_connection.__enter__.return_value = tombstoned_connection
+            tombstoned_connection.execute.return_value.fetchone.return_value = ("fixture.audio", "wav", "qa-user", "team-a", datetime.now(timezone.utc))
+            with patch("app.api.connect", return_value=tombstoned_connection), patch.dict(os.environ, {"AUDIO_STORAGE_PATH": directory}):
+                unavailable = self.client.get(grant.json()["url"], headers=qa_headers)
+            self.assertEqual(unavailable.status_code, 404)
 
     def test_cookie_upload_requires_exact_origin_and_session_csrf(self):
         self.client.cookies.set("session", self.token())

@@ -2,7 +2,7 @@
 
 Self-hosted call auditing and configurable disposition platform: transcribe calls, check configured policies, identify interaction outcomes, propose evidence-backed quality scores, and support human review and live supervision.
 
-**Status:** implementation in progress. Identity-scoped APIs, durable recording intake, the final redacted transcript pipeline, and configurable disposition identification have runnable tests. Deterministic policy evaluation now has versioned findings, but trusted connection/hold/completion metadata is not integrated, so uploaded calls remain UNKNOWN for timed rules. Seven-dimension audit scoring, analyst UI, live monitoring and deployment remain incomplete; model quality and capacity are unmeasured. Nothing is deployed.
+**Status:** post-call implementation in progress. Identity-scoped APIs, durable recording intake, final redacted transcription, configurable disposition, versioned policy findings, immutable seven-dimension audits, append-only human reviews and a small analyst page have runnable checks. Timed policy findings remain UNKNOWN without trusted telephony context. Live monitoring, production model approval, quality/capacity qualification and deployment remain incomplete. Nothing is deployed.
 
 ## Read in this order
 
@@ -18,7 +18,7 @@ Self-hosted call auditing and configurable disposition platform: transcribe call
 
 Build a post-call pilot first, validate disposition and audit findings with QA analysts, then add live transcription and supervisor alerts using the same transcript, disposition and audit contracts. The live system remains part of the planned scope. Large-scale infrastructure is a separate expansion milestone driven by measured load.
 
-The starting proposal uses Python/FastAPI, PostgreSQL, private object storage, self-hosted speech and language models, and React/TypeScript. Model candidates, licenses and deployment boundaries are documented in the [open-source model guide](docs/open-source-models.md). These are proposed choices for a new project, not dependencies found in this workspace.
+The starting proposal uses Python/FastAPI, PostgreSQL, private object storage, self-hosted speech and language models, and React/TypeScript. The current analyst pilot uses dependency-free HTML/CSS/JavaScript because this repository had no existing browser application/build scaffold; that scoped implementation choice and its replacement path are recorded in the plan. Model candidates, licenses and deployment boundaries are documented in the [open-source model guide](docs/open-source-models.md).
 
 ## Source and assumptions
 

@@ -20,6 +20,7 @@ dependencies = [
 test = ["httpx==0.28.1"]
 transcription = ["faster-whisper==1.2.1"]
 privacy = ["presidio-analyzer==2.2.364"]
+browser-test = ["playwright==1.60.0"]
 
 [tool.setuptools]
 packages = ["app"]

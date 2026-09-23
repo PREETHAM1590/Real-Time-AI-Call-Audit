@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Call audit review</title>
+    <link rel="stylesheet" href="/analyst-assets/styles.css">
+    <script src="/analyst-assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Call audit review</h1>
+      <p>Review final redacted evidence and record a reasoned decision.</p>
+    </header>
+    <main class="layout">
+      <section aria-labelledby="queue-title" class="queue-panel">
+        <div class="section-heading"><h2 id="queue-title">Review queue</h2><button id="refresh-queue" type="button">Refresh</button></div>
+        <p id="queue-status" class="status" role="status" aria-live="polite"></p>
+        <ol id="queue-list" class="queue-list"></ol>
+      </section>
+      <section id="call-panel" aria-labelledby="call-title" class="call-panel" aria-live="polite">
+        <h2 id="call-title" tabindex="-1">Select a call</h2>
+        <p id="call-status" class="status" role="status" aria-live="polite">Choose an item in the review queue.</p>
+        <div id="call-detail"></div>
+      </section>
+    </main>
+  </body>
+</html>

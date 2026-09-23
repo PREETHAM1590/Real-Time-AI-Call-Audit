@@ -336,11 +336,13 @@ The caller fetches only the authorised call's pinned transcript revision. Valida
 
 ## Task 6: Deliver analyst review and evidence navigation
 
-**Files:** Create reviews module, browser project and `tests/test_reviews.py`, `web/tests/qa.spec.ts`; modify API.
+**Files:** Create `app/reviews.py`, `app/audio_access.py`, migration 010–011, `tests/test_reviews.py`, `tests/test_audio_access.py`, `tests/test_browser_review.py` and the `web/` analyst page; modify audit/API and project test dependencies.
+
+**Approved implementation adjustment:** The repository has no existing browser application or npm build scaffold. For the pilot review surface, use native HTML/CSS/JavaScript served by FastAPI and a Python Playwright browser smoke test (`.[browser-test]` plus Chromium). This avoids introducing a speculative frontend dependency tree; a React/TypeScript client remains a later replacement path and is not claimed as delivered.
 
 **Interfaces:** `append_review(connection, scope: Scope, audit_id: str, base_review_version: int, action: str, scores: dict, reason: str) -> dict`; `ReviewConflict` exception maps to HTTP 409. Browser `getCall(id: string)` and `submitReview(auditId: string, body: ReviewInput)` implement the spec API.
 
-- [ ] **1. Write concurrent-review integration check:**
+- [x] **1. Write concurrent-review integration check:**
 
 ```python
 first = append_review(connection, qa_scope, audit_id, 0, "ACCEPT", {}, "Verified evidence")
@@ -352,26 +354,20 @@ self.assertEqual(stored[0], original_machine_score)
 ```
 
 Create `qa_scope` with Task 1's `Scope`, insert a completed synthetic call/audit in setUp and use Task 2's isolated database restriction.
-- [ ] **2. Run:** `python -m unittest tests.test_reviews -v`; expect missing review implementation.
-- [ ] **3. Implement atomic review append:** lock the audit's review head, verify organisation/permission and expected version, validate changed scores and nonempty reason, insert review and access event in one transaction. Recompute the effective reviewed score with Task 5's scoring function.
-- [ ] **4. Build queue and detail screen:** show risk, processing state, agent/date, redacted transcript, findings, disposition code/name/config version/review state, machine score and reviewed score separately. Never conflate disposition with QA score or human review. Clicking evidence seeks native `<audio controls>` to the canonical timestamp only after authorised playback access. Render transcript as text, never unsanitised HTML.
-- [ ] **5. Add review form** with required reason, saving/error state, conflict reload, keyboard focus and visible labels. Disable scoring action on superseded audit until current evidence is loaded. Record playback access before issuing a short-lived URL.
-- [ ] **6. Create browser check** against a seeded local test backend:
+- [x] **2. Run:** `python -m unittest tests.test_reviews -v`; the expected missing implementation failure was recorded before implementation.
+- [x] **3. Implement atomic review append:** lock audit and call rows, verify organisation/permission/current transcript and expected review version, validate changed scores and nonempty reason, insert immutable review and access event in one transaction. Recompute effective score using Task 5's scoring function and persisted rubric threshold. ACCEPT confirms the current vector; OVERRIDE merges changes over the prior effective vector. A reasoned TRIAGE action preserves a null score and NEEDS_REVIEW for unscoreable audits and keeps the call visible in the queue without offering duplicate triage actions.
+- [x] **4. Build queue and detail screen:** display processing state, agent/date, final redacted transcript, findings, current disposition, and machine/review score separately. Evidence buttons focus the canonical transcript utterance; after explicit audio authorization they also seek the native `<audio controls>` player. Transcript content is rendered as text, not HTML.
+- [x] **5. Add review form** with required reason, saving/error state, conflict reload, keyboard focus and visible labels. Disable actions for superseded audit evidence. `POST /v1/calls/{id}/audio-access` records an immutable grant before a 60-second identity-bound URL is returned; range requests recheck current role, scope and tombstone. A renewal control is visible. AUDIO_ACCESS_GRANTED query capabilities must be redacted from proxy logs.
+- [x] **6. Create browser check** against deterministic API fixtures using Python Playwright:
 
-```typescript
-import { test, expect } from '@playwright/test';
-test('analyst saves an evidence-backed review', async ({ page }) => {
-  await page.goto('/');
-  await page.getByRole('link', { name: 'Synthetic call 001' }).click();
-  await expect(page.getByText('Machine score')).toBeVisible();
-  await page.getByLabel('Review reason').fill('Verified transcript evidence');
-  await page.getByRole('button', { name: 'Accept audit' }).click();
-  await expect(page.getByText('Review saved')).toBeVisible();
-});
+```powershell
+python -m pip install -e ".[test,browser-test]"
+python -m playwright install chromium
+python -m unittest tests.test_browser_review -v
 ```
 
-Use an isolated test identity/session supplied by the test server, never a production auth bypass. Test agent denial of audio and reviewer mutation as backend assertions too.
-- [ ] **7. Run:** backend module, `npm --prefix web run build` and `npm --prefix web run test:e2e -- qa.spec.ts`; demonstrate P1 end to end; commit `feat: add analyst review workflow`.
+The browser test supplies deterministic synthetic fixtures and does not disable authentication in the application. Backend API tests cover agent denial, expired/wrong identity capabilities, permission revocation, logged grant and range streaming; PostgreSQL tests cover immutable review persistence and optimistic conflicts. The vanilla UI has no npm build. The Playwright smoke test is not a production-browser/accessibility qualification.
+- [x] **7. Run:** full backend suite and browser smoke with all PostgreSQL integrations against a dedicated `_test` database, compileall and diff checks; no production-readiness claim. Commit the analyst review workflow.
 
 ## Task 7: Add one live media adapter and finalisation barrier
 

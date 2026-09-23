@@ -1,14 +1,18 @@
 import json
 import os
+import re
 import threading
-from uuid import uuid4
+from pathlib import Path
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import Request
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 
 from app.auth import IdentityLookup, Scope, can_access, csrf_token_for_session, scope_dependency
 from app.config import Settings
@@ -17,10 +21,14 @@ from app.ingest import IdempotencyConflict, IntakeError, MAX_AUDIO_BYTES, accept
 from app.disposition_config import ConfigError, compile_disposition_config
 from app.disposition import classify_disposition
 from app.local_disposition_adapter import LocalVllmDispositionAdapter
+from app.reviews import ReviewConflict, ReviewForbidden, ReviewNotFound, append_review, call_detail, review_queue
+from app.audio_access import issue_audio_capability, verify_audio_capability
+from app.storage import LocalPrivateStorage
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
 MAX_DISPOSITION_CONFIG_BYTES = 1024 * 1024
+MAX_REVIEW_BODY_BYTES = 32 * 1024
 
 
 class _RequestBodyTooLarge(Exception):
@@ -137,6 +145,61 @@ class DispositionBodyLimitMiddleware:
             self.slots.release()
 
 
+class ReviewBodyLimitMiddleware:
+    """Authenticate and bound analyst JSON before FastAPI parses it."""
+
+    def __init__(self, app, *, get_scope, max_bytes: int = MAX_REVIEW_BODY_BYTES, concurrent_requests: int = 8):
+        self.app = app
+        self.get_scope = get_scope
+        self.max_bytes = max_bytes
+        self.slots = threading.BoundedSemaphore(concurrent_requests)
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or scope.get("method") != "POST" or not path.startswith("/v1/audits/") or not path.endswith("/reviews"):
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", ()))
+        try:
+            content_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            await JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)(scope, receive, send)
+            return
+        if content_length < 0 or content_length > self.max_bytes:
+            await JSONResponse({"detail": "Review request is too large"}, status_code=413)(scope, receive, send)
+            return
+        if not self.slots.acquire(blocking=False):
+            await JSONResponse({"detail": "Review API capacity is busy"}, status_code=503, headers={"Retry-After": "1"})(scope, receive, send)
+            return
+        try:
+            try:
+                auth_scope = await self.get_scope(Request(scope, receive))
+            except HTTPException as error:
+                await JSONResponse({"detail": error.detail}, status_code=error.status_code)(scope, receive, send)
+                return
+            if auth_scope.role not in {"QA_ANALYST", "ADMIN"}:
+                await JSONResponse({"detail": "QA analyst permission required"}, status_code=403)(scope, receive, send)
+                return
+            scope.setdefault("state", {})["auth_scope"] = auth_scope
+            received = 0
+
+            async def limited_receive():
+                nonlocal received
+                message = await receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body", b""))
+                    if received > self.max_bytes:
+                        raise _RequestBodyTooLarge
+                return message
+
+            try:
+                await self.app(scope, limited_receive, send)
+            except _RequestBodyTooLarge:
+                await JSONResponse({"detail": "Review request is too large"}, status_code=413)(scope, receive, send)
+        finally:
+            self.slots.release()
+
+
 def create_app(
     settings: Settings,
     *,
@@ -162,12 +225,124 @@ def create_app(
         return {"csrf_token": csrf_token_for_session(session_token, settings.csrf_secret)}
 
     @app.get("/v1/calls/{call_id}")
-    async def get_call(call_id: str, scope: Scope = Depends(get_scope)) -> dict[str, str]:
+    def get_call(call_id: str, scope: Scope = Depends(get_scope)) -> dict:
         with connect() as connection:
-            record = connection.execute("SELECT id,organisation_id,agent_id,team_id,processing_state FROM calls WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (scope.organisation_id, call_id)).fetchone()
-        if record is None or not can_access(scope, str(record[1]), record[2], record[3]):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return {"id": str(record[0]), "processing_state": record[4]}
+            try:
+                return call_detail(connection, scope, call_id)
+            except ReviewNotFound as error:
+                raise HTTPException(status_code=404, detail="Call not found") from error
+
+    @app.get("/v1/reviews/queue")
+    def get_review_queue(limit: int = 50, scope: Scope = Depends(get_scope)) -> dict:
+        try:
+            with connect() as connection:
+                items = review_queue(connection, scope, limit=limit)
+        except ReviewForbidden as error:
+            raise HTTPException(status_code=403, detail="QA analyst permission required") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"items": items}
+
+    @app.post("/v1/calls/{call_id}/audio-access")
+    def grant_audio_access(call_id: str, request: Request, scope: Scope = Depends(get_scope)) -> dict:
+        try:
+            canonical_call_id = str(UUID(call_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=404, detail="Call not found") from None
+        if scope.role not in {"QA_ANALYST", "COMPLIANCE_OFFICER", "ADMIN"}:
+            raise HTTPException(status_code=403, detail="Analyst audio access required")
+        request_id = request.headers.get("X-Request-ID")
+        if request_id is not None and (not request_id or len(request_id) > 128):
+            raise HTTPException(status_code=400, detail="Invalid request identifier")
+        with connect() as connection:
+            with connection.transaction():
+                row = connection.execute(
+                    "SELECT a.id,a.private_key,a.codec,c.agent_id,c.team_id "
+                    "FROM calls c JOIN audio_objects a ON a.organisation_id=c.organisation_id AND a.call_id=c.id "
+                    "WHERE c.organisation_id=%s AND c.id=%s AND c.tombstoned_at IS NULL",
+                    (scope.organisation_id, canonical_call_id),
+                ).fetchone()
+                if row is None or not can_access(scope, scope.organisation_id, row[3], row[4]):
+                    raise HTTPException(status_code=404, detail="Call not found")
+                connection.execute(
+                    "INSERT INTO access_events(organisation_id,id,actor_id,action,resource_type,resource_id,outcome,request_id) "
+                    "VALUES (%s,%s,%s,'AUDIO_ACCESS_GRANTED','AUDIO_OBJECT',%s,'SUCCESS',%s)",
+                    (scope.organisation_id, uuid4(), scope.user_id, row[0], request_id),
+                )
+        capability = issue_audio_capability(scope, canonical_call_id, str(row[0]), settings.csrf_secret)
+        return {"url": f"/v1/calls/{canonical_call_id}/audio?capability={capability}", "expires_in_seconds": 60}
+
+    @app.get("/v1/calls/{call_id}/audio")
+    def stream_call_audio(call_id: str, capability: str, request: Request, scope: Scope = Depends(get_scope)):
+        try:
+            canonical_call_id = str(UUID(call_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=404, detail="Call not found") from None
+        audio_id = verify_audio_capability(capability, scope, canonical_call_id, settings.csrf_secret)
+        if audio_id is None:
+            raise HTTPException(status_code=403, detail="Audio capability is invalid or expired")
+        if scope.role not in {"QA_ANALYST", "COMPLIANCE_OFFICER", "ADMIN"}:
+            raise HTTPException(status_code=403, detail="Analyst audio access required")
+        with connect() as connection:
+            row = connection.execute(
+                "SELECT a.private_key,a.codec,c.agent_id,c.team_id,c.tombstoned_at "
+                "FROM calls c JOIN audio_objects a ON a.organisation_id=c.organisation_id AND a.call_id=c.id "
+                "WHERE c.organisation_id=%s AND c.id=%s AND a.id=%s",
+                (scope.organisation_id, canonical_call_id, audio_id),
+            ).fetchone()
+        if row is None or row[4] is not None or not can_access(scope, scope.organisation_id, row[2], row[3]):
+            raise HTTPException(status_code=404, detail="Call not found")
+        storage = LocalPrivateStorage(os.environ.get("AUDIO_STORAGE_PATH", "./private-audio"))
+        try:
+            size = storage.size(row[0], max_bytes=MAX_AUDIO_BYTES)
+        except (OSError, ValueError):
+            raise HTTPException(status_code=404, detail="Audio is unavailable") from None
+        if size == 0:
+            raise HTTPException(status_code=404, detail="Audio is unavailable")
+        start, end, status_code = 0, size - 1, 200
+        headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, no-store", "Content-Length": str(size)}
+        range_header = request.headers.get("Range")
+        if range_header:
+            if len(range_header) > 128:
+                raise HTTPException(status_code=416, detail="Invalid byte range", headers={"Content-Range": f"bytes */{size}"})
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match or (not match.group(1) and not match.group(2)):
+                raise HTTPException(status_code=416, detail="Invalid byte range", headers={"Content-Range": f"bytes */{size}"})
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            else:
+                suffix = int(match.group(2))
+                start = max(0, size - suffix)
+                end = size - 1
+            if start >= size or end < start:
+                raise HTTPException(status_code=416, detail="Range is not satisfiable", headers={"Content-Range": f"bytes */{size}"})
+            end = min(end, size - 1)
+            status_code = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+            headers["Content-Length"] = str(end - start + 1)
+        content_type = "audio/mpeg" if row[1] == "mp3" else "audio/wav"
+        return StreamingResponse(storage.iter_range(row[0], start, end), status_code=status_code, media_type=content_type, headers=headers)
+
+    @app.post("/v1/audits/{audit_id}/reviews", status_code=201)
+    def create_review(audit_id: str, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        if set(body) != {"action", "base_review_version", "scores", "reason"}:
+            raise HTTPException(status_code=422, detail="Review body fields are invalid")
+        try:
+            with connect() as connection:
+                review = append_review(
+                    connection, scope, audit_id, body["base_review_version"], body["action"], body["scores"], body["reason"],
+                    request_id=request.headers.get("X-Request-ID") if request else None,
+                )
+        except ReviewConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ReviewNotFound as error:
+            raise HTTPException(status_code=404, detail="Audit not found") from error
+        except ReviewForbidden as error:
+            raise HTTPException(status_code=403, detail="QA analyst permission required") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return review
 
     @app.get("/v1/calls/{call_id}/disposition")
     def get_disposition(call_id: str, scope: Scope = Depends(get_scope)) -> dict:
@@ -328,12 +503,21 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid audio") from error
         return result
 
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    if web_root.is_dir():
+        @app.get("/analyst", include_in_schema=False)
+        def analyst_home():
+            return FileResponse(web_root / "index.html")
+
+        app.mount("/analyst-assets", StaticFiles(directory=web_root), name="analyst-assets")
+
     limited_app = UploadBodyLimitMiddleware(app, max_bytes=MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES, get_scope=get_scope)
     limited_app = DispositionBodyLimitMiddleware(limited_app, get_scope=get_scope)
+    limited_app = ReviewBodyLimitMiddleware(limited_app, get_scope=get_scope)
     return CORSMiddleware(
         limited_app,
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-CSRF-Token", "X-Organisation-ID"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-CSRF-Token", "X-Organisation-ID", "X-Request-ID"],
     )

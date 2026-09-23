@@ -225,8 +225,9 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 | POST /v1/disposition-configs/{id}/versions/{version}/activate | Admin atomically changes the active pointer only to an independently approved version; prior versions/results remain immutable; 409 on stale pointer |
 | POST /v1/disposition-configs/{id}/versions/{version}/replay | Admin replays only synthetic or approved redacted fixtures; returns metrics without activating or changing historical calls |
 | POST /v1/disposition-configs/{id}/rollback | Admin atomically points to a previously active, independently approved immutable version; reason required; 409 on stale pointer |
-| POST /v1/calls/{id}/audio-access | Separate audio permission; logged short-lived playback URL, maximum 60-second validity |
-| POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE, base_review_version, reason and dimension scores; 201, or 409 on stale review |
+| POST /v1/calls/{id}/audio-access | QA_ANALYST/COMPLIANCE_OFFICER/ADMIN only; append access event before issuing a 60-second identity-bound URL |
+| GET /v1/calls/{id}/audio | Authenticated byte-range stream; rechecks role, tenant, call permission and tombstone for each request |
+| POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE/TRIAGE, base_review_version, reason and changed dimension scores; 201, or 409 on stale evidence/review |
 | GET /v1/events | Scoped SSE; Last-Event-ID resumes; expired cursor yields reset_required and client fetches snapshot |
 | GET /v1/me/scores | Agent's own reviewed scores and coaching notes; server derives identity |
 | GET /v1/reports/team | Scoped aggregates; sample count, period and rubric/model versions included |

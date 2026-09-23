@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import stat
 from uuid import uuid4
 
 
@@ -43,6 +44,34 @@ class LocalPrivateStorage:
         if len(data) > max_bytes:
             raise ValueError("audio object exceeds configured byte limit")
         return data
+
+    def size(self, key: str, *, max_bytes: int) -> int:
+        if Path(key).name != key or not key.endswith(".audio") or max_bytes <= 0:
+            raise ValueError("invalid storage key or byte limit")
+        target = self.root / key
+        if target.is_symlink():
+            raise ValueError("audio object must not be a symlink")
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            raise ValueError("audio object is not a bounded regular file")
+        return info.st_size
+
+    def iter_range(self, key: str, start: int, end: int, *, chunk_bytes: int = 256 * 1024):
+        """Yield a bounded byte range from a validated private object key."""
+        if Path(key).name != key or not key.endswith(".audio") or start < 0 or end < start or chunk_bytes <= 0:
+            raise ValueError("invalid storage key or byte range")
+        target = self.root / key
+        if target.is_symlink():
+            raise ValueError("audio object must not be a symlink")
+        with target.open("rb") as source:
+            source.seek(start)
+            remaining = end - start + 1
+            while remaining:
+                block = source.read(min(chunk_bytes, remaining))
+                if not block:
+                    return
+                remaining -= len(block)
+                yield block
 
     def delete_orphans(self, referenced: set[str], *, older_than: timedelta = timedelta(days=1)) -> int:
         cutoff = datetime.now(timezone.utc).timestamp() - older_than.total_seconds()
