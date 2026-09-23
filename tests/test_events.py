@@ -11,6 +11,7 @@ from uuid import uuid4
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.auth import Scope
 from app.events import (
@@ -69,8 +70,12 @@ class EventSSEEndpointTests(unittest.IsolatedAsyncioTestCase):
         composed = self.app
         while not hasattr(composed, "routes") and hasattr(composed, "app"):
             composed = composed.app
+        self.inner_app = composed
         self.endpoint = next(route.endpoint for route in composed.routes if getattr(route, "path", None) == "/v1/events")
         self.scope = Scope(str(uuid4()), "qa", "QA_ANALYST", frozenset())
+        async def current_scope(_request):
+            return self.scope
+        self.inner_app.state.refresh_scope = current_scope
         self.request = ConnectedRequest()
 
     async def test_route_resumes_after_last_event_id_and_emits_spec_envelope(self):
@@ -110,8 +115,75 @@ class EventSSEEndpointTests(unittest.IsolatedAsyncioTestCase):
             iterator = response.body_iterator
             chunk = await anext(iterator)
             self.assertIn("id: 10", chunk)
-            self.assertEqual(read.call_count, 1)
+            self.assertEqual(read.call_count, 2)
+            self.assertEqual(read.call_args.kwargs["limit"], 1)
             await iterator.aclose()
+
+    async def test_stream_revalidates_scope_before_each_delivery_and_stops_on_revocation(self):
+        event = {"sequence": 11, "schema_version": 1, "call_id": str(uuid4()), "type": "call.updated", "occurred_at": "2026-09-23T00:00:00Z", "payload": {"processing_state": "QUEUED", "transcript_revision": 0}}
+        calls = 0
+
+        async def refresh(_request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self.scope
+            if calls == 2:
+                return Scope(self.scope.organisation_id, self.scope.user_id, "TEAM_LEADER", frozenset({"changed-team"}))
+            raise HTTPException(status_code=401)
+
+        self.inner_app.state.refresh_scope = refresh
+        with patch("app.api.connect"), patch("app.api.read_events", return_value=[event]) as read:
+            response = self.endpoint(request=self.request, last_event_id="10", scope=self.scope)
+            with self.assertRaises(StopAsyncIteration):
+                await anext(response.body_iterator)
+        self.assertEqual(calls, 3)
+        self.assertEqual(read.call_count, 2)
+
+    async def test_fresh_scope_dependency_ignores_cached_membership_and_checks_token_expiry(self):
+        import time
+
+        import jwt
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from app.auth import scope_dependency
+        from app.config import Settings
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        settings = Settings(
+            oidc_issuer="https://issuer.example.test",
+            oidc_audience="call-audit-test",
+            oidc_public_key=public_key,
+            csrf_secret="test-only-csrf-secret-long-enough-for-settings",
+            allowed_origins=("http://localhost:3000",),
+        )
+        membership = [self.scope]
+        cached_scope = scope_dependency(settings, lambda _subject: membership[0])
+        fresh_scope = scope_dependency(settings, lambda _subject: membership[0], cache_scope=False)
+
+        def request_with_token(token):
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return Request({
+                "type": "http", "method": "GET", "path": "/v1/events", "query_string": b"",
+                "headers": [(b"authorization", f"Bearer {token}".encode()), (b"x-organisation-id", self.scope.organisation_id.encode())],
+                "server": ("localhost", 80), "client": ("127.0.0.1", 1), "scheme": "http",
+            }, receive)
+
+        claims = {"iss": settings.oidc_issuer, "aud": settings.oidc_audience, "sub": "subject", "exp": int(time.time()) + 60}
+        token = jwt.encode(claims, private_key, algorithm="RS256")
+        request = request_with_token(token)
+        self.assertEqual(await cached_scope(request), self.scope)
+        membership[0] = None
+        with self.assertRaises(HTTPException) as revoked:
+            await fresh_scope(request)
+        self.assertEqual(revoked.exception.status_code, 401)
+
+        expired = jwt.encode({**claims, "exp": int(time.time()) - 1}, private_key, algorithm="RS256")
+        with self.assertRaises(HTTPException) as expiry:
+            await fresh_scope(request_with_token(expired))
+        self.assertEqual(expiry.exception.status_code, 401)
 
 
 @unittest.skipUnless(os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
@@ -211,6 +283,21 @@ class EventOutboxPostgresTests(unittest.TestCase):
             last = connection.execute("SELECT last_sequence FROM event_counters WHERE organisation_id=%s", (self.org_a,)).fetchone()[0]
         self.assertEqual(rows, [])
         self.assertEqual(last, 3)
+
+    def test_tenant_event_history_is_bounded_and_old_cursors_expire(self):
+        scope = Scope(self.org_a, "qa", "QA_ANALYST", frozenset())
+        with patch("app.events.MAX_EVENT_HISTORY", 3), self.connect() as connection:
+            for _ in range(5):
+                append_call_updated(connection, self.org_a, self.call_a1, "ANALYSING", 1)
+            rows = connection.execute("SELECT sequence FROM events WHERE organisation_id=%s ORDER BY sequence", (self.org_a,)).fetchall()
+            counter = connection.execute("SELECT last_sequence,oldest_sequence FROM event_counters WHERE organisation_id=%s", (self.org_a,)).fetchone()
+            self.assertEqual(connection.execute("SELECT oldest_sequence FROM event_counters WHERE organisation_id=%s", (self.org_b,)).fetchone()[0], 1)
+            with self.assertRaises(EventCursorExpired):
+                read_events(connection, scope, 4)
+            retained = read_events(connection, scope, 5)
+        self.assertEqual(rows, [(6,), (7,), (8,)])
+        self.assertEqual(counter, (8, 6))
+        self.assertEqual([event["sequence"] for event in retained], [6, 7, 8])
 
     def test_retry_and_exhausted_lease_state_events_share_the_state_transaction(self):
         retry_call, retry_job_id = str(uuid4()), str(uuid4())

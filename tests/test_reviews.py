@@ -57,6 +57,8 @@ class ReviewPersistenceIntegrationTests(unittest.TestCase):
             first = append_review(connection, qa, str(audit_id), 0, "ACCEPT", {}, "Verified synthetic evidence")
             self.assertEqual(first["version"], 1)
             self.assertEqual(first["effective_score"], 3.0)
+            event = connection.execute("SELECT type,payload FROM events WHERE organisation_id=%s AND call_id=%s ORDER BY sequence DESC LIMIT 1", (organisation_id, call_id)).fetchone()
+            self.assertEqual(event, ("call.updated", {"processing_state": "NEEDS_REVIEW", "transcript_revision": 1}))
             with self.assertRaises(ReviewConflict):
                 append_review(connection, qa, str(audit_id), 0, "OVERRIDE", {"clarity": 2}, "Stale review")
             stored = connection.execute("SELECT overall_score,decision FROM audits WHERE organisation_id=%s AND id=%s", (organisation_id, audit_id)).fetchone()
@@ -86,6 +88,8 @@ class ReviewPersistenceIntegrationTests(unittest.TestCase):
             self.assertEqual(second["effective_scores"]["clarity"], 2)
             self.assertEqual(second["effective_score"], 3.4)
             self.assertEqual(connection.execute("SELECT overall_score FROM audits WHERE organisation_id=%s AND id=%s", (organisation_id, audit_id)).fetchone()[0], machine["overall_score"])
+            events = connection.execute("SELECT payload FROM events WHERE organisation_id=%s AND call_id=%s ORDER BY sequence", (organisation_id, call_id)).fetchall()
+            self.assertEqual([event[0] for event in events], [{"processing_state": "NEEDS_REVIEW", "transcript_revision": 1}] * 2)
 
     def test_nondefault_rubric_threshold_is_persisted_for_review_recomputation(self):
         organisation_id, _, audit_id, _ = self.create_audit()
@@ -105,6 +109,8 @@ class ReviewPersistenceIntegrationTests(unittest.TestCase):
             queued = review_queue(connection, qa)
             with self.assertRaises(ReviewConflict):
                 append_review(connection, qa, str(audit_id), 1, "TRIAGE", {}, "Duplicate acknowledgement")
+            event = connection.execute("SELECT type,payload FROM events WHERE organisation_id=%s AND call_id=%s ORDER BY sequence DESC LIMIT 1", (organisation_id, call_id)).fetchone()
+            self.assertEqual(event, ("call.updated", {"processing_state": "NEEDS_REVIEW", "transcript_revision": 1}))
         self.assertEqual(result["action"], "TRIAGE")
         self.assertIsNone(result["effective_score"])
         self.assertEqual(result["effective_decision"], "NEEDS_REVIEW")

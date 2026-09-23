@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from app.audit import DIMENSION_IDS, weighted_score
 from app.auth import Scope, can_access
+from app.events import append_call_updated
 
 
 class ReviewConflict(ValueError):
@@ -64,7 +65,7 @@ def append_review(
     with connection.transaction():
         row = connection.execute(
             "SELECT a.call_id,a.revision,a.transcript_revision,a.dimensions_json,a.overall_score,a.decision,a.pass_threshold,"
-            "c.agent_id,c.team_id,c.transcript_revision,c.tombstoned_at,"
+            "c.agent_id,c.team_id,c.transcript_revision,c.tombstoned_at,c.processing_state,"
             "(SELECT max(revision) FROM audits current WHERE current.organisation_id=a.organisation_id AND current.call_id=a.call_id) "
             "FROM audits a JOIN calls c ON c.organisation_id=a.organisation_id AND c.id=a.call_id "
             "WHERE a.organisation_id=%s AND a.id=%s FOR UPDATE OF a,c",
@@ -72,7 +73,7 @@ def append_review(
         ).fetchone()
         if row is None or row[10] is not None or not can_access(scope, scope.organisation_id, row[7], row[8]):
             raise ReviewNotFound("Audit not found")
-        if row[2] != row[9] or row[1] != row[11]:
+        if row[2] != row[9] or row[1] != row[12]:
             raise ReviewConflict("Audit evidence is superseded; reload the current transcript")
         head = connection.execute(
             "SELECT version,effective_scores_json,effective_score,effective_decision,action FROM reviews "
@@ -148,6 +149,7 @@ def append_review(
             "VALUES (%s,%s,%s,'REVIEW_SAVED','AUDIT_REVIEW',%s,'SUCCESS',%s)",
             (scope.organisation_id, uuid4(), scope.user_id, audit_uuid, request_id),
         )
+        append_call_updated(connection, scope.organisation_id, str(row[0]), row[11], row[9])
     return {
         "id": str(review_uuid), "audit_id": str(audit_uuid), "version": version,
         "base_review_version": base_review_version, "reviewer_id": scope.user_id,

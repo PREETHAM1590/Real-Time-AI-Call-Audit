@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+from app.events import purge_call_events
+
 MAX_RETENTION_BATCH = 100
 MAX_AUDIO_OBJECTS_PER_CALL = 16
 
@@ -150,6 +152,7 @@ def purge_call(connection, organisation_id: str, call_id: str, storage, *, now: 
 
         # Keep the call row locked from hold verification through object deletion,
         # so a concurrent hold cannot race past this decision point.
+        purge_call_events(connection, str(org), str(call))
         for object_row in object_rows:
             storage.delete(object_row[0])
         connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (org, call))

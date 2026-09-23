@@ -77,11 +77,11 @@ def csrf_token_for_session(session_token: str, secret: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def scope_dependency(settings: Settings, identity_lookup: IdentityLookup | None = None):
+def scope_dependency(settings: Settings, identity_lookup: IdentityLookup | None = None, *, cache_scope: bool = True):
     """Validate an OIDC token and resolve its authority from the identity store."""
 
     async def get_scope(request: Request) -> Scope:
-        cached = request.scope.get("state", {}).get("auth_scope")
+        cached = request.scope.get("state", {}).get("auth_scope") if cache_scope else None
         if cached is not None:
             return cached
 
@@ -139,7 +139,8 @@ def scope_dependency(settings: Settings, identity_lookup: IdentityLookup | None 
             if origin not in settings.allowed_origins or not hmac.compare_digest(supplied, expected):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
 
-        request.scope.setdefault("state", {})["auth_scope"] = scope
+        if cache_scope:
+            request.scope.setdefault("state", {})["auth_scope"] = scope
         return scope
 
     return get_scope

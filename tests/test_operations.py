@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from app.db import connect
+from app.auth import Scope
+from app.events import EventCursorExpired, append_call_updated, read_events
 from app.migrate import migrate
 from app.retention import RetentionError, due_for_deletion, purge_call, request_call_deletion, tombstone_expired_calls
 from app.evaluate import evaluate_dataset, evaluate_records, precision_recall
@@ -163,6 +165,8 @@ class RetentionPostgresTests(unittest.TestCase):
             )
             requested = request_call_deletion(connection, str(organisation_id), str(call_id), "admin-user", now=datetime(2026, 9, 23, tzinfo=timezone.utc))
             self.assertEqual(requested["status"], "TOMBSTONED")
+            append_call_updated(connection, str(organisation_id), str(call_id), "DELETING", 0)
+            append_call_updated(connection, str(organisation_id), str(call_id), "DELETING", 0)
             row = connection.execute("SELECT tombstoned_at,processing_state FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id)).fetchone()
             job = connection.execute("SELECT state,last_error_code FROM jobs WHERE organisation_id=%s AND id=%s", (organisation_id, job_id)).fetchone()
             self.assertIsNotNone(row[0])
@@ -172,6 +176,10 @@ class RetentionPostgresTests(unittest.TestCase):
             repeated = purge_call(connection, str(organisation_id), str(call_id), storage, now=datetime(2026, 9, 23, tzinfo=timezone.utc))
             self.assertEqual(result["status"], "PARTIAL_IMMUTABLE_HISTORY")
             self.assertEqual(repeated["status"], "ALREADY_PURGED")
+            self.assertEqual(connection.execute("SELECT count(*) FROM events WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT oldest_sequence FROM event_counters WHERE organisation_id=%s", (organisation_id,)).fetchone()[0], 3)
+            with self.assertRaises(EventCursorExpired):
+                read_events(connection, Scope(str(organisation_id), "qa", "QA_ANALYST", frozenset()), 0)
             call = connection.execute("SELECT processing_state,agent_id,team_id,content_purged_at FROM calls WHERE organisation_id=%s AND id=%s", (organisation_id, call_id)).fetchone()
             self.assertEqual(call, ("DELETED", "[deleted]", "[deleted]", call[3]))
             self.assertIsNotNone(call[3])

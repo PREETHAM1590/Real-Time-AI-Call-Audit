@@ -7,6 +7,8 @@ from app.auth import Scope, can_access
 
 MAX_EVENT_SEQUENCE = 9_223_372_036_854_775_807
 MAX_EVENT_BATCH = 100
+# ponytail: keep 10k tenant events; older cursors reload the current snapshot.
+MAX_EVENT_HISTORY = 10_000
 _CALL_STATES = frozenset({"QUEUED", "TRANSCRIBING", "ANALYSING", "AUDITING", "READY", "RETRY_WAIT", "NEEDS_REVIEW", "FAILED", "DELETING", "DELETED"})
 _READ_ROLES = frozenset({"AGENT", "TEAM_LEADER", "QA_ANALYST", "COMPLIANCE_OFFICER", "ADMIN"})
 
@@ -56,7 +58,49 @@ def append_call_updated(connection, organisation_id: str, call_id: str, processi
         "VALUES (%s,%s,%s,'call.updated',1,%s::jsonb)",
         (organisation_id, sequence, call_id, json.dumps(payload, separators=(",", ":"))),
     )
+    oldest = int(connection.execute(
+        "SELECT oldest_sequence FROM event_counters WHERE organisation_id=%s FOR UPDATE",
+        (organisation_id,),
+    ).fetchone()[0])
+    cutoff = connection.execute(
+        "SELECT sequence FROM events WHERE organisation_id=%s ORDER BY sequence DESC OFFSET %s LIMIT 1",
+        (organisation_id, MAX_EVENT_HISTORY - 1),
+    ).fetchone()
+    if cutoff is not None:
+        oldest = max(oldest, int(cutoff[0]))
+    connection.execute("DELETE FROM events WHERE organisation_id=%s AND sequence<%s", (organisation_id, oldest))
+    connection.execute(
+        "UPDATE event_counters SET oldest_sequence=%s WHERE organisation_id=%s AND oldest_sequence<%s",
+        (oldest, organisation_id, oldest),
+    )
     return sequence
+
+
+def purge_call_events(connection, organisation_id: str, call_id: str) -> int:
+    """Remove a purged call's refresh history and expire cursors that could contain it."""
+    counter = connection.execute(
+        "SELECT oldest_sequence FROM event_counters WHERE organisation_id=%s::uuid FOR UPDATE",
+        (organisation_id,),
+    ).fetchone()
+    if counter is None:
+        return 0
+    latest_removed = connection.execute(
+        "SELECT max(sequence) FROM events WHERE organisation_id=%s::uuid AND call_id=%s::uuid",
+        (organisation_id, call_id),
+    ).fetchone()[0]
+    if latest_removed is None:
+        return 0
+    deleted = connection.execute(
+        "DELETE FROM events WHERE organisation_id=%s::uuid AND call_id=%s::uuid",
+        (organisation_id, call_id),
+    ).rowcount
+    oldest = max(int(counter[0]), int(latest_removed) + 1)
+    connection.execute("DELETE FROM events WHERE organisation_id=%s::uuid AND sequence<%s", (organisation_id, oldest))
+    connection.execute(
+        "UPDATE event_counters SET oldest_sequence=%s WHERE organisation_id=%s::uuid AND oldest_sequence<%s",
+        (oldest, organisation_id, oldest),
+    )
+    return deleted
 
 
 def read_events(connection, scope: Scope, after_sequence: int, limit: int = 100) -> list[dict]:

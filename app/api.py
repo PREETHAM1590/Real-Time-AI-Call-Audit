@@ -217,6 +217,7 @@ def create_app(
     """Create the API with OIDC validation and server-owned scope lookups."""
     app = FastAPI()
     get_scope = scope_dependency(settings, identity_lookup)
+    app.state.refresh_scope = scope_dependency(settings, identity_lookup, cache_scope=False)
     report_redactor = report_redactor or redact_text
     if disposition_adapter is None and os.environ.get("DISPOSITION_MODEL_SHA256"):
         disposition_adapter = LocalVllmDispositionAdapter.from_environment()
@@ -249,16 +250,15 @@ def create_app(
         except EventCursorError as error:
             raise HTTPException(status_code=400, detail="Invalid event cursor") from error
 
-        def load_batch(after: int) -> list[dict]:
+        def load_batch(after: int, current_scope: Scope) -> list[dict]:
             with connect() as connection:
-                return read_events(connection, scope, after, limit=100)
+                return read_events(connection, current_scope, after, limit=1)
 
         reset_event = None
         try:
-            first_batch = load_batch(cursor)
+            load_batch(cursor, scope)
         except EventCursorExpired as error:
             reset_event = reset_required_event(error.latest_sequence)
-            first_batch = []
         except EventCursorError as error:
             raise HTTPException(status_code=400, detail="Event cursor is ahead of the stream") from error
         except EventForbidden as error:
@@ -266,28 +266,45 @@ def create_app(
 
         async def stream():
             current_cursor = cursor
-            pending = [reset_event] if reset_event is not None else first_batch
-            for envelope in pending:
+            if reset_event is not None:
+                try:
+                    await app.state.refresh_scope(request)
+                except HTTPException:
+                    return
                 if await request.is_disconnected():
                     return
-                yield encode_sse(envelope)
-                current_cursor = envelope["sequence"]
+                yield encode_sse(reset_event)
+                current_cursor = reset_event["sequence"]
             while True:
                 if await request.is_disconnected():
                     return
                 try:
-                    batch = await run_in_threadpool(load_batch, current_cursor)
+                    current_scope = await app.state.refresh_scope(request)
+                    batch = await run_in_threadpool(load_batch, current_cursor, current_scope)
                 except EventCursorExpired as error:
                     envelope = reset_required_event(error.latest_sequence)
-                    yield encode_sse(envelope)
-                    current_cursor = envelope["sequence"]
-                    continue
-                for envelope in batch:
-                    if await request.is_disconnected():
+                    try:
+                        await app.state.refresh_scope(request)
+                    except HTTPException:
                         return
                     yield encode_sse(envelope)
                     current_cursor = envelope["sequence"]
-                if not batch:
+                    continue
+                except (HTTPException, EventForbidden, EventCursorError):
+                    return
+                if batch:
+                    try:
+                        verified_scope = await app.state.refresh_scope(request)
+                    except HTTPException:
+                        return
+                    if verified_scope != current_scope:
+                        continue
+                    if await request.is_disconnected():
+                        return
+                    envelope = batch[0]
+                    yield encode_sse(envelope)
+                    current_cursor = envelope["sequence"]
+                else:
                     await asyncio.sleep(1)
                     if await request.is_disconnected():
                         return
