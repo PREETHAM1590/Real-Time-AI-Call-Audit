@@ -80,6 +80,14 @@ class EvaluationTests(unittest.TestCase):
             dataset.write_text(json.dumps({**record, "transcript": "never accept raw text"}) + "\n", encoding="utf-8")
             invalid = subprocess.run(command + [str(second)], capture_output=True, text=True, check=False)
             self.assertEqual(invalid.returncode, 2)
+            huge_integer_line = (
+                '{"case_id":"case-huge","excluded":false,"abstained":false,"gold_findings":[],"predicted_findings":[],'
+                '"gold_dimensions":{"clarity":' + ("9" * 5000) + '},"predicted_dimensions":{}}\n'
+            )
+            dataset.write_text(huge_integer_line, encoding="utf-8")
+            huge = subprocess.run(command + [str(second)], capture_output=True, text=True, check=False)
+            self.assertEqual(huge.returncode, 2)
+            self.assertNotIn("Traceback", huge.stderr)
 
     def test_checked_in_synthetic_golden_fixture_records_critical_miss_and_abstention(self):
         fixture = Path(__file__).parent / "fixtures" / "golden.jsonl"
@@ -99,7 +107,7 @@ class RetentionPostgresTests(unittest.TestCase):
             raise RuntimeError("Refusing retention integration tests without isolated DATABASE_URL ending in _test")
         migrate()
 
-    def make_call(self, *, held=False, expires_at=None):
+    def make_call(self, *, held=False, expires_at=None, with_audit=True):
         organisation_id, call_id, audio_id = uuid4(), uuid4(), uuid4()
         storage = LocalPrivateStorage(Path(tempfile.gettempdir()) / f"call-audit-retention-{uuid4().hex}")
         storage_key = storage.put(b"synthetic audio bytes")
@@ -122,19 +130,20 @@ class RetentionPostgresTests(unittest.TestCase):
                 "VALUES (%s,%s,1,'u1','s1','speaker-1','AGENT',0,100,'Synthetic redacted text.',0.9,'test-v1')",
                 (organisation_id, call_id),
             )
-            audit_id = uuid4()
-            dimensions = [{"id": "greeting", "status": "SCORED", "score": 3, "reason": "Synthetic redacted evidence", "evidence": []}]
-            scores = {"greeting": 3}
-            connection.execute(
-                "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms,pass_threshold) "
-                "VALUES (%s,%s,%s,1,1,'synthetic','synthetic','prompt-v1',%s,'rubric-v1',%s,'[]'::jsonb,%s,%s::jsonb,3,'PASS','{}'::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,1,1,3)",
-                (organisation_id, audit_id, call_id, "b" * 64, "c" * 64, "d" * 64, json.dumps(dimensions)),
-            )
-            connection.execute(
-                "INSERT INTO reviews(organisation_id,id,audit_id,call_id,audit_revision,version,base_review_version,reviewer_id,action,changed_scores_json,effective_scores_json,effective_score,effective_decision,reason) "
-                "VALUES (%s,%s,%s,%s,1,1,0,'reviewer','ACCEPT','{}'::jsonb,%s::jsonb,3,'PASS','Synthetic restricted review reason')",
-                (organisation_id, uuid4(), audit_id, call_id, json.dumps(scores)),
-            )
+            if with_audit:
+                audit_id = uuid4()
+                dimensions = [{"id": "greeting", "status": "SCORED", "score": 3, "reason": "Synthetic redacted evidence", "evidence": []}]
+                scores = {"greeting": 3}
+                connection.execute(
+                    "INSERT INTO audits(organisation_id,id,call_id,revision,transcript_revision,model_artifact,inference_runtime,prompt_version,prompt_hash,rubric_version,rubric_hash,policy_provenance,policy_fingerprint,dimensions_json,overall_score,decision,coaching_narrative,highlights,improvement_areas,usage_json,attempts,latency_ms,pass_threshold) "
+                    "VALUES (%s,%s,%s,1,1,'synthetic','synthetic','prompt-v1',%s,'rubric-v1',%s,'[]'::jsonb,%s,%s::jsonb,3,'PASS','{}'::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,1,1,3)",
+                    (organisation_id, audit_id, call_id, "b" * 64, "c" * 64, "d" * 64, json.dumps(dimensions)),
+                )
+                connection.execute(
+                    "INSERT INTO reviews(organisation_id,id,audit_id,call_id,audit_revision,version,base_review_version,reviewer_id,action,changed_scores_json,effective_scores_json,effective_score,effective_decision,reason) "
+                    "VALUES (%s,%s,%s,%s,1,1,0,'reviewer','ACCEPT','{}'::jsonb,%s::jsonb,3,'PASS','Synthetic restricted review reason')",
+                    (organisation_id, uuid4(), audit_id, call_id, json.dumps(scores)),
+                )
         return organisation_id, call_id, job_id, storage, storage_key
 
     def test_tombstone_precedes_bounded_purge_and_is_idempotent(self):
@@ -167,7 +176,7 @@ class RetentionPostgresTests(unittest.TestCase):
             ).fetchall()
             event_details = {row[0]: row[1] for row in events}
             self.assertEqual(set(event_details), {"CALL_DELETION_REQUESTED", "CALL_CONTENT_PURGED"})
-            self.assertEqual(event_details["CALL_CONTENT_PURGED"], {"retained_immutable_history": {"audits": 1, "reviews": 1, "dispositions": 0}})
+            self.assertEqual(event_details["CALL_CONTENT_PURGED"], {"retained_immutable_history": {"audits": 1, "reviews": 1, "dispositions": 0, "access_events": 2}})
 
     def test_hold_and_not_due_calls_are_not_physically_purged(self):
         organisation_id, call_id, _, storage, storage_key = self.make_call(held=True, expires_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
@@ -216,6 +225,17 @@ class RetentionPostgresTests(unittest.TestCase):
                 17,
             )
         self.assertTrue(all(Path(storage.root / key).exists() for key in [first_key, *extra_keys]))
+
+    def test_no_audit_purge_still_reports_retained_call_access_history(self):
+        organisation_id, call_id, _, storage, _ = self.make_call(with_audit=False)
+        with connect() as connection:
+            request_call_deletion(connection, str(organisation_id), str(call_id), "admin-user")
+            result = purge_call(connection, str(organisation_id), str(call_id), storage)
+        self.assertEqual(result["status"], "PARTIAL_IMMUTABLE_HISTORY")
+        self.assertEqual(
+            result["immutable_records_retained"],
+            {"audits": 0, "reviews": 0, "dispositions": 0, "access_events": 2},
+        )
 
     def test_running_worker_cannot_commit_after_deletion_tombstone(self):
         from app.ingest import finish_job

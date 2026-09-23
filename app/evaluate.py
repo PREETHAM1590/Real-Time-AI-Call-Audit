@@ -178,7 +178,7 @@ def load_dataset(path: str | Path) -> tuple[list[dict[str, Any]], str]:
             raise EvaluationInputError(f"dataset exceeds {MAX_DATASET_CASES} case limit")
         try:
             value = json.loads(line)
-        except (json.JSONDecodeError, RecursionError) as error:
+        except (ValueError, RecursionError) as error:
             raise EvaluationInputError(f"line {line_number} is not valid JSON") from error
         records.append(value)
     # Validate once before evaluation so malformed input produces no partial report.
