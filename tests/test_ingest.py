@@ -126,9 +126,16 @@ class PostgresIngestTests(unittest.TestCase):
         self.assertEqual(raced, [first, first])
         with self.assertRaises(IdempotencyConflict):
             accept_recording(self.scope, "ext-1", data + b"x", {"agent_id": "agent-test", "team_id": "team-test"}, "idem-1", storage=self.storage)
+        with self.assertRaises(IdempotencyConflict):
+            accept_recording(self.scope, "ext-1", data, {"language": "en"}, "idem-1", storage=self.storage)
         with self.assertRaises(ExternalReferenceConflict):
             accept_recording(self.scope, "ext-1", data, {}, "new-idem-key", storage=self.storage)
         self.assertEqual(accept_recording(self.scope, "ext-1", data, {}, "idem-1", storage=self.storage), first)
+
+        second = accept_recording(self.scope, "ext-2", data, {}, "idem-2", storage=self.storage)
+        self.created_call_ids.add(second["id"])
+        with self.assertRaises(IdempotencyConflict):
+            accept_recording(self.scope, "ext-2", data, {}, "idem-1", storage=self.storage)
 
         def race_external_reference(idempotency_key):
             try:

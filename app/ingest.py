@@ -106,14 +106,16 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
             with connection.transaction():
                 inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, scope.user_id if scope.role == "AGENT" else "", next(iter(scope.team_ids)) if scope.role == "AGENT" and len(scope.team_ids) == 1 else "", language)).fetchone()
                 if inserted is None:
-                    existing = connection.execute("SELECT id,payload_sha256,processing_state,idempotency_key FROM calls WHERE organisation_id=%s AND (idempotency_key=%s OR external_ref=%s) ORDER BY (idempotency_key=%s) DESC LIMIT 1", (scope.organisation_id, idempotency_key, external_ref, idempotency_key)).fetchone()
-                    if existing is None:
-                        raise IntakeError("Call reference already exists")
-                    if existing[3] != idempotency_key:
+                    existing = connection.execute("SELECT id,payload_sha256,processing_state,external_ref,language FROM calls WHERE organisation_id=%s AND idempotency_key=%s", (scope.organisation_id, idempotency_key)).fetchone()
+                    if existing is not None:
+                        if existing[3] != external_ref or existing[4] != language or existing[1] != checksum:
+                            raise IdempotencyConflict("Idempotency key reused with different upload details")
+                        result = {"id": str(existing[0]), "processing_state": existing[2]}
+                    else:
+                        existing = connection.execute("SELECT id FROM calls WHERE organisation_id=%s AND external_ref=%s", (scope.organisation_id, external_ref)).fetchone()
+                        if existing is None:
+                            raise IntakeError("Call reference already exists")
                         raise ExternalReferenceConflict("External reference already exists")
-                    if existing[1] != checksum:
-                        raise IdempotencyConflict("Idempotency key reused with different audio")
-                    result = {"id": str(existing[0]), "processing_state": existing[2]}
                 else:
                     connection.execute("INSERT INTO audio_objects(organisation_id,id,call_id,private_key,checksum,codec,sample_rate,channels,duration_ms) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (scope.organisation_id, audio_id, call_id, key, checksum, codec, rate, channels, duration))
                     connection.execute("INSERT INTO jobs(organisation_id,id,call_id,stage,state) VALUES (%s,%s,%s,'TRANSCRIBE','QUEUED')", (scope.organisation_id, job_id, call_id))

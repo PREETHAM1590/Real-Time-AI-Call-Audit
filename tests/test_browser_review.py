@@ -27,6 +27,55 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 @unittest.skipIf(sync_playwright is None, "Install the optional browser-test extra and Chromium to run the browser check")
 class AnalystBrowserSmokeTests(unittest.TestCase):
+    def test_upload_conflicts_show_distinct_recovery_messages(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        uploads = []
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+
+                def handle_api(route):
+                    path = urlsplit(route.request.url).path
+                    if path == "/v1/csrf":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({"csrf_token": "synthetic-csrf"}))
+                    elif path == "/v1/reviews/queue":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({"items": []}))
+                    elif path == "/v1/calls" and route.request.method == "POST":
+                        uploads.append(route.request.headers.get("idempotency-key"))
+                        detail = "External reference already exists" if b"taken-reference" in route.request.post_data_buffer else "Idempotency key conflicts with existing upload"
+                        route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": detail}))
+                    else:
+                        route.fulfill(status=404, content_type="application/json", body="{}")
+
+                page.route("**/v1/**", handle_api)
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                page.get_by_label("External reference").fill("taken-reference")
+                page.get_by_label("Language").fill("en")
+                page.locator("#upload-audio").set_input_files({"name": "synthetic.wav", "mimeType": "audio/wav", "buffer": b"synthetic wav fixture"})
+                page.get_by_role("button", name="Upload recording").click()
+                page.get_by_text("That external reference is already in use. Choose a different reference.").wait_for()
+
+                page.get_by_label("External reference").fill("key-conflict-reference")
+                page.get_by_role("button", name="Upload recording").click()
+                page.get_by_text("This upload key conflicts with a prior request. Retry the original unchanged upload, or edit the form to start a new upload.").wait_for()
+                self.assertEqual(len(uploads), 2)
+                self.assertNotEqual(uploads[0], uploads[1])
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_upload_disables_form_until_delayed_response_and_rejects_other_extensions(self):
         web_root = Path(__file__).resolve().parent.parent / "web"
         uploads = []

@@ -19,7 +19,7 @@ from app.api import MULTIPART_OVERHEAD_BYTES, UploadBodyLimitMiddleware, create_
 from app.config import Settings
 from app.contracts import PersistedUtterance, Utterance
 from app.db import connect
-from app.ingest import ExternalReferenceConflict, MAX_AUDIO_BYTES
+from app.ingest import ExternalReferenceConflict, IdempotencyConflict, MAX_AUDIO_BYTES
 from app.migrate import migrate
 from app.reviews import ReviewNotFound
 
@@ -320,6 +320,16 @@ class ApiContractTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"detail": "External reference already exists"})
+
+        with patch("app.api.accept_recording", side_effect=IdempotencyConflict("Idempotency key reused with different upload details")):
+            key_conflict = self.client.post(
+                "/v1/calls",
+                headers={**headers, "Idempotency-Key": "request-key-conflict"},
+                files={"audio": ("call.wav", b"synthetic", "audio/wav")},
+                data={"external_ref": "different-reference", "language": "en"},
+            )
+        self.assertEqual(key_conflict.status_code, 409)
+        self.assertEqual(key_conflict.json(), {"detail": "Idempotency key conflicts with existing upload"})
 
         too_long = self.client.post(
             "/v1/calls",

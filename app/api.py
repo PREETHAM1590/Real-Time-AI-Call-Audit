@@ -677,7 +677,7 @@ def create_app(
         except ExternalReferenceConflict as error:
             raise HTTPException(status_code=409, detail="External reference already exists") from error
         except IdempotencyConflict as error:
-            raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing audio") from error
+            raise HTTPException(status_code=409, detail="Idempotency key conflicts with existing upload") from error
         except IntakeError as error:
             raise HTTPException(status_code=400, detail="Invalid audio") from error
         return result

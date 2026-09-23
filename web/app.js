@@ -344,9 +344,11 @@ uploadForm.addEventListener("submit", async (event) => {
     uploadForm.reset();
     uploadStatusText(`Call ${result.id} is queued for processing.`);
   } catch (error) {
-    uploadStatusText(error.status === 409
-      ? "That external reference is already in use. Choose a new reference, or retry the unchanged upload."
-      : error.message, true);
+    const conflictMessage = error.status !== 409 ? null
+      : error.message === "External reference already exists"
+        ? "That external reference is already in use. Choose a different reference."
+        : "This upload key conflicts with a prior request. Retry the original unchanged upload, or edit the form to start a new upload.";
+    uploadStatusText(conflictMessage || error.message, true);
   } finally {
     for (const control of uploadForm.elements) control.disabled = false;
   }
