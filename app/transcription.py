@@ -44,7 +44,12 @@ def _field(segment: Any, name: str, default=None):
     return getattr(segment, name, default)
 
 
-def normalise_segments(response: dict, channel_roles: dict[int, str]) -> list[dict]:
+def normalise_segments(
+    response: dict,
+    channel_roles: Mapping[int, str],
+    *,
+    channel_index: int | None = None,
+) -> list[dict]:
     """Convert local model segments to bounded call-relative values.
 
     Channel metadata is trusted only when supplied by the authenticated media
@@ -66,14 +71,15 @@ def normalise_segments(response: dict, channel_roles: dict[int, str]) -> list[di
             raise TranscriptionError("Local model returned invalid segment timing") from None
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start or end * 1000 > MAX_DURATION_MS:
             raise TranscriptionError("Local model returned invalid segment timing")
-        channel = _field(segment, "channel")
-        explicit_speaker = _field(segment, "speaker_id")
-        if channel is not None and isinstance(channel, int):
-            candidate_role = channel_roles.get(channel, "UNKNOWN")
-            speaker_id = f"channel-{channel}"
+        if channel_index is not None:
+            candidate_role = channel_roles.get(channel_index, "UNKNOWN")
+            speaker_id = f"channel-{channel_index}"
+            source_segment_id = _field(segment, "id", f"segment-{index}")
+            segment_id = f"channel-{channel_index}:{source_segment_id}"
         else:
             candidate_role = "UNKNOWN"
-            speaker_id = str(explicit_speaker) if isinstance(explicit_speaker, str) and explicit_speaker else "mono-unknown"
+            speaker_id = "mono-unknown"
+            segment_id = str(_field(segment, "id", f"segment-{index}"))
         role = candidate_role if candidate_role in {"AGENT", "CUSTOMER", "IVR"} else "UNKNOWN"
         confidence = _field(segment, "confidence")
         if confidence is not None:
@@ -84,7 +90,7 @@ def normalise_segments(response: dict, channel_roles: dict[int, str]) -> list[di
             if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
                 confidence = None
         result.append({
-            "segment_id": str(_field(segment, "id", f"segment-{index}")),
+            "segment_id": segment_id,
             "speaker_id": speaker_id[:128],
             "role": role,
             "start_ms": round(start * 1000),
@@ -93,6 +99,47 @@ def normalise_segments(response: dict, channel_roles: dict[int, str]) -> list[di
             "confidence": confidence,
         })
     return result
+
+
+def _decode_audio_channels(audio: bytes, channels: int):
+    """Decode mono/stereo audio to separate 16 kHz float32 streams using local PyAV."""
+    if channels not in (1, 2):
+        raise TranscriptionError("Only mono or stereo recordings are supported")
+    try:
+        import av
+        import numpy as np
+
+        with av.open(io.BytesIO(audio), mode="r") as container:
+            if not container.streams.audio:
+                raise TranscriptionError("Recording has no audio stream")
+            stream = container.streams.audio[0]
+            layout = stream.codec_context.layout
+            source_channels = layout.nb_channels if layout is not None else stream.codec_context.channels
+            if source_channels != channels:
+                raise TranscriptionError("Recording channel metadata does not match media")
+            output_layout = "mono" if channels == 1 else "stereo"
+            resampler = av.AudioResampler(format="fltp", layout=output_layout, rate=16000)
+            decoded: list[list[Any]] = [[] for _ in range(channels)]
+            for frame in container.decode(stream):
+                for converted in resampler.resample(frame):
+                    planes = converted.to_ndarray()
+                    if planes.ndim != 2 or planes.shape[0] != channels:
+                        raise TranscriptionError("Local decoder returned an unexpected channel layout")
+                    for index in range(channels):
+                        decoded[index].append(planes[index].astype(np.float32, copy=False))
+            for converted in resampler.resample(None):
+                planes = converted.to_ndarray()
+                if planes.ndim != 2 or planes.shape[0] != channels:
+                    raise TranscriptionError("Local decoder returned an unexpected channel layout")
+                for index in range(channels):
+                    decoded[index].append(planes[index].astype(np.float32, copy=False))
+            if any(not values for values in decoded):
+                raise TranscriptionError("Local decoder returned an empty channel")
+            return [np.concatenate(values) for values in decoded]
+    except TranscriptionError:
+        raise
+    except Exception:
+        raise TranscriptionError("Local audio channel decoding failed") from None
 
 
 def prepare_utterances(segments: list[dict], redact: Callable[[str], str]) -> list[PreparedUtterance]:
@@ -172,11 +219,16 @@ def transcribe_recording(
     model: Any | None = None,
     duration_ms: int | None = None,
     expected_sha256: str | None = None,
+    channels: int = 1,
+    channel_roles: Mapping[int, str] | None = None,
+    audio_decoder: Callable[[bytes, int], list[Any]] = _decode_audio_channels,
 ) -> list[dict]:
     if not language or len(language) > 32:
         raise TranscriptionError("Unsupported language value")
     if duration_ms is not None and not 0 < duration_ms <= MAX_DURATION_MS:
         raise TranscriptionError("Recording duration exceeds local inference limit")
+    if channels not in (1, 2):
+        raise TranscriptionError("Only mono or stereo recordings are supported")
     if not _MODEL_GATE.acquire(blocking=False):
         raise TranscriptionError("Local transcription capacity is busy")
     try:
@@ -189,21 +241,29 @@ def transcribe_recording(
             raise TranscriptionError("Private audio object is empty")
         if expected_sha256 is not None and hashlib.sha256(audio).hexdigest() != expected_sha256.lower():
             raise TranscriptionError("Private audio checksum verification failed")
-        model_version = "injected-test-model"
         if model is None:
-            model, model_version = _load_model()
+            model, _model_version = _load_model()
         try:
-            segments, _info = model.transcribe(
-                io.BytesIO(audio),
-                language=None if language == "und" else language,
-                word_timestamps=False,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                beam_size=5,
-            )
-            # Consume within this bounded worker slot; generator errors are handled
-            # without formatting the exception because decoder errors may contain data.
-            return normalise_segments({"segments": segments}, {})
+            decoded_channels = audio_decoder(audio, channels)
+            if len(decoded_channels) != channels:
+                raise TranscriptionError("Local decoder returned an unexpected channel count")
+            all_segments: list[dict] = []
+            for channel_index, pcm in enumerate(decoded_channels):
+                segments, _info = model.transcribe(
+                    pcm,
+                    language=None if language == "und" else language,
+                    word_timestamps=False,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                    beam_size=5,
+                )
+                all_segments.extend(normalise_segments(
+                    {"segments": segments},
+                    channel_roles or {},
+                    channel_index=channel_index if channels == 2 else None,
+                ))
+            # Preserve overlap and channel identity while ordering by call offsets.
+            return sorted(all_segments, key=lambda item: (item["start_ms"], item["end_ms"], item["speaker_id"], item["segment_id"]))
         except TranscriptionError:
             raise
         except Exception:
@@ -223,7 +283,7 @@ def make_transcription_processor(
     def process(job: dict) -> dict:
         with connect() as connection:
             details = connection.execute(
-                "SELECT c.language,a.private_key,a.duration_ms,a.checksum FROM calls c "
+                "SELECT c.language,a.private_key,a.duration_ms,a.checksum,a.channels FROM calls c "
                 "JOIN audio_objects a ON a.organisation_id=c.organisation_id AND a.call_id=c.id "
                 "JOIN jobs j ON j.organisation_id=c.organisation_id AND j.call_id=c.id "
                 "WHERE c.organisation_id=%s AND c.id=%s AND j.id=%s AND j.stage='TRANSCRIBE' "
@@ -232,13 +292,14 @@ def make_transcription_processor(
             ).fetchone()
         if details is None:
             raise TranscriptionError("Transcription input is unavailable")
-        language, private_key, duration_ms, expected_sha256 = details
+        language, private_key, duration_ms, expected_sha256, channels = details
         raw_segments = transcriber(
             private_key,
             language,
             storage=storage,
             duration_ms=duration_ms,
             expected_sha256=expected_sha256,
+            channels=channels,
         )
         if redact is redact_text:
             redactor = lambda text: redact(text, language=language)

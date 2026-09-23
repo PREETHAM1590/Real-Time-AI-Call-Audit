@@ -52,13 +52,14 @@ class FakeStorage:
 class FakeModel:
     def __init__(self, segments):
         self.segments = segments
-        self.received = None
+        self.received = []
         self.options = None
 
     def transcribe(self, audio, **kwargs):
-        self.received = audio.read()
+        self.received.append(audio)
         self.options = kwargs
-        return iter(self.segments), SimpleNamespace(language="en")
+        selected = self.segments.get(audio, []) if isinstance(self.segments, dict) else self.segments
+        return iter(selected), SimpleNamespace(language="en")
 
 
 class PrivacyTests(unittest.TestCase):
@@ -112,11 +113,12 @@ class TranscriptionTests(unittest.TestCase):
         self.assertLess(normalized[1]["start_ms"], normalized[0]["end_ms"])
 
     def test_explicit_channel_mapping_is_used_only_for_known_channel(self):
-        rows = normalise_segments({"segments": [
-            {"start": 0, "end": 1, "text": "hello", "channel": 1},
-            {"start": 1, "end": 2, "text": "there", "channel": 2},
-        ]}, {1: "CUSTOMER"})
-        self.assertEqual([row["role"] for row in rows], ["CUSTOMER", "UNKNOWN"])
+        mapped = normalise_segments({"segments": [{"start": 0, "end": 1, "text": "hello", "channel": 99}]}, {1: "CUSTOMER"}, channel_index=1)
+        unknown = normalise_segments({"segments": [{"start": 1, "end": 2, "text": "there", "channel": 0}]}, {}, channel_index=0)
+        self.assertEqual(mapped[0]["role"], "CUSTOMER")
+        self.assertEqual(mapped[0]["speaker_id"], "channel-1")
+        self.assertEqual(unknown[0]["role"], "UNKNOWN")
+        self.assertEqual(unknown[0]["speaker_id"], "channel-0")
 
     def test_prepare_batch_returns_only_redacted_final_items(self):
         source = "My phone is 4155550199"
@@ -145,25 +147,52 @@ class TranscriptionTests(unittest.TestCase):
 
     def test_local_adapter_uses_bounded_fake_model_and_private_storage(self):
         model = FakeModel([SimpleNamespace(start=0.0, end=0.5, text="hello")])
-        result = transcribe_recording("call.audio", "en", storage=FakeStorage(), model=model, duration_ms=500)
+        result = transcribe_recording("call.audio", "en", storage=FakeStorage(), model=model, duration_ms=500, audio_decoder=lambda audio, _channels: [audio])
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["role"], "UNKNOWN")
-        self.assertEqual(model.received, b"synthetic audio")
+        self.assertEqual(model.received, [b"synthetic audio"])
         self.assertEqual(model.options["word_timestamps"], False)
         self.assertTrue(model.options["vad_filter"])
 
+    def test_stereo_adapter_transcribes_channels_separately_merges_by_time_and_keeps_roles_unknown(self):
+        model = FakeModel({
+            b"left": [SimpleNamespace(start=0.4, end=0.8, text="left channel")],
+            b"right": [SimpleNamespace(start=0.1, end=0.5, text="right channel")],
+        })
+        result = transcribe_recording(
+            "call.audio", "en", storage=FakeStorage(), model=model, duration_ms=1000, channels=2,
+            audio_decoder=lambda _audio, channels: [b"left", b"right"],
+        )
+        self.assertEqual(model.received, [b"left", b"right"])
+        self.assertEqual([segment["text"] for segment in result], ["right channel", "left channel"])
+        self.assertEqual([segment["role"] for segment in result], ["UNKNOWN", "UNKNOWN"])
+        self.assertEqual([segment["speaker_id"] for segment in result], ["channel-1", "channel-0"])
+
+    def test_stereo_adapter_accepts_only_explicit_trusted_channel_role_map(self):
+        model = FakeModel({
+            b"left": [SimpleNamespace(start=0, end=0.4, text="agent stream", channel=1)],
+            b"right": [SimpleNamespace(start=0, end=0.4, text="customer stream", channel=0)],
+        })
+        result = transcribe_recording(
+            "call.audio", "en", storage=FakeStorage(), model=model, duration_ms=1000, channels=2,
+            channel_roles={0: "AGENT", 1: "CUSTOMER"},
+            audio_decoder=lambda _audio, _channels: [b"left", b"right"],
+        )
+        self.assertEqual({segment["role"] for segment in result}, {"AGENT", "CUSTOMER"})
+        self.assertEqual({segment["speaker_id"] for segment in result}, {"channel-0", "channel-1"})
+
     def test_transcription_rejects_duration_over_cap_before_model_use(self):
         with self.assertRaises(TranscriptionError):
-            transcribe_recording("call.audio", "en", storage=FakeStorage(), model=FakeModel([]), duration_ms=120 * 60 * 1000 + 1)
+            transcribe_recording("call.audio", "en", storage=FakeStorage(), model=FakeModel([]), duration_ms=120 * 60 * 1000 + 1, audio_decoder=lambda audio, _channels: [audio])
 
     def test_local_adapter_rejects_audio_checksum_mismatch(self):
         with self.assertRaises(TranscriptionError):
-            transcribe_recording("call.audio", "en", storage=FakeStorage(), model=FakeModel([]), expected_sha256="0" * 64)
+            transcribe_recording("call.audio", "en", storage=FakeStorage(), model=FakeModel([]), expected_sha256="0" * 64, audio_decoder=lambda audio, _channels: [audio])
 
     def test_job_handler_only_returns_redacted_persistence_payload(self):
         fake_connection = MagicMock()
         fake_connection.__enter__.return_value = fake_connection
-        fake_connection.execute.return_value.fetchone.return_value = ("en", "call.audio", 500, "a" * 64)
+        fake_connection.execute.return_value.fetchone.return_value = ("en", "call.audio", 500, "a" * 64, 1)
         raw_secret = "contact me at jane@example.com"
         with patch("app.transcription.connect", return_value=fake_connection):
             process = make_transcription_processor(
@@ -192,10 +221,14 @@ class ArtifactVerificationTests(unittest.TestCase):
                 verified_model_directory("relative/model", digest)
 
 
+@unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
 class TranscriptMigrationTests(unittest.TestCase):
     def test_v3_schema_upgrade_adds_revision_and_redacted_utterance_table(self):
         # Models an already-migrated deployment upgrading from the prior calls shape.
         from pathlib import Path
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url or not (urlparse(database_url).path or "").lstrip("/").endswith("_test"):
+            self.fail("Refusing migration integration test unless DATABASE_URL ends in _test")
         migration = Path(__file__).resolve().parent.parent / "migrations" / "004_redacted_transcripts.sql"
         schema = f"migration_upgrade_{uuid4().hex}"
         with connect() as connection:
@@ -276,7 +309,7 @@ class WorkerPrivacyBoundaryTests(unittest.TestCase):
 
         db = MagicMock()
         transcribe_connect.return_value.__enter__.return_value = db
-        db.execute.return_value.fetchone.return_value = ("en", "call.audio", 500, "a" * 64)
+        db.execute.return_value.fetchone.return_value = ("en", "call.audio", 500, "a" * 64, 1)
         secret = "private@example.com"
         process = make_transcription_processor(
             transcriber=lambda *args, **kwargs: [{"segment_id": "s1", "speaker_id": "mono", "role": "UNKNOWN", "start_ms": 0, "end_ms": 1, "text": secret, "confidence": None}],
