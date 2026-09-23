@@ -10,12 +10,15 @@ class FinalBufferTests(unittest.TestCase):
         buffer = FinalBuffer()
         buffer.apply("s1", "may", False)
         buffer.apply("s1", "may be recorded", False)
+        self.assertEqual(buffer.partials, {"s1": "may be recorded"})
         self.assertEqual(buffer.final_text(), "")
 
         buffer.apply("s1", "may be recorded", True)
+        self.assertNotIn("s1", buffer.partials)
         buffer.apply("s1", "duplicate final", True)
         buffer.apply("s1", "late provisional text", False)
         self.assertEqual(buffer.final_text(), "may be recorded")
+        self.assertNotIn("s1", buffer.partials)
 
     def test_final_text_preserves_caller_order(self):
         buffer = FinalBuffer()
