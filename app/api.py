@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -31,11 +32,15 @@ from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavaila
 from app.retention import request_call_deletion
 from app.operations import operations_summary
 from app.events import EventCursorError, EventCursorExpired, EventForbidden, encode_sse, parse_last_event_id, read_events, reset_required_event
+from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
+from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
 MAX_DISPOSITION_CONFIG_BYTES = 1024 * 1024
 MAX_REVIEW_BODY_BYTES = 32 * 1024
+# ponytail: this is a per-worker connection cap; use shared admission control if a global cap becomes necessary.
+_EXOTEL_CONNECTIONS = threading.BoundedSemaphore(8)
 
 
 class _RequestBodyTooLarge(Exception):
@@ -546,6 +551,228 @@ def create_app(
             (scope.organisation_id, uuid4(), scope.user_id, action, config_id, version, reason, request_id, json.dumps(details or {})),
         )
 
+    def write_exotel_event(connection, scope: Scope, integration_id: str, action: str, *, subject_ref: str | None = None, request_id: str | None = None) -> None:
+        connection.execute(
+            "INSERT INTO exotel_integration_events(organisation_id,integration_id,actor_id,action,subject_ref,request_id) VALUES (%s,%s,%s,%s,%s,%s)",
+            (scope.organisation_id, integration_id, scope.user_id, action, subject_ref, request_id),
+        )
+
+    @app.post("/v1/exotel-integrations", status_code=201)
+    def create_exotel_integration(body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        account_sid = body.get("account_sid")
+        if set(body) != {"account_sid"} or not isinstance(account_sid, str) or not account_sid.strip() or len(account_sid) > 256:
+            raise HTTPException(status_code=422, detail="A bounded Exotel account SID is required")
+        account_sid = account_sid.strip()
+        integration_id = uuid4()
+        username, password, salt, verifier = integration_credentials()
+        try:
+            with connect() as connection:
+                with connection.transaction():
+                    connection.execute("INSERT INTO exotel_integrations(organisation_id,id,account_sid,username,password_salt,password_verifier,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)", (scope.organisation_id, integration_id, account_sid, username, salt, verifier, scope.user_id))
+                    write_exotel_event(connection, scope, str(integration_id), "CREATED", request_id=request.headers.get("X-Request-ID") if request else None)
+        except UniqueViolation as error:
+            raise HTTPException(status_code=409, detail="Exotel account is already configured") from error
+        return {"id": str(integration_id), "account_sid": account_sid, "username": username, "password": password, "status": "ACTIVE"}
+
+    @app.get("/v1/exotel-integrations")
+    def list_exotel_integrations(scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        with connect() as connection:
+            rows = connection.execute("SELECT id,account_sid,username,is_active,created_at FROM exotel_integrations WHERE organisation_id=%s ORDER BY created_at,id", (scope.organisation_id,)).fetchall()
+        return {"integrations": [{"id": str(row[0]), "account_sid": row[1], "username": row[2], "status": "ACTIVE" if row[3] else "DISABLED", "created_at": row[4].isoformat()} for row in rows]}
+
+    @app.delete("/v1/exotel-integrations/{integration_id}", status_code=204)
+    def disable_exotel_integration(integration_id: str, request: Request, scope: Scope = Depends(get_scope)) -> Response:
+        require_admin(scope)
+        try:
+            integration_id = str(UUID(integration_id))
+        except ValueError as error:
+            raise HTTPException(status_code=404) from error
+        with connect() as connection:
+            with connection.transaction():
+                changed = connection.execute("UPDATE exotel_integrations SET is_active=false,disabled_at=now() WHERE organisation_id=%s AND id=%s AND is_active RETURNING id", (scope.organisation_id, integration_id)).fetchone()
+                if changed is None:
+                    exists = connection.execute("SELECT 1 FROM exotel_integrations WHERE organisation_id=%s AND id=%s", (scope.organisation_id, integration_id)).fetchone()
+                    if exists is None:
+                        raise HTTPException(status_code=404)
+                else:
+                    write_exotel_event(connection, scope, integration_id, "DISABLED", request_id=request.headers.get("X-Request-ID"))
+        return Response(status_code=204)
+
+    @app.get("/v1/exotel-integrations/{integration_id}/agents")
+    def list_exotel_agents(integration_id: str, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        try:
+            integration_id = str(UUID(integration_id))
+        except ValueError as error:
+            raise HTTPException(status_code=404) from error
+        with connect() as connection:
+            rows = connection.execute("SELECT agent_ref,agent_id,team_id,created_by,created_at FROM exotel_agent_mappings WHERE organisation_id=%s AND integration_id=%s ORDER BY agent_ref", (scope.organisation_id, integration_id)).fetchall()
+        return {"mappings": [{"agent_ref": row[0], "agent_id": row[1], "team_id": row[2], "created_by": row[3], "created_at": row[4].isoformat()} for row in rows]}
+
+    @app.put("/v1/exotel-integrations/{integration_id}/agents/{agent_ref}")
+    def map_exotel_agent(integration_id: str, agent_ref: str, body: dict = Body(...), request: Request = None, scope: Scope = Depends(get_scope)) -> dict:
+        require_admin(scope)
+        if len(agent_ref) > 128 or not agent_ref.strip() or set(body) != {"agent_id", "team_id"}:
+            raise HTTPException(status_code=422, detail="A bounded agent reference, agent ID, and team ID are required")
+        agent_id, team_id = body.get("agent_id"), body.get("team_id")
+        if not all(isinstance(value, str) and value.strip() and len(value) <= 256 for value in (agent_id, team_id)):
+            raise HTTPException(status_code=422, detail="Invalid agent mapping")
+        agent_id, team_id = agent_id.strip(), team_id.strip()
+        try:
+            integration_id = str(UUID(integration_id))
+        except ValueError as error:
+            raise HTTPException(status_code=404) from error
+        with connect() as connection:
+            with connection.transaction():
+                active = connection.execute("SELECT 1 FROM exotel_integrations WHERE organisation_id=%s AND id=%s AND is_active", (scope.organisation_id, integration_id)).fetchone()
+                if active is None:
+                    raise HTTPException(status_code=404)
+                memberships = connection.execute("SELECT team_id FROM identity_memberships WHERE organisation_id=%s AND user_id=%s AND role='AGENT' AND is_active ORDER BY team_id", (scope.organisation_id, agent_id)).fetchall()
+                if len(memberships) != 1 or memberships[0][0] != team_id:
+                    raise HTTPException(status_code=422, detail="Agent must have exactly one active AGENT team membership matching the mapping")
+                connection.execute("INSERT INTO exotel_agent_mappings(organisation_id,integration_id,agent_ref,agent_id,team_id,created_by) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (organisation_id,integration_id,agent_ref) DO UPDATE SET agent_id=EXCLUDED.agent_id,team_id=EXCLUDED.team_id,created_by=EXCLUDED.created_by,created_at=now()", (scope.organisation_id, integration_id, agent_ref, agent_id, team_id, scope.user_id))
+                write_exotel_event(connection, scope, integration_id, "AGENT_MAPPED", subject_ref=agent_ref, request_id=request.headers.get("X-Request-ID") if request else None)
+        return {"agent_ref": agent_ref, "agent_id": agent_id, "team_id": team_id}
+
+    @app.delete("/v1/exotel-integrations/{integration_id}/agents/{agent_ref}", status_code=204)
+    def unmap_exotel_agent(integration_id: str, agent_ref: str, request: Request, scope: Scope = Depends(get_scope)) -> Response:
+        require_admin(scope)
+        try:
+            integration_id = str(UUID(integration_id))
+        except ValueError as error:
+            raise HTTPException(status_code=404) from error
+        with connect() as connection:
+            with connection.transaction():
+                deleted = connection.execute("DELETE FROM exotel_agent_mappings WHERE organisation_id=%s AND integration_id=%s AND agent_ref=%s RETURNING agent_ref", (scope.organisation_id, integration_id, agent_ref)).fetchone()
+                if deleted is not None:
+                    write_exotel_event(connection, scope, integration_id, "AGENT_UNMAPPED", subject_ref=agent_ref, request_id=request.headers.get("X-Request-ID"))
+        return Response(status_code=204)
+
+    def authenticate_exotel(header: str | None):
+        credentials = parse_basic_authorization(header)
+        if credentials is None:
+            return None
+        username, password = credentials
+        with connect() as connection:
+            row = connection.execute("SELECT organisation_id::text,id::text,account_sid,password_salt,password_verifier FROM exotel_integrations WHERE username=%s AND is_active", (username,)).fetchone()
+        # A fixed dummy verifier makes unknown usernames take the same password-check path.
+        salt = row[3] if row else bytes(16)
+        verifier = row[4] if row else bytes(32)
+        valid = verify_integration_secret(password, salt, verifier)
+        return row if row is not None and valid else None
+
+    def resolve_exotel_agent(organisation_id: str, integration_id: str, agent_ref: str):
+        with connect() as connection:
+            row = connection.execute("SELECT agent_id,team_id FROM exotel_agent_mappings WHERE organisation_id=%s AND integration_id=%s AND agent_ref=%s", (organisation_id, integration_id, agent_ref)).fetchone()
+            if row is None:
+                return None
+            memberships = connection.execute("SELECT team_id FROM identity_memberships WHERE organisation_id=%s AND user_id=%s AND role='AGENT' AND is_active ORDER BY team_id", (organisation_id, row[0])).fetchall()
+            if len(memberships) != 1 or memberships[0][0] != row[1]:
+                return None
+            return Scope(organisation_id, row[0], "AGENT", frozenset({row[1]}))
+
+    def next_exotel_generation(organisation_id: str, integration_id: str, call_key: str) -> int:
+        with connect() as connection:
+            row = connection.execute("INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation) VALUES (%s,%s,%s,1) ON CONFLICT (organisation_id,integration_id,call_key) DO UPDATE SET generation=exotel_sessions.generation+1,started_at=now() RETURNING generation", (organisation_id, integration_id, call_key)).fetchone()
+        return row[0]
+
+    @app.websocket("/v1/exotel/stream")
+    async def exotel_stream(websocket: WebSocket) -> None:
+        try:
+            integration = await run_in_threadpool(authenticate_exotel, websocket.headers.get("authorization"))
+        except Exception:
+            integration = None
+        if integration is None:
+            await websocket.close(code=4401)
+            return
+        if not _EXOTEL_CONNECTIONS.acquire(blocking=False):
+            await websocket.close(code=4429)
+            return
+        import tempfile
+        try:
+            await websocket.accept()
+            connected = await websocket.receive_text()
+            start_raw = await websocket.receive_text()
+            try:
+                preliminary = ExotelSession(account_sid=integration[2], call_sid="pending", generation=1)
+                preliminary.accept(connected, generation=1)
+                # Read only identity and custom mapping reference from start; parser validates all fields below.
+                start_event = json.loads(start_raw)
+                start_body = start_event.get("start", {}) if isinstance(start_event, dict) else {}
+                call_sid = start_body.get("call_sid")
+                custom = start_body.get("custom_parameters", {})
+                agent_ref = custom.get("agent_ref") if isinstance(custom, dict) else None
+                if not isinstance(call_sid, str) or not isinstance(agent_ref, str):
+                    raise ExotelProtocolError("required call mapping is missing")
+                preliminary.call_sid = call_sid
+                preliminary.accept(start_raw, generation=1)
+                agent_scope = await run_in_threadpool(resolve_exotel_agent, integration[0], integration[1], agent_ref)
+                if agent_scope is None:
+                    raise ExotelProtocolError("call agent mapping is unavailable")
+                external_ref, idempotency_key = make_audio_references(integration[0], integration[2], call_sid)
+                call_key = external_ref.partition(":")[2]
+                generation = await run_in_threadpool(next_exotel_generation, integration[0], integration[1], call_key)
+                session = ExotelSession(account_sid=integration[2], call_sid=call_sid, generation=generation)
+                session.accept(connected, generation=generation)
+                started = session.accept(start_raw, generation=generation)
+                if not isinstance(started, ExotelLifecycleEvent) or started.missing_sequences:
+                    raise ExotelProtocolError("incomplete stream sequence")
+            except (ExotelProtocolError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                await websocket.close(code=4400)
+                return
+
+            total_pcm_bytes = 0
+            expected_timestamp = 0
+            with tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024) as spool:
+                while True:
+                    raw = await websocket.receive_text()
+                    try:
+                        event = session.accept(raw, generation=generation)
+                    except ExotelProtocolError:
+                        await websocket.close(code=4400)
+                        return
+                    if isinstance(event, ExotelLifecycleEvent):
+                        if event.missing_sequences or event.missing_chunks:
+                            await websocket.close(code=4400)
+                            return
+                        if event.event == "stop":
+                            break
+                    elif event is not None:
+                        if event.missing_sequences or event.missing_chunks or event.stream_offset_ms != expected_timestamp:
+                            await websocket.close(code=4400)
+                            return
+                        expected_timestamp += len(event.pcm) // 16
+                        total_pcm_bytes += len(event.pcm)
+                        if expected_timestamp > ExotelSession.MAX_DURATION_MS or total_pcm_bytes > ExotelSession.MAX_STREAM_BYTES:
+                            await websocket.close(code=4400)
+                            return
+                        spool.write(event.pcm)
+                if not total_pcm_bytes:
+                    await websocket.close(code=4400)
+                    return
+                spool.seek(0)
+                audio = build_wav(spool.read())
+            try:
+                await run_in_threadpool(
+                    accept_recording, agent_scope, external_ref, audio, {"language": "und"}, idempotency_key,
+                    generation_fence=(integration[1], call_key, generation),
+                )
+            except (IntakeError, ExternalReferenceConflict, IdempotencyConflict):
+                await websocket.close(code=4409)
+                return
+            await websocket.close(code=1000)
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+        finally:
+            _EXOTEL_CONNECTIONS.release()
+
     @app.get("/v1/disposition-configs")
     def list_disposition_configs(scope: Scope = Depends(get_scope)) -> dict:
         require_admin(scope)
@@ -691,6 +918,10 @@ def create_app(
         @app.get("/quality", include_in_schema=False)
         def quality_home():
             return FileResponse(web_root / "quality.html")
+
+        @app.get("/providers", include_in_schema=False)
+        def providers_home():
+            return FileResponse(web_root / "providers.html")
 
         app.mount("/analyst-assets", StaticFiles(directory=web_root), name="analyst-assets")
 

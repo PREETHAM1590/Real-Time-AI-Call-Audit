@@ -18,7 +18,7 @@ These assumptions allow planning to proceed. They are not facts supplied by the 
 |---|---|---|
 | First deployment | One organisation, tenant-scoped data model | Product owner before pilot |
 | Initial language | English, evaluated on Indian-English contact-centre samples | QA lead before model selection |
-| First ingestion | Uploaded WAV/MP3 recordings; then one vendor WebSocket adapter | Telephony owner before live work |
+| First ingestion | Uploaded WAV/MP3 recordings now; add India-facing provider adapters after per-vendor media and account contracts are verified | Telephony owner before live work |
 | Upload assignment | Derive agent/team from authenticated server identity and membership; keep QA/admin/service upload disabled until a trusted source-to-agent mapping exists | Identity/telephony owner before enabling those uploaders |
 | Pilot capacity | 100 concurrent live calls, 25 dashboard viewers | Engineering during load qualification |
 | Pilot input limits | 250 MiB upload, 120-minute duration, mono/stereo audio | Operations before integration |
@@ -35,7 +35,7 @@ Use synthetic recordings while those real-data decisions are unresolved. Vendor 
 | Release | Included | Exit evidence |
 |---|---|---|
 | P1: Post-call pilot | Authenticated upload, durable processing, transcription, role mapping, redaction, configured policy checks, configurable disposition identification, seven-dimension audit, analyst queue, evidence, override history | Tasks 1–6; representative calls reviewed end to end |
-| P2: Live monitoring | One authenticated media adapter, ordered audio, partial/final transcript handling, live policy state, sentiment signals, resumable supervisor feed | Tasks 7–8; live interruption and replay checks |
+| P2: Live monitoring | Authenticated provider adapters for the prioritised India-facing telephony products, ordered audio, partial/final transcript handling, live policy state, sentiment signals, resumable supervisor feed | Tasks 7–8; live interruption and replay checks per adapter |
 | P3: Operational release | Own-score agent portal, team trends, policy export, retention, observability, evaluation and recovery drills | Tasks 9–10; operational gates pass |
 | Expansion | SIPREC and other media vendors, re-diarization, secondary-model verification, analytics warehouse and larger-scale event backbone | Separate subsystem plans after measured need |
 
@@ -76,6 +76,7 @@ Supervisor flow: sign in → active team calls → provisional signals → verif
 | R13 | Governance | Retention, deletion, access trail and restricted audio enforced | 1, 3, 6, 10 |
 | R14 | Quality and operations | Golden-set evaluation, load results, rollback and restore evidence | 10 |
 | R15 | Disposition identification | Tenant/use-case configuration maps redacted final transcript and authoritative facts to a versioned disposition, deterministic rule trace and review state; remains separate from QA score | 3A, 6, 10 |
+| R16 | Provider integrations | Provider setup and call intake state the verified capability per adapter (live audio, post-call recording, call events); validate provider authentication, tenant mapping, media format and entitlement before enabling a path | 7, 8, 10 |
 
 ### Global constraints
 
@@ -131,6 +132,21 @@ flowchart LR
 ```
 
 Start with one backend codebase, an API process, a worker process and private model processes. Use PostgreSQL for transactional state, job leases and a durable UI event outbox. Store audio objects separately. A React interface consumes JSON APIs and server-sent events (SSE); media ingestion uses WebSockets because audio is bidirectional protocol traffic. SSE is sufficient for one-way dashboard updates. Provision model artifacts ahead of runtime and isolate live STT capacity from queued post-call transcription/audits.
+
+### India-facing telephony coverage
+
+The product must support an expanding set of India-facing cloud telephony and contact-centre systems through explicit, independently qualified adapters. “All providers used in India” is not a finite or verifiable roster: enterprise PBXs, resellers, account-specific products and custom SIP deployments vary. Do not present the following research set as exhaustive or as implemented. Offer an `Other / custom integration` path and add vendors when an owner supplies a supported product/version, test account, media contract, tenant/agent mapping and acceptance evidence.
+
+| Provider/product | Publicly documented evidence found | UI capability until adapter qualification |
+|---|---|---|
+| Exotel AgentStream / Programmable Voice | Official docs describe WSS Basic authentication, connected/start/media/stop lifecycle, custom parameters and 8 kHz mono PCM-over-base64: [Voicebot applet](https://docs.exotel.com/exotel-agentstream/voicebot-applet), [StreamKit start example](https://docs.exotel.com/exotel-agentstream/streamkit-cloud), [Stream applet](https://docs.exotel.com/exotel-agentstream/stream-applet) | A tenant-scoped Basic-authenticated recording intake path, ADMIN mapping and gap-rejecting 8 kHz mono parser are implemented. Account entitlement, the deployed callflow, agent-leg coverage and role attribution remain unverified; mono audio stays UNKNOWN |
+| Airtel IQ Voice API | Airtel publishes [Voice Callflow API docs](https://www.airtel.in/business/b2b/airtel-iq/api-docs/voice/callflow-component-apis); its [buying guide](https://assets.airtel.in/static-assets/cms/b2b/widgets/docs/Airtel-IQ-Buying-Guide-with-metadata.pdf) lists media streaming and call recording | Media streaming capability stated; protocol, direction, product plan and tenant-specific contract require confirmation |
+| Knowlarity SuperReceptionist | Official [developer FAQ](https://knowlaritycommunications.zohodesk.com/portal/en/kb/faq/superreceptionist/crm-integrations/integration-apis) describes REST APIs and post-call hooks | API/post-call events documented; no live audio feed verified in this research. Absence of a found page is not proof of absence |
+| Ozonetel CloudAgent | Official docs include [call-record control](https://docs.ozonetel.com/reference/get_caservices-call-record-php) | Recording control documented; it does not establish a recording download or live audio feed |
+| MyOperator | Official [API index](https://signup.myoperator.com/api/) and [API reference](https://support.myoperator.com/portal/en/kb/articles/myoperator-api-reference-postman-documentation-links) document call events and post-call recording-link retrieval | Post-call recording/events documented; link lifetime and access scope must be verified against the contracted API version |
+| Servetel (Tata Tele Business Services) | Official [call detail records](https://docs.servetel.in/reference/call-detail-records-2) expose recording URLs; [active call details](https://docs.servetel.in/reference/fetch-details-of-active-calls) expose call metadata | Post-call recording and active-call metadata documented; no live media feed verified in this research |
+
+These rows are research inputs, not an implementation promise. Recheck current vendor docs and account entitlements at adapter implementation. A recording URL, active-call list, call-event webhook or recording pause/resume operation is not a live audio stream. The UI must distinguish `Live audio`, `Post-call recording`, and `Call events` and show `Protocol/entitlement unverified` where appropriate. Adapter configuration is tenant-scoped, secrets are write-only and never returned to the browser, and self-hosted STT/LLM processing remains unchanged.
 
 PostgreSQL documents `SKIP LOCKED` as useful for consumers of queue-like tables; use it only for claiming jobs, not ordinary report queries. [PostgreSQL SELECT documentation](https://www.postgresql.org/docs/10/sql-select.html)
 

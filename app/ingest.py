@@ -87,7 +87,7 @@ def inspect_audio(audio: bytes) -> tuple[str, int, int, int]:
     raise IntakeError("Unsupported audio format")
 
 
-def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: dict, idempotency_key: str, *, storage: LocalPrivateStorage | None = None) -> dict:
+def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: dict, idempotency_key: str, *, storage: LocalPrivateStorage | None = None, generation_fence: tuple[str, str, int] | None = None) -> dict:
     if scope.role != "AGENT" or not scope.organisation_id.strip() or not scope.user_id.strip() or len(scope.team_ids) != 1 or not next(iter(scope.team_ids)).strip():
         raise IntakeError("Recording intake requires an agent identity and one server-resolved team")
     agent_id = scope.user_id
@@ -106,6 +106,14 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
     try:
         with connect() as connection:
             with connection.transaction():
+                if generation_fence is not None:
+                    integration_id, call_key, generation = generation_fence
+                    current = connection.execute(
+                        "SELECT s.generation FROM exotel_sessions s JOIN exotel_integrations i ON i.organisation_id=s.organisation_id AND i.id=s.integration_id WHERE s.organisation_id=%s AND s.integration_id=%s AND s.call_key=%s AND i.is_active FOR UPDATE OF s,i",
+                        (scope.organisation_id, integration_id, call_key),
+                    ).fetchone()
+                    if current is None or current[0] != generation:
+                        raise IntakeError("Exotel session generation is stale")
                 inserted = connection.execute("INSERT INTO calls(organisation_id,id,external_ref,idempotency_key,payload_sha256,agent_id,team_id,language,processing_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'QUEUED') ON CONFLICT DO NOTHING RETURNING id", (scope.organisation_id, call_id, external_ref, idempotency_key, checksum, agent_id, team_id, language)).fetchone()
                 if inserted is None:
                     existing = connection.execute("SELECT id,payload_sha256,processing_state,external_ref,language,agent_id,team_id FROM calls WHERE organisation_id=%s AND idempotency_key=%s", (scope.organisation_id, idempotency_key)).fetchone()

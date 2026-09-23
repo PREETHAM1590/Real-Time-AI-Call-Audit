@@ -89,6 +89,12 @@ Separate latency clocks: call end, object available, job enqueued, local inferen
 
 Alert notifications are proposed integration work; this documentation does not create or send any notifications.
 
+### Exotel AgentStream intake status
+
+The API now exposes ADMIN-only tenant-scoped integration and agent-mapping routes under `/v1/exotel-integrations`, plus the Basic-authenticated WSS endpoint `/v1/exotel/stream`. Integration creation returns a generated username/password once; record the password in the approved secret store and configure it in the Exotel WSS URL, because later list responses omit credentials. Map each Exotel `start.custom_parameters.agent_ref` to an active AGENT identity with exactly one active team membership before accepting calls. The path accepts only a complete connected/start/media/stop lifecycle with contiguous sequence, chunk and timestamp positions, bounded 8 kHz mono PCM, and submits the WAV through ordinary durable intake after stop. A gap, disconnect, stale generation, invalid mapping or disabled integration fails closed.
+
+This is code-path evidence from synthetic WebSocket tests, not an Exotel tenant test. Account entitlement, actual callflow configuration, media direction/coverage and production WSS networking remain unverified. No live STT, supervisor monitoring, two-leg attribution, capacity qualification, vendor operations or real-call processing is established; use synthetic traffic until real-data and retention approvals are in place.
+
 ## Failure and recovery runbook
 
 | Incident | Action | Recovery evidence |
