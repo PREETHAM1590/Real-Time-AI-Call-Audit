@@ -31,11 +31,21 @@ def _normalise_phrase(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
 
 
-def _phrase_evidence(utterances: Sequence[Utterance | Mapping[str, Any]], variants: Sequence[str]) -> list[str]:
+def _phrase_evidence(
+    utterances: Sequence[Utterance | Mapping[str, Any]],
+    variants: Sequence[str],
+    allowed_ids: set[str] | None = None,
+) -> list[str]:
     phrases = [_normalise_phrase(phrase) for phrase in variants if _normalise_phrase(phrase)]
     run: list[Utterance | Mapping[str, Any]] = []
     for utterance in [*utterances, None]:
-        if utterance is not None and _field(utterance, "is_final", True) and _field(utterance, "role") == "AGENT":
+        utterance_id = str(_field(utterance, "id")) if utterance is not None else None
+        if (
+            utterance is not None
+            and _field(utterance, "is_final", True)
+            and _field(utterance, "role") == "AGENT"
+            and (allowed_ids is None or utterance_id in allowed_ids)
+        ):
             run.append(utterance)
             continue
         text = _normalise_phrase(" ".join(str(_field(item, "text_redacted", "")) for item in run))
@@ -65,17 +75,22 @@ def disclosure_state(
     ended: bool,
     reliable: bool,
     phrase_variants: Sequence[str] = _DEFAULT_PHRASES,
+    required_opportunity_ms: int = 30_000,
+    phrase_satisfied: bool | None = None,
 ) -> str:
     """Classify an already-clipped opening opportunity window.
 
-    `opportunity_ms` is elapsed eligible call time after holds are removed.
-    The caller must supply only final utterances wholly inside that window.
+    `opportunity_ms` is elapsed eligible call time after holds are removed;
+    `required_opportunity_ms` is the versioned rule's threshold. The caller
+    must supply only final utterances wholly inside the opportunity window.
     """
     if not reliable or any(not _field(u, "is_final", True) or _field(u, "role") == "UNKNOWN" for u in utterances):
         return "UNKNOWN"
-    if _phrase_evidence(utterances, phrase_variants):
+    if phrase_satisfied is None:
+        phrase_satisfied = bool(_phrase_evidence(utterances, phrase_variants))
+    if phrase_satisfied:
         return "SATISFIED"
-    if opportunity_ms >= 30_000:
+    if opportunity_ms >= required_opportunity_ms:
         return "POTENTIAL_VIOLATION"
     return "UNKNOWN" if ended else "PENDING"
 
@@ -145,6 +160,8 @@ def compile_ruleset(raw: Mapping[str, Any]) -> dict[str, Any]:
             if kind == "OPENING_DISCLOSURE" and "window_ms" in rule or kind == "CLOSING_PHRASE" and "opportunity_ms" in rule:
                 raise RulesetError("Rule duration does not match rule type")
         compiled_rules.append({**dict(rule), "policy_text_version": policy_version})
+    if sum(rule["type"] == "SENSITIVE_NUMBER_ADVISORY" for rule in compiled_rules) != 1:
+        raise RulesetError("Ruleset must define exactly one sensitive-number advisory rule")
     normalized = json.loads(json.dumps(dict(raw), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return {
         "ruleset_id": ruleset_id,
@@ -202,16 +219,15 @@ def _hold_overlap(holds: Sequence[tuple[int, int]], start: int, end: int) -> int
 
 def _opening_deadline(start: int, opportunity_ms: int, holds: Sequence[tuple[int, int]]) -> int:
     deadline = start + opportunity_ms
-    # Holds pause the clock. An interval that starts before the current
-    # deadline extends it, which can in turn bring a later hold into scope.
-    changed = True
-    while changed:
-        changed = False
-        extension = sum(max(0, min(end, deadline) - max(begin, start)) for begin, end in holds if begin < deadline)
-        extended = start + opportunity_ms + extension
-        if extended > deadline:
-            deadline = extended
-            changed = True
+    # Holds pause the clock. Sorted, merged intervals can each be consumed
+    # once: if one starts before the current deadline, shift the deadline by
+    # its full portion after `start`. This also brings a later hold into scope
+    # without rescanning prior intervals or iterating once per held millisecond.
+    for begin, end in holds:
+        if begin >= deadline:
+            break
+        if end > start:
+            deadline += end - max(begin, start)
     return deadline
 
 
@@ -272,9 +288,32 @@ def evaluate_rules(utterances: Sequence[Utterance | Mapping[str, Any]], context:
                         eligible.append(utterance)
                 opportunity_end = min(duration, deadline)
                 elapsed = max(0, opportunity_end - connected - _hold_overlap(safe_holds, connected, opportunity_end))
-            unknown_role = any(_field(u, "role") == "UNKNOWN" for u in eligible)
-            state = disclosure_state(eligible, elapsed, ended=context.get("complete") is True, reliable=bool(reliable and deadline is not None and not unknown_role), phrase_variants=rule["phrase_variants"])
-            evidence = _phrase_evidence(eligible, rule["phrase_variants"]) if state == "SATISFIED" else []
+            window_end = min(duration, deadline) if isinstance(duration, int) and deadline is not None else None
+            unknown_role = False
+            if window_end is not None:
+                for utterance in utterances:
+                    if _field(utterance, "role") != "UNKNOWN":
+                        continue
+                    start, end = _field(utterance, "start_ms"), _field(utterance, "end_ms")
+                    if not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int) or isinstance(end, bool):
+                        continue
+                    overlap_start, overlap_end = max(start, connected), min(end, window_end)
+                    opportunity_overlap = max(0, overlap_end - overlap_start)
+                    if opportunity_overlap and _hold_overlap(safe_holds, overlap_start, overlap_end) < opportunity_overlap:
+                        unknown_role = True
+                        break
+            allowed_ids = {str(_field(u, "id")) for u in eligible}
+            phrase_evidence = _phrase_evidence(utterances, rule["phrase_variants"], allowed_ids)
+            state = disclosure_state(
+                eligible,
+                elapsed,
+                ended=context.get("complete") is True,
+                reliable=bool(reliable and deadline is not None and not unknown_role),
+                phrase_variants=rule["phrase_variants"],
+                required_opportunity_ms=rule["opportunity_ms"],
+                phrase_satisfied=bool(phrase_evidence),
+            )
+            evidence = phrase_evidence if state == "SATISFIED" else []
             findings.append(_new_finding(context, compiled, rule, state, evidence, deadline))
         elif rule["type"] == "CLOSING_PHRASE":
             if not isinstance(duration, int) or isinstance(duration, bool) or duration < 0:
@@ -291,11 +330,19 @@ def evaluate_rules(utterances: Sequence[Utterance | Mapping[str, Any]], context:
             unknown_role = any(_field(u, "role") == "UNKNOWN" for u in eligible)
             if not reliable or window_start is None or unknown_role:
                 state = "UNKNOWN"
-            elif _phrase_evidence(eligible, rule["phrase_variants"]):
+            elif _phrase_evidence(
+                utterances,
+                rule["phrase_variants"],
+                {str(_field(u, "id")) for u in eligible},
+            ):
                 state = "SATISFIED"
             else:
                 state = "POTENTIAL_VIOLATION"
-            evidence = _phrase_evidence(eligible, rule["phrase_variants"]) if state == "SATISFIED" else []
+            evidence = (
+                _phrase_evidence(utterances, rule["phrase_variants"], {str(_field(u, "id")) for u in eligible})
+                if state == "SATISFIED"
+                else []
+            )
             findings.append(_new_finding(context, compiled, rule, state, evidence, window_start))
     return findings
 
@@ -305,7 +352,7 @@ def scan_sensitive_numbers(segments: Sequence[Mapping[str, Any]], ruleset: Mappi
     if ruleset is None:
         return []
     compiled = ruleset if "ruleset_hash" in ruleset else compile_ruleset(ruleset)
-    rule = next((item for item in compiled["rules"] if item["id"] == "sensitive_number_advisory"), None)
+    rule = next((item for item in compiled["rules"] if item["type"] == "SENSITIVE_NUMBER_ADVISORY"), None)
     if rule is None:
         return []
     output = []

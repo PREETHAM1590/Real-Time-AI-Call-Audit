@@ -1,12 +1,13 @@
 import json
 import hashlib
+import copy
 import os
 from pathlib import Path
 import unittest
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from app.compliance import disclosure_state, evaluate_rules, scan_sensitive_numbers
+from app.compliance import RulesetError, _opening_deadline, compile_ruleset, disclosure_state, evaluate_rules, scan_sensitive_numbers
 from app.contracts import Utterance
 from app.db import connect
 from app.ingest import finish_job, persist_policy_findings
@@ -57,6 +58,10 @@ class DisclosureStateTests(unittest.TestCase):
         ]
         self.assertEqual(disclosure_state(interrupted, 30_000, ended=True, reliable=True), "POTENTIAL_VIOLATION")
 
+    def test_partial_utterance_is_not_durable_disclosure_evidence(self):
+        partial = [u("partial", "AGENT", 1_000, 2_000, "This call may be recorded", final=False)]
+        self.assertEqual(disclosure_state(partial, 30_000, ended=True, reliable=True), "UNKNOWN")
+
 
 class PolicyWindowTests(unittest.TestCase):
     @classmethod
@@ -72,6 +77,45 @@ class PolicyWindowTests(unittest.TestCase):
         disclosure = next(item for item in result if item["rule_id"] == "opening_disclosure")
         self.assertEqual(disclosure["status"], "POTENTIAL_VIOLATION")
         self.assertEqual(disclosure["deadline_ms"], 35_000)
+
+    def test_opening_deadline_sweeps_long_and_many_holds_once(self):
+        self.assertEqual(_opening_deadline(0, 1, [(0, 500_000)]), 500_001)
+        many_holds = [(index * 3, index * 3 + 2) for index in range(10_000)]
+        self.assertEqual(_opening_deadline(0, 1_000_000, many_holds), 1_020_000)
+
+    def test_each_ruleset_opportunity_threshold_controls_violation_timing(self):
+        ten_second_rule = copy.deepcopy(self.ruleset)
+        ten_second_rule["rules"][0]["opportunity_ms"] = 10_000
+        complete_twelve_second_call = evaluate_rules([], context(call_duration_ms=12_000), ten_second_rule)
+        self.assertEqual(next(item for item in complete_twelve_second_call if item["rule_id"] == "opening_disclosure")["status"], "POTENTIAL_VIOLATION")
+
+        thirty_one_second_rule = copy.deepcopy(self.ruleset)
+        thirty_one_second_rule["rules"][0]["opportunity_ms"] = 31_000
+        # The agent connects 15 seconds into a complete 45 second call, so
+        # only 30 seconds of eligible opportunity occurred.
+        complete_call_below_threshold = evaluate_rules([], context(call_duration_ms=45_000, agent_connected_ms=15_000), thirty_one_second_rule)
+        self.assertEqual(next(item for item in complete_call_below_threshold if item["rule_id"] == "opening_disclosure")["status"], "UNKNOWN")
+
+    def test_unknown_role_crossing_opportunity_cutoff_makes_result_unknown(self):
+        rows = [u("crossing", "UNKNOWN", 29_500, 30_500, "Unclear speaker.")]
+        findings = evaluate_rules(rows, context(call_duration_ms=45_000), self.ruleset)
+        disclosure = next(item for item in findings if item["rule_id"] == "opening_disclosure")
+        self.assertEqual(disclosure["status"], "UNKNOWN")
+
+    def test_hold_or_ivr_breaks_phrase_continuity(self):
+        rows = [
+            u("before", "AGENT", 9_000, 9_500, "This call may be"),
+            u("ivr", "IVR", 10_000, 15_000, "Please wait while we connect you."),
+            u("after", "AGENT", 16_000, 16_500, "recorded."),
+        ]
+        findings = evaluate_rules(
+            rows,
+            context(call_duration_ms=40_000, holds=[{"start_ms": 10_000, "end_ms": 15_000, "tag": "HOLD"}]),
+            self.ruleset,
+        )
+        disclosure = next(item for item in findings if item["rule_id"] == "opening_disclosure")
+        self.assertEqual(disclosure["status"], "POTENTIAL_VIOLATION")
+        self.assertEqual(disclosure["evidence_ids"], [])
 
     def test_phrase_inside_extended_window_satisfies_and_unknown_role_abstains(self):
         rows = [u("good", "AGENT", 34_000, 34_500, "This call may be recorded.")]
@@ -100,6 +144,16 @@ class PolicyWindowTests(unittest.TestCase):
         self.assertEqual(len(sensitive), 1)
         self.assertEqual(sensitive[0]["rule_id"], "sensitive_number_advisory")
         self.assertNotIn("415-555-0199", json.dumps(sensitive))
+
+    def test_sensitive_number_rule_uses_type_and_preserves_configured_id(self):
+        renamed = copy.deepcopy(self.ruleset)
+        renamed_rule = next(rule for rule in renamed["rules"] if rule["type"] == "SENSITIVE_NUMBER_ADVISORY")
+        renamed_rule["id"] = "number_dlp"
+        flag = scan_sensitive_numbers([{"segment_id": "segment-1", "start_ms": 2_000, "end_ms": 3_000, "text": "My number is 415-555-0199"}], renamed)
+        self.assertEqual(flag[0]["rule_id"], "number_dlp")
+        renamed["rules"].append(copy.deepcopy(renamed_rule))
+        with self.assertRaises(RulesetError):
+            compile_ruleset(renamed)
 
 
 @unittest.skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
