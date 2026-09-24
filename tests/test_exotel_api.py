@@ -31,6 +31,8 @@ class _Connection:
     def __init__(self, rows):
         self.rows = rows
         self.session_params = None
+        self.session_states = []
+        self.session_activated = threading.Event()
 
     def __enter__(self):
         return self
@@ -44,13 +46,17 @@ class _Connection:
     def execute(self, query, params=()):
         if "WHERE username=%s" in query:
             return _Result(self.rows["integration"])
-        if "FROM exotel_agent_mappings" in query:
+        if "JOIN exotel_agent_mappings" in query or "FROM exotel_agent_mappings" in query:
             return _Result(("agent-a", "team-a"))
         if "FROM identity_memberships" in query:
             return _Result(many=[("team-a",)])
         if "INSERT INTO exotel_sessions" in query:
             self.session_params = params
+            self.session_activated.set()
             return _Result((4,))
+        if "UPDATE exotel_sessions" in query:
+            self.session_states.append(params[0])
+            return _Result((params[-1],))
         raise AssertionError("unexpected SQL in synthetic websocket test")
 
 
@@ -112,12 +118,14 @@ class ExotelWebSocketTests(unittest.TestCase):
         call_key = make_audio_references("org-a", "acct-a", "call-a")[0].partition(":")[2]
         self.assertEqual(self.connection.session_params[2], call_key)
         self.assertEqual(intake.call_args.kwargs["generation_fence"], ("integration-a", call_key, 4, "external-agent", "agent-a", "team-a"))
+        self.assertEqual(self.connection.session_states, ["DRAINING", "ENDED"])
 
     def test_gap_and_wrong_password_never_submit_audio(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
             result = self._stream(media_sequence=3)
             self.assertEqual(result["code"], 4400)
             self.assertEqual(intake.call_count, 0)
+            self.assertEqual(self.connection.session_states[-1], "INCOMPLETE")
             result = self._stream(secret="wrong-secret")
             self.assertEqual(result["code"], 4401)
             self.assertEqual(intake.call_count, 0)
@@ -132,12 +140,31 @@ class ExotelWebSocketTests(unittest.TestCase):
                 self._send_start(ws)
                 self.assertEqual(ws.receive()["code"], 4408)
             self.assertEqual(intake.call_count, 0)
+            self.assertEqual(self.connection.session_states, ["INCOMPLETE"])
 
         with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS", 1), patch("app.api.EXOTEL_SESSION_TIMEOUT_SECONDS", 0.05), patch("app.api.accept_recording") as intake:
             with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
                 self._send_start(ws)
                 self.assertEqual(ws.receive()["code"], 4408)
             self.assertEqual(intake.call_count, 0)
+            self.assertEqual(self.connection.session_states, ["INCOMPLETE", "INCOMPLETE"])
+
+    def test_intake_failure_after_clean_stop_stays_incomplete(self):
+        from app.ingest import IntakeError
+
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording", side_effect=IntakeError("synthetic")):
+            result = self._stream()
+        self.assertEqual(result["code"], 4409)
+        self.assertEqual(self.connection.session_states, ["DRAINING", "INCOMPLETE"])
+
+    def test_disconnect_marks_active_generation_incomplete(self):
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self._send_start(ws)
+                self.assertTrue(self.connection.session_activated.wait(1))
+                ws.close()
+        self.assertEqual(intake.call_count, 0)
+        self.assertEqual(self.connection.session_states, ["INCOMPLETE"])
 
     def test_admission_rejects_before_authentication_work_when_full(self):
         with patch("app.api._EXOTEL_CONNECTIONS", threading.Semaphore(0)), patch("app.api.connect") as connect:

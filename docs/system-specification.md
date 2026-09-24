@@ -205,6 +205,7 @@ Use UUIDs for application identities; local inference segment IDs are separately
 | reviews | organisation_id, id, audit_id, base_review_version, reviewer_id, action, effective_scores_json, reason, created_at; append-only |
 | jobs | organisation_id, id, call_id, stage, input_revision, state, attempts, available_at, lease_token, lease_until, last_error_code; unique call/stage/input revision |
 | events | organisation_id, sequence, call_id, type, redacted_payload, created_at; ordered resumable dashboard outbox |
+| exotel_sessions | organisation_id, integration_id, hashed call_key, generation, state, agent_id, team_id, lifecycle timestamps; tenant-scoped authenticated media lifecycle, no phone number or content fields |
 | access_log | organisation_id, actor_id, action, resource_id, outcome, request_id, created_at; restricted append-only writer |
 
 Use composite organisation/ID foreign keys to prevent cross-tenant references. Add organisation/team/date and organisation/state/date indexes for scoped queries. Reviews reference immutable audit revisions; no mutable `human_override` column on the machine record.
@@ -248,6 +249,7 @@ Use composite organisation/ID foreign keys to prevent cross-tenant references. A
 | GET /v1/calls/{id}/audio | Authenticated byte-range stream; rechecks role, tenant, call permission and tombstone for each request |
 | POST /v1/audits/{id}/reviews | action ACCEPT/OVERRIDE/TRIAGE, base_review_version, reason and changed dimension scores; 201, or 409 on stale evidence/review |
 | GET /v1/events | Scoped SSE; Last-Event-ID resumes; expired cursor yields reset_required and client fetches snapshot |
+| GET /v1/live-calls | Tenant-scoped session snapshot; agents see their own session, team leaders their server-resolved teams, reviewers their organisation; LIVE, DRAINING, ENDED and INCOMPLETE remain explicit, with stale LIVE/DRAINING activity marked |
 | GET /v1/me/scores | Agent's own current-transcript reviewed scores, machine/reviewed checklist, redacted machine coaching notes, and latest ACCEPT/OVERRIDE reason; agent identity derives from server scope |
 | GET /v1/reports/team | Server-authorized team aggregates, separately versioned by rubric/model runtime; cohorts below five distinct agents suppress counts and scores |
 | GET /v1/exports/findings | Compliance-officer-only current-revision policy findings; redacted, bounded CSV (92-day / 10,000-row maximum), formula-safe cells, and immutable access event before response |

@@ -3,6 +3,7 @@
 const dimensions = ["greeting", "listening", "resolution", "compliance", "clarity", "objection", "closing"];
 const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false, uploadKey: null };
+let liveRefreshActive = false;
 const byId = (id) => document.getElementById(id);
 
 function element(tag, text, className) {
@@ -87,6 +88,43 @@ async function loadQueue() {
   } catch (error) {
     byId("queue-status").textContent = error.message;
     byId("queue-status").classList.add("error");
+  }
+}
+
+async function loadLiveCalls() {
+  if (liveRefreshActive) return;
+  liveRefreshActive = true;
+  const status = byId("live-status");
+  const list = byId("live-calls-list");
+  status.textContent = "Loading live sessions…";
+  status.classList.remove("error");
+  try {
+    const result = await request("/v1/live-calls");
+    list.replaceChildren();
+    for (const call of result.items || []) {
+      const item = element("li", undefined, `live-call live-${String(call.state).toLowerCase()}${call.stale ? " live-stale" : ""}`);
+      const stateLabel = call.stale ? "STALE · last media update is old" : ({
+        LIVE: "LIVE · audio session connected",
+        DRAINING: "DRAINING · waiting for recording intake",
+        ENDED: "ENDED · recording intake accepted",
+        INCOMPLETE: "INCOMPLETE · stream ended before intake was accepted",
+      }[call.state] || "UNKNOWN · session state unavailable");
+      item.append(
+        element("strong", stateLabel),
+        element("span", `Call key ${call.call_key}`),
+        element("span", `Agent ${call.agent_id} · Team ${call.team_id}`),
+        element("span", `Started ${new Date(call.started_at).toLocaleString()}`),
+      );
+      list.append(item);
+    }
+    status.textContent = `${(result.items || []).length} live or recently changed session${(result.items || []).length === 1 ? "" : "s"}.`;
+    if (!list.childElementCount) list.append(element("li", "No live or recently changed sessions.", "empty-state"));
+  } catch (error) {
+    list.replaceChildren();
+    status.textContent = `Live status unavailable · ${error.message}`;
+    status.classList.add("error");
+  } finally {
+    liveRefreshActive = false;
   }
 }
 
@@ -370,6 +408,7 @@ async function loadCall(callId) {
 }
 
 byId("refresh-queue").addEventListener("click", loadQueue);
+byId("refresh-live").addEventListener("click", loadLiveCalls);
 const uploadForm = byId("call-upload-form");
 const uploadStatus = byId("upload-status");
 function uploadStatusText(message, error = false) {
@@ -416,4 +455,8 @@ uploadForm.addEventListener("submit", async (event) => {
     for (const control of uploadForm.elements) control.disabled = false;
   }
 });
-document.addEventListener("DOMContentLoaded", loadQueue);
+document.addEventListener("DOMContentLoaded", () => {
+  loadQueue();
+  loadLiveCalls();
+  window.setInterval(() => { if (!document.hidden) loadLiveCalls(); }, 10_000);
+});

@@ -21,6 +21,12 @@
     <div class="page-intro"><h1>Call review</h1><span>Final redacted evidence · Human decisions stay versioned</span></div>
     <main class="layout">
       <section aria-labelledby="queue-title" class="queue-panel">
+        <section aria-labelledby="live-title" class="live-panel">
+          <div class="section-heading"><h2 id="live-title">Live call sessions</h2><button id="refresh-live" type="button">Refresh live calls</button></div>
+          <p id="live-status" class="status" role="status" aria-live="polite">Live status is loaded separately from post-call review.</p>
+          <ol id="live-calls-list" class="live-calls-list"></ol>
+          <p class="live-note">Session status only. Live transcription and AI monitoring are not enabled.</p>
+        </section>
         <section id="upload-panel" aria-labelledby="upload-title" class="upload-panel">
           <h2 id="upload-title">Upload a call</h2>
           <p>Manual uploads require an AGENT account with exactly one server-resolved team. QA and administrator accounts cannot upload recordings.</p>

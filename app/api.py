@@ -35,6 +35,7 @@ from app.operations import operations_summary
 from app.events import EventCursorError, EventCursorExpired, EventForbidden, encode_sse, parse_last_event_id, read_events, reset_required_event
 from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
 from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
+from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, update_exotel_session
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -324,6 +325,14 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/v1/live-calls")
+    def list_live_calls(scope: Scope = Depends(get_scope)) -> dict:
+        try:
+            with connect() as connection:
+                return {"items": read_live_calls(connection, scope)}
+        except LiveCallsForbidden as error:
+            raise HTTPException(status_code=403, detail="Role cannot view live calls") from error
 
     @app.get("/v1/operations/summary")
     def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict[str, int]:
@@ -677,10 +686,16 @@ def create_app(
                 return None
             return Scope(organisation_id, row[0], "AGENT", frozenset({row[1]}))
 
-    def next_exotel_generation(organisation_id: str, integration_id: str, call_key: str) -> int:
+    def next_exotel_generation(organisation_id: str, integration_id: str, call_key: str,
+                               agent_ref: str, agent_id: str, team_id: str) -> int:
         with connect(timeout_seconds=5) as connection:
-            row = connection.execute("INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation) VALUES (%s,%s,%s,1) ON CONFLICT (organisation_id,integration_id,call_key) DO UPDATE SET generation=exotel_sessions.generation+1,started_at=now() RETURNING generation", (organisation_id, integration_id, call_key)).fetchone()
-        return row[0]
+            return activate_exotel_session(connection, organisation_id, integration_id, call_key, agent_ref, agent_id, team_id)
+
+    def persist_exotel_state(organisation_id: str, integration_id: str, call_key: str, generation: int,
+                             state: str, *, activity: bool = False) -> bool:
+        with connect(timeout_seconds=5) as connection:
+            with connection.transaction():
+                return update_exotel_session(connection, organisation_id, integration_id, call_key, generation, state, activity=activity)
 
     @app.websocket("/v1/exotel/stream")
     async def exotel_stream(websocket: WebSocket) -> None:
@@ -690,6 +705,7 @@ def create_app(
         loop = asyncio.get_running_loop()
         session_deadline = loop.time() + EXOTEL_SESSION_TIMEOUT_SECONDS
         handshake_deadline = min(session_deadline, loop.time() + EXOTEL_HANDSHAKE_TIMEOUT_SECONDS)
+        lifecycle = None
 
         async def receive_text_before(deadline: float, max_wait: float) -> str:
             remaining = deadline - loop.time()
@@ -723,13 +739,18 @@ def create_app(
                 if not isinstance(call_sid, str) or not isinstance(agent_ref, str):
                     raise ExotelProtocolError("required call mapping is missing")
                 preliminary.call_sid = call_sid
-                preliminary.accept(start_raw, generation=1)
+                validated_start = preliminary.accept(start_raw, generation=1)
+                if not isinstance(validated_start, ExotelLifecycleEvent) or validated_start.missing_sequences:
+                    raise ExotelProtocolError("incomplete stream sequence")
                 agent_scope = await run_in_threadpool(resolve_exotel_agent, integration[0], integration[1], agent_ref)
                 if agent_scope is None:
                     raise ExotelProtocolError("call agent mapping is unavailable")
                 external_ref, idempotency_key = make_audio_references(integration[0], integration[2], call_sid)
                 call_key = external_ref.partition(":")[2]
-                generation = await run_in_threadpool(next_exotel_generation, integration[0], integration[1], call_key)
+                agent_id = agent_scope.user_id
+                team_id = next(iter(agent_scope.team_ids))
+                generation = await run_in_threadpool(next_exotel_generation, integration[0], integration[1], call_key, agent_ref, agent_id, team_id)
+                lifecycle = (integration[0], integration[1], call_key, generation)
                 session = ExotelSession(account_sid=integration[2], call_sid=call_sid, generation=generation)
                 session.accept(connected, generation=generation)
                 started = session.accept(start_raw, generation=generation)
@@ -741,6 +762,7 @@ def create_app(
 
             total_pcm_bytes = 0
             expected_timestamp = 0
+            last_activity_update = loop.time()
             with tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024) as spool:
                 while True:
                     raw = await receive_text_before(session_deadline, EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS)
@@ -754,6 +776,7 @@ def create_app(
                             await websocket.close(code=4400)
                             return
                         if event.event == "stop":
+                            await run_in_threadpool(persist_exotel_state, *lifecycle, "DRAINING")
                             break
                     elif event is not None:
                         if event.missing_sequences or event.missing_chunks or event.stream_offset_ms != expected_timestamp:
@@ -765,6 +788,9 @@ def create_app(
                             await websocket.close(code=4400)
                             return
                         spool.write(event.pcm)
+                        if loop.time() - last_activity_update >= 15:
+                            await run_in_threadpool(persist_exotel_state, *lifecycle, "LIVE", activity=True)
+                            last_activity_update = loop.time()
                 if not total_pcm_bytes:
                     await websocket.close(code=4400)
                     return
@@ -783,6 +809,10 @@ def create_app(
             except (IntakeError, ExternalReferenceConflict, IdempotencyConflict):
                 await websocket.close(code=4409)
                 return
+            if not await run_in_threadpool(persist_exotel_state, *lifecycle, "ENDED"):
+                await websocket.close(code=4409)
+                return
+            lifecycle = None
             await websocket.close(code=1000)
         except TimeoutError:
             try:
@@ -797,6 +827,11 @@ def create_app(
             except Exception:
                 pass
         finally:
+            if lifecycle is not None:
+                try:
+                    await run_in_threadpool(persist_exotel_state, *lifecycle, "INCOMPLETE")
+                except Exception:
+                    pass
             _EXOTEL_CONNECTIONS.release()
 
     @app.get("/v1/disposition-configs")

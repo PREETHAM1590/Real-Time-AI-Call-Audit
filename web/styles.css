@@ -88,6 +88,12 @@ h4 { margin: 0 0 .35rem; }
 .score-field select { display: block; width: 100%; min-height: 2.35rem; border: 1px solid #8998a6; border-radius: 6px; }
 .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; }
 .empty-state { padding: .7rem 0; color: var(--muted); }
+.live-panel { margin: 0 0 1rem; padding: .8rem 0 1rem; border-bottom: 1px solid var(--rule); }
+.live-calls-list { display: grid; gap: .5rem; margin: .5rem 0; padding: 0; list-style: none; }
+.live-call { display: grid; gap: .2rem; padding: .65rem .75rem; border-left: 4px solid #187245; background: #f2f8f4; overflow-wrap: anywhere; }
+.live-draining, .live-incomplete { border-left-color: #a86100; background: #fff8e9; }
+.live-call span, .live-note { color: var(--muted); font-size: .86rem; }
+.live-stale { border-left-color: #a86100; background: #fff8e9; }
 .report-layout { width: min(1440px, 100%); margin: 0 auto; padding: 0 clamp(1rem, 2vw, 2rem) 2rem; }
 .report-layout > .page-intro { margin: 0 calc(clamp(1rem, 2vw, 2rem) * -1) .5rem; }
 .report-layout > .page-intro:first-child { padding-left: clamp(1rem, 2vw, 2rem); }
