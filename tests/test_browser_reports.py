@@ -135,5 +135,8 @@ class QualityReportBrowserTests(unittest.TestCase):
             myoperator_recording = table.get_by_role("row", name=re.compile("MyOperator")).locator("td").nth(1)
             self.assertIn("valid for 24 hours", myoperator_recording.inner_text())
             self.assertIn("account-specific entitlement and runtime behavior remain unverified", myoperator_recording.inner_text())
+            myoperator_events = table.get_by_role("row", name=re.compile("MyOperator")).locator("td").nth(2)
+            self.assertIn("call.end/call.summary", myoperator_events.inner_text())
+            self.assertIn("24-hour retries", myoperator_events.inner_text())
             page.get_by_role("link", name="Quality", exact=True).click()
             page.get_by_role("heading", name="Quality reports").wait_for()
