@@ -36,6 +36,14 @@ class OperationsSummaryPostgresTests(unittest.TestCase):
 
         migrate()
 
+    @staticmethod
+    def _delete_jobs(*organisation_ids):
+        from app.db import connect
+
+        # Queued synthetic jobs would otherwise be claimed by later worker/ingest integration tests.
+        with connect() as connection:
+            connection.execute("DELETE FROM jobs WHERE organisation_id=ANY(%s)", (list(organisation_ids),))
+
     def test_summary_counts_only_visible_tenant_work_and_bounds_old_age(self):
         from app.db import connect
 
@@ -58,6 +66,7 @@ class OperationsSummaryPostgresTests(unittest.TestCase):
                 "INSERT INTO jobs(organisation_id,id,call_id,stage,state,created_at) VALUES (%s,%s,%s,'TRANSCRIBE','QUEUED',%s),(%s,%s,%s,'TRANSCRIBE','QUEUED',now())",
                 (organisation_id, uuid4(), queued_call, datetime.now(timezone.utc) - timedelta(days=500), other_organisation_id, uuid4(), other_call),
             )
+        self.addCleanup(self._delete_jobs, organisation_id, other_organisation_id)
         with connect() as connection:
             result = operations_summary(connection, str(organisation_id))
         self.assertEqual(result["pending_jobs"], 1)

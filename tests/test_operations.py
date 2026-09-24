@@ -109,6 +109,12 @@ class RetentionPostgresTests(unittest.TestCase):
             raise RuntimeError("Refusing retention integration tests without isolated DATABASE_URL ending in _test")
         migrate()
 
+    @staticmethod
+    def _delete_jobs(organisation_id):
+        # Queued synthetic jobs would otherwise be claimed by later worker/ingest integration tests.
+        with connect() as connection:
+            connection.execute("DELETE FROM jobs WHERE organisation_id=%s", (organisation_id,))
+
     def make_call(self, *, held=False, expires_at=None, with_audit=True):
         organisation_id, call_id, audio_id = uuid4(), uuid4(), uuid4()
         storage = LocalPrivateStorage(Path(tempfile.gettempdir()) / f"call-audit-retention-{uuid4().hex}")
@@ -127,6 +133,7 @@ class RetentionPostgresTests(unittest.TestCase):
             )
             job_id = uuid4()
             connection.execute("INSERT INTO jobs(organisation_id,id,call_id,stage,state) VALUES (%s,%s,%s,'TRANSCRIBE','QUEUED')", (organisation_id, job_id, call_id))
+            self.addCleanup(self._delete_jobs, organisation_id)
             connection.execute(
                 "INSERT INTO transcript_utterances(organisation_id,call_id,revision,id,segment_id,speaker_id,role,start_ms,end_ms,text_redacted,confidence,model_version) "
                 "VALUES (%s,%s,1,'u1','s1','speaker-1','AGENT',0,100,'Synthetic redacted text.',0.9,'test-v1')",
