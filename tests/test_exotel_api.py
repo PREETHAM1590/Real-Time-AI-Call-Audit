@@ -120,6 +120,17 @@ class ExotelWebSocketTests(unittest.TestCase):
         self.assertEqual(intake.call_args.kwargs["generation_fence"], ("integration-a", call_key, 4, "external-agent", "agent-a", "team-a"))
         self.assertEqual(self.connection.session_states, ["DRAINING"])
 
+    def test_empty_clean_stop_is_rejected_without_intake(self):
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self._send_start(ws)
+                ws.send_text(json.dumps({"event": "stop", "sequence_number": 2, "stream_sid": "stream-a",
+                                        "stop": {"call_sid": "call-a", "account_sid": "acct-a", "reason": "callended"}}))
+                closed = ws.receive()
+            self.assertEqual((closed["type"], closed["code"]), ("websocket.close", 4400))
+            intake.assert_not_called()
+        self.assertEqual(self.connection.session_states, ["DRAINING", "INCOMPLETE"])
+
     def test_gap_and_wrong_password_never_submit_audio(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
             result = self._stream(media_sequence=3)

@@ -19,6 +19,7 @@ from app.migrate import migrate
 from app.privacy import RedactionError, redact_text
 from app.storage import LocalPrivateStorage
 from app.transcription import (
+    LiveWindowTranscriber,
     PreparedUtterance,
     TranscriptionError,
     make_transcription_processor,
@@ -101,6 +102,92 @@ class PrivacyTests(unittest.TestCase):
 
 
 class TranscriptionTests(unittest.TestCase):
+    def test_live_windows_are_bounded_unknown_speaker_correctable_and_redacted(self):
+        raw = [
+            [SimpleNamespace(start=2.2, end=3.5, text="call 4155550199")],
+            [SimpleNamespace(start=0.2, end=0.8, text="call 4165550100 corrected")],
+        ]
+
+        class WindowModel:
+            def __init__(self):
+                self.calls = 0
+
+            def transcribe(self, audio, **kwargs):
+                self.calls += 1
+                self.audio_size = len(audio)
+                return iter(raw[min(self.calls - 1, 1)]), SimpleNamespace(language="en")
+
+        model = WindowModel()
+        transcriber = LiveWindowTranscriber(
+            model, language="en", redact=lambda text: text.replace("4155550199", "[REDACTED]").replace("4165550100", "[REDACTED]")
+        )
+        first = transcriber.push(b"\x00\x00" * (8000 * 4), 0)
+        self.assertEqual(len(first), 1)
+        self.assertFalse(first[0].is_final)
+        self.assertEqual(first[0].role, "UNKNOWN")
+        self.assertIn("[REDACTED]", first[0].text_redacted)
+        self.assertNotIn("4155550199", first[0].model_dump_json())
+        self.assertEqual(model.audio_size, 8000 * 4 * 2)
+
+        corrected = transcriber.push(b"\x00\x00" * (8000 * 3), 4000)
+        self.assertEqual(len(corrected), 1)
+        self.assertTrue(corrected[0].is_final)
+        self.assertEqual(corrected[0].id, first[0].id)
+        self.assertIn("corrected", corrected[0].text_redacted)
+        self.assertNotIn("4165550100", corrected[0].model_dump_json())
+        self.assertLessEqual(transcriber.buffered_bytes, LiveWindowTranscriber.WINDOW_MS * 16)
+
+    def test_live_redaction_failure_returns_no_transcript_and_closes_processor(self):
+        model = FakeModel([SimpleNamespace(start=0.2, end=3.5, text="sensitive transcript")])
+        transcriber = LiveWindowTranscriber(
+            model, language="en", redact=lambda _text: (_ for _ in ()).throw(RuntimeError("redaction failed"))
+        )
+        with self.assertRaises(TranscriptionError):
+            transcriber.push(b"\x00\x00" * (8000 * 4), 0)
+        self.assertEqual(transcriber.buffered_bytes, 0)
+        with self.assertRaises(TranscriptionError):
+            transcriber.push(b"\x00\x00" * 160, 4000)
+
+    def test_live_holds_model_gate_while_consuming_lazy_segments(self):
+        class LazyModel:
+            def transcribe(self, audio, **kwargs):
+                def segments():
+                    acquired = transcription_module._MODEL_GATE.acquire(blocking=False)
+                    if acquired:
+                        transcription_module._MODEL_GATE.release()
+                    if acquired:
+                        raise RuntimeError("model gate was not held during generator iteration")
+                    yield SimpleNamespace(start=2.2, end=3.5, text="hello")
+                return segments(), SimpleNamespace(language="en")
+
+        import app.transcription as transcription_module
+        transcriber = LiveWindowTranscriber(LazyModel(), language="en", redact=lambda text: text)
+        self.assertEqual(len(transcriber.push(b"\x00\x00" * (8000 * 4), 0)), 1)
+
+    def test_live_rejects_non_millisecond_pcm_and_out_of_window_timing(self):
+        transcriber = LiveWindowTranscriber(FakeModel([]), language="en", redact=lambda text: text)
+        with self.assertRaises(TranscriptionError):
+            transcriber.push(b"\x00\x00", 0)
+
+        model = FakeModel([SimpleNamespace(start=0.2, end=4.1, text="beyond window")])
+        transcriber = LiveWindowTranscriber(model, language="en", redact=lambda text: text)
+        with self.assertRaises(TranscriptionError):
+            transcriber.push(b"\x00\x00" * (8000 * 4), 0)
+        self.assertEqual(transcriber.buffered_bytes, 0)
+
+    def test_live_malformed_model_timing_clears_audio_and_normalizes_locale(self):
+        class LocaleModel:
+            def transcribe(self, audio, **kwargs):
+                self.language = kwargs["language"]
+                return iter([SimpleNamespace(start=10**1000, end=4.1, text="bad timing")]), SimpleNamespace(language="en")
+
+        model = LocaleModel()
+        transcriber = LiveWindowTranscriber(model, language="en-IN", redact=lambda text: text)
+        with self.assertRaises(TranscriptionError):
+            transcriber.push(b"\x00\x00" * (8000 * 4), 0)
+        self.assertEqual(model.language, "en")
+        self.assertEqual(transcriber.buffered_bytes, 0)
+
     def test_mono_speaker_is_unknown_silence_dropped_and_overlaps_retained(self):
         normalized = normalise_segments({"segments": [
             {"start": 0, "end": 0.1, "text": "   "},

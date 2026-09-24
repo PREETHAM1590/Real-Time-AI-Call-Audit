@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import itertools
 import math
 import os
 import threading
@@ -37,6 +38,217 @@ class PreparedUtterance(Utterance):
     segment_id: str
     speaker_id: str
     confidence: FiniteFloat | None = None
+
+
+class LiveWindowTranscriber:
+    """Bounded overlapping Exotel PCM windows; output is redacted and provisional until stable."""
+
+    SAMPLE_RATE = 8000
+    WINDOW_MS = 4000
+    OVERLAP_MS = 1000
+    MAX_INPUT_CHUNK_BYTES = 100_000
+    MAX_WINDOW_SEGMENTS = 100
+    MAX_WINDOW_TEXT_CHARS = 20_000
+    MAX_PENDING_SEGMENTS = 200
+
+    def __init__(self, model: Any, *, language: str, redact: Callable[[str], str]):
+        if not language or len(language) > 32:
+            raise TranscriptionError("Unsupported live transcription language")
+        self.model = model
+        self.language = language
+        self.redact = redact
+        self._pcm = bytearray()
+        self._buffer_start_ms = 0
+        self._next_input_ms = 0
+        self._next_id = 0
+        self._pending: list[dict] = []
+        self._closed = False
+
+    @property
+    def buffered_bytes(self) -> int:
+        return len(self._pcm)
+
+    def push(self, pcm: bytes, start_ms: int) -> list[PreparedUtterance]:
+        if (self._closed or not isinstance(pcm, bytes) or not pcm or len(pcm) % 16
+                or isinstance(start_ms, bool) or not isinstance(start_ms, int) or start_ms < 0):
+            raise TranscriptionError("Invalid live PCM frame")
+        if len(pcm) > self.MAX_INPUT_CHUNK_BYTES or start_ms != self._next_input_ms:
+            raise TranscriptionError("Live PCM frame is oversized or out of order")
+        duration_ms = len(pcm) // 16
+        if self._next_input_ms + duration_ms > MAX_DURATION_MS:
+            raise TranscriptionError("Live stream exceeds configured duration limit")
+        self._next_input_ms += duration_ms
+        self._pcm.extend(pcm)
+        updates: list[PreparedUtterance] = []
+        window_bytes = self.WINDOW_MS * 16
+        stride_bytes = (self.WINDOW_MS - self.OVERLAP_MS) * 16
+        try:
+            while len(self._pcm) >= window_bytes:
+                updates.extend(self._decode_window(bytes(self._pcm[:window_bytes]), final=False))
+                del self._pcm[:stride_bytes]
+                self._buffer_start_ms += self.WINDOW_MS - self.OVERLAP_MS
+        except TranscriptionError:
+            self._closed = True
+            self._pending.clear()
+            self._pcm.clear()
+            raise
+        except Exception:
+            self._closed = True
+            self._pending.clear()
+            self._pcm.clear()
+            raise TranscriptionError("Local live transcription failed") from None
+        return updates
+
+    def finish(self) -> list[PreparedUtterance]:
+        if self._closed:
+            return []
+        self._closed = True
+        updates: list[PreparedUtterance] = []
+        try:
+            if len(self._pcm) >= 1600:  # Ignore tails shorter than 100 ms.
+                updates.extend(self._decode_window(bytes(self._pcm), final=True))
+            elif self._pending:
+                updates.extend(self._emit(self._pending, final=True))
+        except TranscriptionError:
+            self._pending.clear()
+            self._pcm.clear()
+            raise
+        except Exception:
+            self._pending.clear()
+            self._pcm.clear()
+            raise TranscriptionError("Local live transcription failed") from None
+        self._pending.clear()
+        self._pcm.clear()
+        return updates
+
+    def _decode_window(self, pcm: bytes, *, final: bool) -> list[PreparedUtterance]:
+        if not _MODEL_GATE.acquire(blocking=False):
+            raise TranscriptionError("Local transcription capacity is busy")
+        try:
+            try:
+                import numpy as np
+                import av
+
+                samples = np.frombuffer(pcm, dtype="<i2")
+                frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+                frame.sample_rate = self.SAMPLE_RATE
+                resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+                converted = resampler.resample(frame)
+                converted.extend(resampler.resample(None))
+                audio = np.concatenate([item.to_ndarray().reshape(-1) for item in converted]).astype(np.float32, copy=False)
+                segments, _info = self.model.transcribe(
+                    audio,
+                    language=None if self.language == "und" else self.language.lower().split("-", 1)[0],
+                    word_timestamps=False,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                    beam_size=5,
+                )
+                bounded_segments = list(itertools.islice(segments, self.MAX_WINDOW_SEGMENTS + 1))
+            except TranscriptionError:
+                raise
+            except Exception:
+                raise TranscriptionError("Local live transcription failed") from None
+        finally:
+            _MODEL_GATE.release()
+
+        if len(bounded_segments) > self.MAX_WINDOW_SEGMENTS:
+            raise TranscriptionError("Live model returned too many segments")
+        normalized = normalise_segments({"segments": bounded_segments}, {})
+        window_duration_ms = len(pcm) // 16
+        if any(segment["start_ms"] > window_duration_ms or segment["end_ms"] > window_duration_ms for segment in normalized):
+            raise TranscriptionError("Live model returned timing outside the audio window")
+        if sum(len(segment["text"]) for segment in normalized) > self.MAX_WINDOW_TEXT_CHARS:
+            raise TranscriptionError("Live model returned too much transcript text")
+        window_start = self._buffer_start_ms
+        observed: set[int] = set()
+        observed_candidates: list[dict] = []
+        for segment in normalized:
+            start_ms = window_start + segment["start_ms"]
+            end_ms = window_start + segment["end_ms"]
+            match = next((
+                index for index, candidate in enumerate(self._pending)
+                if index not in observed and abs(candidate["start_ms"] - start_ms) <= 1000
+                and candidate["start_ms"] < end_ms and start_ms < candidate["end_ms"]
+            ), None)
+            if match is None:
+                if len(self._pending) >= self.MAX_PENDING_SEGMENTS:
+                    raise TranscriptionError("Live transcript candidate limit exceeded")
+                self._next_id += 1
+                candidate = {**segment, "id": f"live-{self._next_id}", "start_ms": start_ms,
+                             "end_ms": end_ms, "text": segment["text"]}
+                self._pending.append(candidate)
+                match = len(self._pending) - 1
+            else:
+                candidate = self._pending[match]
+                candidate.update(start_ms=start_ms, end_ms=end_ms, text=segment["text"])
+            observed.add(match)
+            observed_candidates.append(candidate)
+
+        next_window_start = window_start + self.WINDOW_MS - self.OVERLAP_MS
+        stable, pending = [], []
+        for candidate in self._pending:
+            if final or candidate["end_ms"] <= next_window_start:
+                stable.append(candidate)
+            else:
+                pending.append(candidate)
+        self._pending = pending
+        try:
+            updates = self._emit([item for item in observed_candidates if item not in stable], final=False)
+            updates.extend(self._emit(stable, final=True))
+            return updates
+        except TranscriptionError:
+            self._closed = True
+            self._pending.clear()
+            self._pcm.clear()
+            raise
+
+    def _emit(self, candidates: list[dict], *, final: bool) -> list[PreparedUtterance]:
+        # Redact the full batch before returning any item to a caller.
+        try:
+            prepared = []
+            emitted_candidates = []
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                if final and candidate.get("_emitted_final"):
+                    continue
+                if not final and candidate.get("_emitted_text") == candidate["text"]:
+                    continue
+                redacted = self.redact(candidate["text"])
+                if not isinstance(redacted, str):
+                    raise ValueError("invalid redactor output")
+                segment_id = candidate["id"]
+                prepared.append(PreparedUtterance(
+                    id=hashlib.sha256(segment_id.encode("utf-8")).hexdigest()[:32],
+                    role="UNKNOWN", start_ms=candidate["start_ms"], end_ms=candidate["end_ms"],
+                    text_redacted=redacted, is_final=final, segment_id=segment_id,
+                    speaker_id="mono-unknown", confidence=candidate.get("confidence"),
+                ))
+                emitted_candidates.append(candidate)
+            for candidate in emitted_candidates:
+                candidate["_emitted_text"] = candidate["text"]
+                if final:
+                    candidate["_emitted_final"] = True
+            return prepared
+        except TranscriptionError:
+            raise
+        except Exception:
+            raise TranscriptionError("Live transcript redaction failed") from None
+
+
+def exotel_live_transcriber_from_environment() -> LiveWindowTranscriber | None:
+    """Opt in only with a pinned local STT model and an explicitly supported language."""
+    if os.environ.get("EXOTEL_LIVE_TRANSCRIPTION") != "1":
+        return None
+    language = os.environ.get("EXOTEL_LIVE_LANGUAGE", "").strip()
+    if language.lower().split("-", 1)[0] != "en":
+        raise TranscriptionError("Live transcript redaction is not configured for this language")
+    model, _version = _load_model()
+    return LiveWindowTranscriber(
+        model, language=language,
+        redact=lambda text: redact_text(text, language=language),
+    )
 
 
 def _field(segment: Any, name: str, default=None):
