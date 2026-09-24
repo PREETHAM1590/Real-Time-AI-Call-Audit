@@ -118,10 +118,10 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
                 if generation_fence is not None:
                     integration_id, call_key, generation, agent_ref, expected_agent_id, expected_team_id = generation_fence
                     current = connection.execute(
-                        "SELECT s.generation FROM exotel_sessions s JOIN exotel_integrations i ON i.organisation_id=s.organisation_id AND i.id=s.integration_id JOIN exotel_agent_mappings m ON m.organisation_id=s.organisation_id AND m.integration_id=s.integration_id WHERE s.organisation_id=%s AND s.integration_id=%s AND s.call_key=%s AND i.is_active AND m.agent_ref=%s AND m.agent_id=%s AND m.team_id=%s FOR UPDATE OF s,i,m",
+                        "SELECT s.generation,s.state FROM exotel_sessions s JOIN exotel_integrations i ON i.organisation_id=s.organisation_id AND i.id=s.integration_id JOIN exotel_agent_mappings m ON m.organisation_id=s.organisation_id AND m.integration_id=s.integration_id WHERE s.organisation_id=%s AND s.integration_id=%s AND s.call_key=%s AND i.is_active AND m.agent_ref=%s AND m.agent_id=%s AND m.team_id=%s FOR UPDATE OF s,i,m",
                         (scope.organisation_id, integration_id, call_key, agent_ref, expected_agent_id, expected_team_id),
                     ).fetchone()
-                    if current is None or current[0] != generation:
+                    if current is None or current[0] != generation or current[1] != "DRAINING":
                         raise IntakeError("Exotel session identity or generation is stale")
                     memberships = connection.execute(
                         "SELECT team_id FROM identity_memberships WHERE organisation_id=%s AND user_id=%s AND role='AGENT' AND is_active ORDER BY team_id FOR UPDATE",
@@ -145,8 +145,35 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
                     connection.execute("INSERT INTO audio_objects(organisation_id,id,call_id,private_key,checksum,codec,sample_rate,channels,duration_ms) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (scope.organisation_id, audio_id, call_id, key, checksum, codec, rate, channels, duration))
                     connection.execute("INSERT INTO jobs(organisation_id,id,call_id,stage,state) VALUES (%s,%s,%s,'TRANSCRIBE','QUEUED')", (scope.organisation_id, job_id, call_id))
                     append_call_updated(connection, str(scope.organisation_id), str(call_id), "QUEUED", 0)
+                if generation_fence is not None:
+                    integration_id, call_key, generation, _, _, _ = generation_fence
+                    ended = connection.execute(
+                        "UPDATE exotel_sessions SET state='ENDED',ended_at=now(),updated_at=now() "
+                        "WHERE organisation_id=%s AND integration_id=%s AND call_key=%s AND generation=%s "
+                        "AND state='DRAINING' RETURNING generation",
+                        (scope.organisation_id, integration_id, call_key, generation),
+                    ).fetchone()
+                    if ended is None:
+                        raise IntakeError("Exotel session could not be finalized")
     except Exception:
-        storage.delete(key)
+        if generation_fence is None:
+            storage.delete(key)
+        else:
+            # A commit error can be ambiguous. Preserve the object if the durable call
+            # exists; orphan cleanup handles a definitely uncommitted intake later.
+            try:
+                integration_id, call_key, generation, _, _, _ = generation_fence
+                with connect() as connection:
+                    accepted = connection.execute(
+                        "SELECT 1 FROM calls c JOIN exotel_sessions s ON s.organisation_id=c.organisation_id "
+                        "WHERE c.organisation_id=%s AND c.external_ref=%s AND s.integration_id=%s AND s.call_key=%s "
+                        "AND s.generation=%s AND s.state='ENDED' LIMIT 1",
+                        (scope.organisation_id, external_ref, integration_id, call_key, generation),
+                    ).fetchone() is not None
+                if not accepted:
+                    storage.delete(key)
+            except Exception:
+                pass
         raise
     if result is not None:
         storage.delete(key)

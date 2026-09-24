@@ -45,16 +45,43 @@ def update_exotel_session(connection, organisation_id: str, integration_id: str,
                           generation: int, state: str, *, activity: bool = False) -> bool:
     if state not in {"LIVE", "DRAINING", "ENDED", "INCOMPLETE"}:
         raise ValueError("invalid Exotel session state")
+    if state == "LIVE" and not activity or state != "LIVE" and activity:
+        raise ValueError("LIVE is reserved for activity updates")
+    allowed_from = {"LIVE": "'LIVE'", "DRAINING": "'LIVE'", "ENDED": "'DRAINING'", "INCOMPLETE": "'LIVE','DRAINING'"}[state]
     timestamp = {"DRAINING": "draining_at", "ENDED": "ended_at", "INCOMPLETE": "incomplete_at"}.get(state)
     activity_sql = ",last_activity_at=now()" if activity else ""
     timestamp_sql = f",{timestamp}=now()" if timestamp else ""
     row = connection.execute(
         "UPDATE exotel_sessions SET state=%s,updated_at=now()" + timestamp_sql + activity_sql +
         " WHERE organisation_id=%s AND integration_id=%s AND call_key=%s AND generation=%s "
-        "AND state IN ('LIVE','DRAINING') RETURNING generation",
+        f"AND state IN ({allowed_from}) RETURNING generation",
         (state, organisation_id, integration_id, call_key, generation),
     ).fetchone()
     return row is not None
+
+
+def recover_stale_exotel_sessions(connection, organisation_id: str) -> int:
+    """Bound orphaned LIVE sessions and allow a long but finite recording drain."""
+    # ponytail: recover at most 200 per snapshot; later snapshots drain larger backlogs.
+    return connection.execute(
+        "WITH stale AS (SELECT organisation_id,integration_id,call_key FROM exotel_sessions "
+        "WHERE organisation_id=%s::uuid AND ((state='LIVE' AND last_activity_at<now()-interval '90 seconds') "
+        "OR (state='DRAINING' AND draining_at<now()-interval '2 hours 1 minute')) "
+        "ORDER BY updated_at LIMIT 200 FOR UPDATE SKIP LOCKED) "
+        "UPDATE exotel_sessions s SET state='INCOMPLETE',incomplete_at=now(),updated_at=now() FROM stale "
+        "WHERE s.organisation_id=stale.organisation_id AND s.integration_id=stale.integration_id AND s.call_key=stale.call_key",
+        (organisation_id,),
+    ).rowcount
+
+
+def recording_intake_committed(connection, organisation_id: str, integration_id: str, call_key: str,
+                               generation: int, external_ref: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM calls c JOIN exotel_sessions s ON s.organisation_id=c.organisation_id "
+        "WHERE c.organisation_id=%s::uuid AND c.external_ref=%s AND s.integration_id=%s "
+        "AND s.call_key=%s AND s.generation=%s AND s.state='ENDED' LIMIT 1",
+        (organisation_id, external_ref, integration_id, call_key, generation),
+    ).fetchone() is not None
 
 
 def read_live_calls(connection, scope: Scope) -> list[dict]:
@@ -70,9 +97,11 @@ def read_live_calls(connection, scope: Scope) -> list[dict]:
             return []
         predicate = " AND team_id=ANY(%s)"
         parameters.append(sorted(scope.team_ids))
+    recover_stale_exotel_sessions(connection, scope.organisation_id)
     rows = connection.execute(
         "SELECT call_key,agent_id,team_id,state,started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at "
         "FROM exotel_sessions WHERE organisation_id=%s::uuid" + predicate +
+        " AND state<>'UNKNOWN' AND agent_id IS NOT NULL AND team_id IS NOT NULL "
         " AND (state IN ('LIVE','DRAINING') OR updated_at >= now()-interval '15 minutes') "
         "ORDER BY updated_at DESC LIMIT 200",
         tuple(parameters),

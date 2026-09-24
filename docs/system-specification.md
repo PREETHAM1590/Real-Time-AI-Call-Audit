@@ -205,7 +205,7 @@ Use UUIDs for application identities; local inference segment IDs are separately
 | reviews | organisation_id, id, audit_id, base_review_version, reviewer_id, action, effective_scores_json, reason, created_at; append-only |
 | jobs | organisation_id, id, call_id, stage, input_revision, state, attempts, available_at, lease_token, lease_until, last_error_code; unique call/stage/input revision |
 | events | organisation_id, sequence, call_id, type, redacted_payload, created_at; ordered resumable dashboard outbox |
-| exotel_sessions | organisation_id, integration_id, hashed call_key, generation, state, agent_id, team_id, lifecycle timestamps; tenant-scoped authenticated media lifecycle, no phone number or content fields |
+| exotel_sessions | organisation_id, integration_id, hashed call_key, generation, state, agent_id, team_id, lifecycle timestamps; tenant-scoped authenticated media lifecycle, no phone number or content fields; pre-lifecycle rows remain UNKNOWN and hidden |
 | access_log | organisation_id, actor_id, action, resource_id, outcome, request_id, created_at; restricted append-only writer |
 
 Use composite organisation/ID foreign keys to prevent cross-tenant references. Add organisation/team/date and organisation/state/date indexes for scoped queries. Reviews reference immutable audit revisions; no mutable `human_override` column on the machine record.

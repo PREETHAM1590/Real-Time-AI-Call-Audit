@@ -118,7 +118,7 @@ class ExotelWebSocketTests(unittest.TestCase):
         call_key = make_audio_references("org-a", "acct-a", "call-a")[0].partition(":")[2]
         self.assertEqual(self.connection.session_params[2], call_key)
         self.assertEqual(intake.call_args.kwargs["generation_fence"], ("integration-a", call_key, 4, "external-agent", "agent-a", "team-a"))
-        self.assertEqual(self.connection.session_states, ["DRAINING", "ENDED"])
+        self.assertEqual(self.connection.session_states, ["DRAINING"])
 
     def test_gap_and_wrong_password_never_submit_audio(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:

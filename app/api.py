@@ -35,7 +35,7 @@ from app.operations import operations_summary
 from app.events import EventCursorError, EventCursorExpired, EventForbidden, encode_sse, parse_last_event_id, read_events, reset_required_event
 from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
 from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
-from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, update_exotel_session
+from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, recording_intake_committed, update_exotel_session
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -697,6 +697,11 @@ def create_app(
             with connection.transaction():
                 return update_exotel_session(connection, organisation_id, integration_id, call_key, generation, state, activity=activity)
 
+    def reconcile_exotel_intake(organisation_id: str, integration_id: str, call_key: str,
+                                generation: int, external_ref: str) -> bool:
+        with connect(timeout_seconds=5) as connection:
+            return recording_intake_committed(connection, organisation_id, integration_id, call_key, generation, external_ref)
+
     @app.websocket("/v1/exotel/stream")
     async def exotel_stream(websocket: WebSocket) -> None:
         if not _EXOTEL_CONNECTIONS.acquire(blocking=False):
@@ -776,7 +781,9 @@ def create_app(
                             await websocket.close(code=4400)
                             return
                         if event.event == "stop":
-                            await run_in_threadpool(persist_exotel_state, *lifecycle, "DRAINING")
+                            if not await run_in_threadpool(persist_exotel_state, *lifecycle, "DRAINING"):
+                                await websocket.close(code=4409)
+                                return
                             break
                     elif event is not None:
                         if event.missing_sequences or event.missing_chunks or event.stream_offset_ms != expected_timestamp:
@@ -806,12 +813,14 @@ def create_app(
                     generation_fence=(integration[1], call_key, generation, agent_ref, agent_scope.user_id, next(iter(agent_scope.team_ids))),
                     timeout_seconds=remaining_seconds,
                 )
-            except (IntakeError, ExternalReferenceConflict, IdempotencyConflict):
-                await websocket.close(code=4409)
-                return
-            if not await run_in_threadpool(persist_exotel_state, *lifecycle, "ENDED"):
-                await websocket.close(code=4409)
-                return
+            except Exception:
+                try:
+                    accepted = await run_in_threadpool(reconcile_exotel_intake, *lifecycle, external_ref)
+                except Exception:
+                    accepted = False
+                if not accepted:
+                    await websocket.close(code=4409)
+                    return
             lifecycle = None
             await websocket.close(code=1000)
         except TimeoutError:

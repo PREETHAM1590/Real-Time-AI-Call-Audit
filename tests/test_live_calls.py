@@ -2,15 +2,22 @@
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
 
 from app.auth import Scope
-from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, update_exotel_session
+from app.ingest import IntakeError, accept_recording
+from app.live_calls import (LiveCallsForbidden, activate_exotel_session, read_live_calls,
+                            recording_intake_committed, recover_stale_exotel_sessions,
+                            update_exotel_session)
 
 
 class _Result:
-    def __init__(self, one=None, many=None):
+    def __init__(self, one=None, many=None, rowcount=0):
         self.one = one
         self.many = [] if many is None else many
+        self.rowcount = rowcount
 
     def fetchone(self):
         return self.one
@@ -20,11 +27,12 @@ class _Result:
 
 
 class _Connection:
-    def __init__(self, *, rows=(), generation=5, mapping=("agent-a", "team-a"), memberships=(("team-a",),)):
+    def __init__(self, *, rows=(), generation=5, mapping=("agent-a", "team-a"), memberships=(("team-a",),), committed=False):
         self.rows = list(rows)
         self.generation = generation
         self.mapping = mapping
         self.memberships = list(memberships)
+        self.committed = committed
         self.queries = []
 
     def transaction(self):
@@ -45,10 +53,71 @@ class _Connection:
         if "INSERT INTO exotel_sessions" in query:
             return _Result((self.generation,))
         if "UPDATE exotel_sessions" in query:
+            if "SET state='INCOMPLETE'" in query:
+                return _Result(rowcount=1)
             return _Result((params[-1],))
+        if "SELECT 1 FROM calls" in query:
+            return _Result((1,) if self.committed else None)
         if "SELECT call_key" in query:
-            return _Result(many=self.rows)
+            return _Result(many=[row for row in self.rows if row[3] != "UNKNOWN"])
         raise AssertionError(f"Unexpected query: {query}")
+
+
+class _IntakeConnection:
+    def __init__(self, *, allow_ended=True):
+        self.call_id = uuid4()
+        self.allow_ended = allow_ended
+        self.in_transaction = False
+        self.ended_was_in_transaction = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def transaction(self):
+        connection = self
+
+        class _Transaction:
+            def __enter__(self):
+                connection.in_transaction = True
+                return connection
+
+            def __exit__(self, *args):
+                connection.in_transaction = False
+                return False
+
+        return _Transaction()
+
+    def execute(self, query, params=()):
+        if "SELECT s.generation,s.state" in query:
+            return _Result((7, "DRAINING"))
+        if "FROM identity_memberships" in query:
+            return _Result(many=[("team-a",)])
+        if "INSERT INTO calls(" in query:
+            return _Result((self.call_id,))
+        if "INSERT INTO event_counters" in query:
+            return _Result((1,))
+        if "SELECT oldest_sequence" in query:
+            return _Result((1,))
+        if "SELECT sequence FROM events" in query or "SELECT 1 FROM calls c JOIN exotel_sessions" in query:
+            return _Result()
+        if "UPDATE exotel_sessions SET state='ENDED'" in query:
+            self.ended_was_in_transaction = self.in_transaction
+            return _Result((7,) if self.allow_ended else None)
+        return _Result()
+
+
+class _Storage:
+    def __init__(self):
+        self.deleted = []
+
+    def put(self, _audio):
+        return "synthetic-object"
+
+    def delete(self, key):
+        self.deleted.append(key)
 
 
 class LiveSessionLifecycleTests(unittest.TestCase):
@@ -72,10 +141,63 @@ class LiveSessionLifecycleTests(unittest.TestCase):
         self.assertTrue(update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, "DRAINING"))
         query, params = connection.queries[-1]
         self.assertIn("generation=%s", query)
-        self.assertIn("state IN ('LIVE','DRAINING')", query)
+        self.assertIn("state IN ('LIVE')", query)
         self.assertEqual(params[0], "DRAINING")
         with self.assertRaises(ValueError):
             update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, "FAILED")
+
+    def test_nominal_transition_matrix_and_activity_guard(self):
+        connection = _Connection()
+        for state, activity in (("LIVE", True), ("DRAINING", False), ("ENDED", False)):
+            self.assertTrue(update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, state, activity=activity))
+        self.assertIn("AND state IN ('LIVE')", connection.queries[1][0])
+        self.assertIn("AND state IN ('DRAINING')", connection.queries[2][0])
+        self.assertIn("last_activity_at=now()", connection.queries[0][0])
+        with self.assertRaises(ValueError):
+            update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, "LIVE")
+        with self.assertRaises(ValueError):
+            update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, "DRAINING", activity=True)
+
+    def test_stale_recovery_is_bounded_for_live_and_draining(self):
+        connection = _Connection()
+        self.assertEqual(recover_stale_exotel_sessions(connection, "org-a"), 1)
+        query = connection.queries[0][0]
+        self.assertIn("last_activity_at<now()-interval '90 seconds'", query)
+        self.assertIn("draining_at<now()-interval '2 hours 1 minute'", query)
+
+    def test_migration_hides_legacy_sessions_as_unknown_and_backfills_times(self):
+        migration = (Path(__file__).resolve().parent.parent / "migrations" / "018_exotel_session_lifecycle.sql").read_text(encoding="utf-8")
+        self.assertIn("DEFAULT 'UNKNOWN'", migration)
+        self.assertIn("SET updated_at=started_at,last_activity_at=started_at", migration)
+        now = datetime.now(timezone.utc)
+        legacy = ("b" * 64, None, None, "UNKNOWN", now, None, None, None, now, now)
+        self.assertEqual(read_live_calls(_Connection(rows=[legacy]), Scope("org-a", "qa-a", "QA_ANALYST", frozenset())), [])
+
+    def test_reconcile_confirms_only_committed_ended_session(self):
+        self.assertTrue(recording_intake_committed(_Connection(committed=True), "org-a", "integration-a", "a" * 64, 5, "sha256:ref"))
+        self.assertFalse(recording_intake_committed(_Connection(committed=False), "org-a", "integration-a", "a" * 64, 5, "sha256:ref"))
+
+    def test_accept_recording_commits_ended_transition_inside_intake_transaction(self):
+        connection = _IntakeConnection()
+        storage = _Storage()
+        scope = Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+        with patch("app.ingest.connect", return_value=connection), patch("app.ingest.inspect_audio", return_value=("wav", 8000, 1, 100)):
+            result = accept_recording(scope, "sha256:ref", b"synthetic", {}, "idem",
+                                      storage=storage, generation_fence=("integration-a", "a" * 64, 7, "external-agent", "agent-a", "team-a"))
+        self.assertEqual(result["processing_state"], "QUEUED")
+        self.assertTrue(connection.ended_was_in_transaction)
+        self.assertEqual(storage.deleted, [])
+
+    def test_failed_ended_transition_rolls_back_and_does_not_claim_acceptance(self):
+        connection = _IntakeConnection(allow_ended=False)
+        storage = _Storage()
+        scope = Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+        with patch("app.ingest.connect", return_value=connection), patch("app.ingest.inspect_audio", return_value=("wav", 8000, 1, 100)):
+            with self.assertRaisesRegex(IntakeError, "finalized"):
+                accept_recording(scope, "sha256:ref", b"synthetic", {}, "idem",
+                                 storage=storage, generation_fence=("integration-a", "a" * 64, 7, "external-agent", "agent-a", "team-a"))
+        self.assertTrue(connection.ended_was_in_transaction)
+        self.assertEqual(storage.deleted, ["synthetic-object"])
 
 
 class LiveCallsScopeTests(unittest.TestCase):
@@ -91,6 +213,7 @@ class LiveCallsScopeTests(unittest.TestCase):
         self.assertIn("organisation_id=%s::uuid", query)
         self.assertIn("team_id=ANY(%s)", query)
         self.assertEqual(params, ("org-a", ["team-a", "team-b"]))
+        self.assertTrue(any("state<>'UNKNOWN'" in query for query, _ in connection.queries))
         self.assertTrue(result[0]["stale"])
         self.assertEqual(result[0]["call_key"], "a" * 64)
 
