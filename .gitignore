@@ -14,3 +14,7 @@ models/
 *.onnx
 *.safetensors
 *.bin
+
+# Kaggle GPU benchmark: generated per-run, never committed.
+benchmarks/kaggle_gpu_benchmark/.build/
+benchmarks/kaggle_gpu_benchmark/results/

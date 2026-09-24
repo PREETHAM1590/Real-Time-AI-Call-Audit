@@ -51,6 +51,10 @@ The Dockerfile builds one backend image with the locked base, transcription and 
 
 Use deterministic local inference fakes in ordinary CI. Run actual pinned-model tests in isolated staging with the selected CPU/GPU allocation. Fail visibly if an artifact or runtime is missing; never silently substitute fake results. Verify inference still works with outbound internet blocked after controlled provisioning.
 
+### Pre-provisioning GPU benchmark (Kaggle)
+
+Before dedicated GPU hardware is available, [`benchmarks/kaggle_gpu_benchmark/`](../benchmarks/kaggle_gpu_benchmark/README.md) runs a one-off, disposable benchmark on a Kaggle-hosted GPU notebook to produce a first Local model contract data point for faster-whisper and the Qwen3-8B audit candidate, against synthetic-only fixtures generated in the script itself. Kaggle notebook sessions are ephemeral and are not "infrastructure controlled by this project"; nothing there is wired into the running application, and the application's own adapters stay bound to loopback-only self-hosted endpoints regardless of what it measures. Status: harness written, **not yet run** — no numbers exist here until it is executed and its `benchmark_result.json` is transcribed below, explicitly labelled as measured on Kaggle's GPU, not target production hardware.
+
 ## Golden-set protocol
 
 Start with 100 adjudicated calls across normal, high-risk, silent, short, noisy, overlapping, mono, dual-channel and prompt-injection cases. Keep identities and recordings restricted; use redacted transcript fixtures in source control. Separate prompt-development examples from held-out evaluation examples. Deduplicate by underlying conversation so train/evaluation versions cannot overlap.
