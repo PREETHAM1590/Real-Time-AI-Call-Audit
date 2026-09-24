@@ -371,7 +371,7 @@ The browser test supplies deterministic synthetic fixtures and does not disable 
 
 ## Task 7: Add India-facing telephony adapters and finalisation barrier
 
-The user's expanded scope is an extensible, capability-truthful provider set for the Indian contact-centre market, not a claim that a finite catalogue can include every carrier, reseller, PBX and account-specific product. Research the six public product families in specification §6 “India-facing telephony coverage”; implement adapters only after current product docs, an authenticated test tenant, account entitlements, agent/team mapping and the media or recording contract have been confirmed. The first live adapter remains the earliest live-media milestone; post-call-only providers must not be presented as real-time media sources. Add further providers from customer/operator evidence rather than assuming the public research set is exhaustive.
+The user's expanded scope is an extensible, capability-truthful provider set for the Indian contact-centre market, not a claim that a finite catalogue can include every carrier, reseller, PBX and account-specific product. Research the initial vendor set in specification §6 “India-facing telephony coverage”; implement adapters only after current product docs, an authenticated test tenant, account entitlements, agent/team mapping and the media or recording contract have been confirmed. The first live adapter remains the earliest live-media milestone; post-call-only providers must not be presented as real-time media sources. Add further providers from customer/operator evidence rather than assuming the public research set is exhaustive.
 
 **Files:** Create `app/media.py`, `tests/test_media.py`; modify transcription/worker/API.
 
