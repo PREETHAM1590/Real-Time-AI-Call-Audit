@@ -363,6 +363,15 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
                         review_saved = True
                         review_head += 1
                         route.fulfill(status=201, content_type="application/json", body=json.dumps({"version": 1, "action": "ACCEPT"}))
+                    elif path == "/v1/calls/call-1/disposition":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                            "call_id": "call-1", "revision": 1, "transcript_revision": 1, "config_id": "retention_v1",
+                            "config_version": 1, "config_hash": "a" * 64, "schema_version": "1.0.0",
+                            "model_artifact": "local-disposition-v1", "adapter_version": "vllm-adapter-1",
+                            "processing_path": "MODEL_RULE", "status": "RESOLVED", "code": "CALLBACK", "parent_code": None,
+                            "confidence": 0.82, "requires_review": False, "review_reason": None,
+                            "matched_rule_id": "CALLBACK", "signals": {}, "usage": {}, "created_at": "2026-09-23T00:05:00+00:00",
+                        }))
                     elif path == "/v1/calls/call-1/audio-access":
                         audio_grants.append(True)
                         route.fulfill(status=200, content_type="application/json", body=json.dumps({"url": f"/v1/calls/call-1/audio?capability=synthetic-{len(audio_grants)}", "expires_in_seconds": 60}))
@@ -379,6 +388,16 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
                 self.assertIn("Agent: agent-a", queue_text)
                 self.assertIn("Team: team-a", queue_text)
                 self.assertRegex(queue_text, r"Age: \d+[mhd] old")
+                disposition_text = page.locator(".disposition-card").inner_text()
+                self.assertIn("CALLBACK", disposition_text)
+                self.assertIn("RESOLVED", disposition_text)
+                self.assertIn("MODEL_RULE", disposition_text)
+                self.assertIn("0.82", disposition_text)
+                self.assertIn("retention_v1", disposition_text)
+                self.assertIn("local-disposition-v1", disposition_text)
+                self.assertIn("vllm-adapter-1", disposition_text)
+                self.assertIn("aaaaaaaaaaaa", disposition_text)
+                self.assertIn("Disposition (separate from QA audit score)", page.locator("#call-detail").inner_text())
                 self.assertIn("1 policy finding linked", page.locator(".transcript-row").first.inner_text())
                 evidence_links = page.locator(".evidence-link")
                 self.assertIn(citation_quote, evidence_links.first.inner_text())

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Disposition configuration · Call Audit</title>
+    <link rel="stylesheet" href="/analyst-assets/styles.css">
+    <script src="/analyst-assets/dispositions.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/analyst">Call Audit</a>
+      <nav aria-label="Primary navigation" class="primary-nav">
+        <a href="/analyst">Review</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/dispositions" aria-current="page">Dispositions</a>
+        <a href="/quality">Quality</a>
+        <a href="/providers">Provider coverage</a>
+      </nav>
+    </header>
+    <div class="page-intro"><h1>Disposition configuration</h1><span>Tenant-scoped immutable JSON versions · deterministic rules resolve the outcome, separate from QA scores</span></div>
+    <main class="report-layout dispositions-page">
+      <p id="dispositions-status" class="status" role="status" aria-live="polite">Loading configuration versions…</p>
+      <section id="dispositions-admin" aria-labelledby="versions-title" class="block" hidden>
+        <div class="section-heading"><h2 id="versions-title">Configuration versions</h2><button id="refresh-versions" type="button">Refresh</button></div>
+        <div class="table-scroll" role="region" aria-label="Disposition configuration versions" tabindex="0">
+          <table id="versions-table" class="versions-table">
+            <caption>Newest versions per configuration ID, with derived status and lineage</caption>
+            <thead>
+              <tr><th scope="col">Config</th><th scope="col">Version</th><th scope="col">Status</th><th scope="col">Hash</th><th scope="col">Created by</th><th scope="col">Approved by</th><th scope="col">Actions</th></tr>
+            </thead>
+            <tbody id="versions-body"></tbody>
+          </table>
+        </div>
+        <p id="action-status" class="status" role="status" aria-live="polite"></p>
+
+        <section aria-labelledby="stage-title" class="block editor-panel">
+          <h3 id="stage-title">Validate or stage a new version</h3>
+          <p>Paste a tenant-scoped disposition configuration JSON document. Validation runs before staging; staging persists an immutable version that still requires a second administrator's approval before activation.</p>
+          <div class="editor-toolbar">
+            <button id="load-sample" type="button">Load synthetic sample</button>
+            <span class="editor-hint">The sample is a local, synthetic fixture bundled with this page. It fetches nothing and contains no tenant or production data.</span>
+          </div>
+          <label for="config-json">Configuration JSON</label>
+          <textarea id="config-json" rows="14" spellcheck="false" placeholder="Paste configuration JSON, or use Load synthetic sample."></textarea>
+          <div id="field-errors" class="field-errors" role="alert"></div>
+          <div class="actions">
+            <button id="validate-config" type="button">Validate</button>
+            <button id="stage-config" type="button">Stage version</button>
+          </div>
+        </section>
+
+        <section aria-labelledby="rollback-title" class="block editor-panel">
+          <h3 id="rollback-title">Rollback active configuration</h3>
+          <p>Roll back to a version that was previously active and independently approved. A reason is required.</p>
+          <form id="rollback-form" class="rollback-form">
+            <label for="rollback-config-id">Config ID</label>
+            <input id="rollback-config-id" required maxlength="128" autocomplete="off">
+            <label for="rollback-version">Target version</label>
+            <input id="rollback-version" type="number" min="1" required>
+            <label for="rollback-generation">Expected active generation</label>
+            <input id="rollback-generation" type="number" min="1" required>
+            <label for="rollback-reason">Reason</label>
+            <textarea id="rollback-reason" required maxlength="1000"></textarea>
+            <button type="submit">Roll back</button>
+          </form>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

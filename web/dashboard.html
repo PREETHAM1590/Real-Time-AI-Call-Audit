@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Overview dashboard · Call Audit</title>
+    <link rel="stylesheet" href="/analyst-assets/styles.css">
+    <script src="/analyst-assets/dashboard.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/analyst">Call Audit</a>
+      <nav aria-label="Primary navigation" class="primary-nav">
+        <a href="/analyst">Review</a>
+        <a href="/dashboard" aria-current="page">Dashboard</a>
+        <a href="/dispositions">Dispositions</a>
+        <a href="/quality">Quality</a>
+        <a href="/providers">Provider coverage</a>
+      </nav>
+    </header>
+    <div class="page-intro"><h1>Overview dashboard</h1><span>Operational health from authorised, role-scoped endpoints · never implies all-clear when a panel fails</span></div>
+    <main class="report-layout dashboard-page">
+      <section aria-labelledby="kpi-title" class="block">
+        <h2 id="kpi-title">Operations summary</h2>
+        <p id="kpi-status" class="status" role="status" aria-live="polite">Loading operations summary…</p>
+        <div id="kpi-tiles" class="kpi-tiles"></div>
+      </section>
+      <div class="dashboard-grid">
+        <section aria-labelledby="queue-panel-title" class="block panel-card">
+          <h2 id="queue-panel-title">Review queue</h2>
+          <p id="queue-panel-status" class="status" role="status" aria-live="polite">Loading review queue…</p>
+          <div id="queue-panel-body"></div>
+        </section>
+        <section aria-labelledby="live-panel-title" class="block panel-card">
+          <h2 id="live-panel-title">Live call sessions</h2>
+          <p id="live-panel-status" class="status" role="status" aria-live="polite">Loading live sessions…</p>
+          <div id="live-panel-body"></div>
+        </section>
+        <section aria-labelledby="disposition-panel-title" class="block panel-card">
+          <h2 id="disposition-panel-title">Disposition configuration</h2>
+          <p id="disposition-panel-status" class="status" role="status" aria-live="polite">Loading disposition configuration…</p>
+          <div id="disposition-panel-body"></div>
+        </section>
+        <section aria-labelledby="scores-panel-title" class="block panel-card">
+          <h2 id="scores-panel-title">Quality scores</h2>
+          <p id="scores-panel-status" class="status" role="status" aria-live="polite">Loading quality scores…</p>
+          <div id="scores-panel-body"></div>
+        </section>
+      </div>
+      <section aria-labelledby="capability-title" class="block capability-panel">
+        <h2 id="capability-title">Capability status</h2>
+        <p>What is implemented and running versus what is pending, and why. This panel is a truthful status list, not a roadmap promise.</p>
+        <ul id="capability-list" class="capability-status-list"></ul>
+      </section>
+    </main>
+  </body>
+</html>

@@ -223,6 +223,40 @@ function addEvidenceButton(container, evidence, byUtterance) {
   container.append(button);
 }
 
+function renderDispositionCard(host, disposition) {
+  const block = element("section", undefined, "block");
+  block.append(element("h3", "Disposition (separate from QA audit score)"));
+  if (!disposition) {
+    block.append(element("p", "Unavailable for this transcript revision.", "empty-state"));
+    host.append(block);
+    return;
+  }
+  const card = element("div", undefined, "disposition-card");
+  const fields = [
+    ["Code", disposition.code || disposition.status || "Unavailable"],
+    ["Status", disposition.status ?? "Unavailable"],
+    ["Matched rule", disposition.matched_rule_id ?? "None"],
+    ["Processing path", disposition.processing_path ?? "Unavailable"],
+    ["Confidence", disposition.confidence ?? "Unavailable"],
+    ["Requires review", disposition.requires_review === undefined ? "Unavailable" : (disposition.requires_review ? "Yes" : "No")],
+    ["Review reason", disposition.review_reason ?? "None"],
+    ["Config", disposition.config_id ? `${disposition.config_id} · v${disposition.config_version}` : "Unavailable"],
+    ["Config hash", disposition.config_hash ? disposition.config_hash.slice(0, 12) : "Unavailable"],
+    ["Model artifact", disposition.model_artifact ?? "Unavailable"],
+    ["Adapter version", disposition.adapter_version ?? "Unavailable"],
+    ["Transcript revision", disposition.transcript_revision ?? "Unavailable"],
+    ["Revision", disposition.revision ?? "Unavailable"],
+    ["Created at", disposition.created_at ?? "Unavailable"],
+  ];
+  for (const [title, value] of fields) {
+    const cell = element("div", undefined, "summary-card");
+    cell.append(element("strong", title), element("span", value));
+    card.append(cell);
+  }
+  block.append(card);
+  host.append(block);
+}
+
 function renderCall(data) {
   state.call = data;
   state.audioGranted = false;
@@ -241,7 +275,6 @@ function renderCall(data) {
     ["Machine score", audit?.machine_score ?? "Unavailable"],
     ["Machine decision", audit?.machine_decision ?? "Unavailable"],
     ["Reviewed score", data.reviews.length ? (data.reviews[data.reviews.length - 1].effective_score ?? "Unscored") : "Not reviewed"],
-    ["Disposition", data.disposition ? `${data.disposition.code || data.disposition.status} · config v${data.disposition.config_version}` : "Unavailable for this transcript revision"],
   ];
   for (const [title, value] of summaries) {
     const card = element("div", undefined, "summary-card");
@@ -253,7 +286,9 @@ function renderCall(data) {
   const reviewRail = element("aside", undefined, "review-rail");
   reviewRail.setAttribute("aria-label", "Audit findings and review actions");
   workspace.append(evidenceColumn, reviewRail);
-  host.append(summary, workspace);
+  host.append(summary);
+  renderDispositionCard(host, data.disposition);
+  host.append(workspace);
   const alreadyTriaged = data.reviews?.some((review) => review.action === "TRIAGE" && review.effective_decision === "NEEDS_REVIEW");
   if (audit && !audit.superseded && alreadyTriaged) {
     reviewRail.append(element("p", "This call has been triaged and remains in the review queue. Its evidence is still insufficient for a score.", "status"));
@@ -458,6 +493,12 @@ async function loadCall(callId) {
   byId("call-status").textContent = "Loading call evidence…";
   try {
     const detail = await request(`/v1/calls/${encodeURIComponent(callId)}`);
+    if (detail.disposition) {
+      try {
+        const enriched = await request(`/v1/calls/${encodeURIComponent(callId)}/disposition`);
+        if (enriched && enriched.status !== "PENDING") detail.disposition = { ...detail.disposition, ...enriched };
+      } catch { /* keep the summary disposition fields already present on the call detail */ }
+    }
     renderCall(detail);
     byId("call-status").textContent = detail.audit?.superseded
       ? "This audit uses superseded transcript evidence. Scoring actions are disabled; reload the current review queue."

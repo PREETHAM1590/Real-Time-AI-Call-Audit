@@ -1135,6 +1135,14 @@ def create_app(
         def providers_home():
             return FileResponse(web_root / "providers.html")
 
+        @app.get("/dashboard", include_in_schema=False)
+        def dashboard_home():
+            return FileResponse(web_root / "dashboard.html")
+
+        @app.get("/dispositions", include_in_schema=False)
+        def dispositions_home():
+            return FileResponse(web_root / "dispositions.html")
+
         app.mount("/analyst-assets", StaticFiles(directory=web_root), name="analyst-assets")
 
     limited_app = UploadBodyLimitMiddleware(app, max_bytes=MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES, get_scope=get_scope)

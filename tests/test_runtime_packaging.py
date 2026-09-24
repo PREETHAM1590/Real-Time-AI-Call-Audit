@@ -28,6 +28,19 @@ class RuntimePackagingTests(unittest.TestCase):
                 composed = composed.app
             self.assertIn("/health", {route.path for route in composed.routes})
             self.assertIn("/providers", {route.path for route in composed.routes})
+            self.assertIn("/dashboard", {route.path for route in composed.routes})
+            self.assertIn("/dispositions", {route.path for route in composed.routes})
+            from fastapi.testclient import TestClient
+
+            with TestClient(module.app) as client:
+                dashboard = client.get("/dashboard")
+                dispositions = client.get("/dispositions")
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertIn("text/html", dashboard.headers["content-type"])
+            self.assertIn("Overview dashboard", dashboard.text)
+            self.assertEqual(dispositions.status_code, 200)
+            self.assertIn("text/html", dispositions.headers["content-type"])
+            self.assertIn("Disposition configuration", dispositions.text)
             sys.modules.pop("app.main", None)
 
     def test_worker_idle_loop_waits_then_honours_shutdown(self):
