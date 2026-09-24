@@ -196,7 +196,7 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
 
                 page.locator("#upload-audio").set_input_files({"name": "synthetic.wav", "mimeType": "audio/wav", "buffer": b"synthetic wav fixture"})
                 page.get_by_role("button", name="Upload recording").click()
-                page.wait_for_function("document.querySelector('#upload-status').textContent.length > 0")
+                page.wait_for_function("document.querySelector('#upload-status').classList.contains('error')")
                 self.assertTrue(page.locator("#upload-status").evaluate("node => node.classList.contains('error')"))
                 self.assertEqual(len(uploads), 1)
 
@@ -316,10 +316,19 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
                 page.evaluate("""() => Object.defineProperty(document.querySelector('#call-audio'), 'currentTime', {configurable: true, writable: true, value: 0})""")
                 evidence_links.first.click()
                 self.assertEqual(page.locator("#call-audio").evaluate("player => player.currentTime"), 1.75)
+                page.wait_for_function("""() => {
+                    const mark = document.querySelector('.transcript-row mark')?.getBoundingClientRect();
+                    const rail = document.querySelector('.review-rail')?.getBoundingClientRect();
+                    return mark && rail && mark.top >= rail.bottom + 4 && mark.bottom <= innerHeight;
+                }""")
                 mark_box = page.locator(".transcript-row mark").bounding_box()
                 rail_box = page.locator(".review-rail").bounding_box()
                 self.assertGreaterEqual(mark_box["y"], rail_box["y"] + rail_box["height"] + 4)
                 self.assertLessEqual(mark_box["y"] + mark_box["height"], 700)
+                page.set_viewport_size({"width": 390, "height": 700})
+                marker_box = page.locator(".policy-evidence-marker").first.bounding_box()
+                self.assertLessEqual(marker_box["x"] + marker_box["width"], 390)
+                self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
                 page.get_by_role("button", name="Renew audio access").click()
                 page.wait_for_function("document.querySelector('#call-audio').src.includes('synthetic-2')")
                 self.assertEqual(len(audio_grants), 2)

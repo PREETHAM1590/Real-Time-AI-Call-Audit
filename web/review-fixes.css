@@ -15,3 +15,4 @@
   .evidence-column { grid-row: 2; }
   .transcript-row { scroll-margin-top: calc(45vh + 3.5rem); }
 }
+@media (max-width: 520px) { .policy-evidence-marker { grid-column: 1 / -1; } }
