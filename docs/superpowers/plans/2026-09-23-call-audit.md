@@ -184,7 +184,7 @@ Update completion only when ID/token match, lease is unexpired, state is RUNNING
 - `prepare_utterances(segments: list[dict], redact: Callable[[str], str]) -> list[Utterance]` requires a redactor; there is no identity-redactor default.
 - `transcribe_recording(private_key: str, language: str) -> list[dict]` is the pinned local faster-whisper adapter.
 
-- [ ] **1. Add an executable privacy boundary check:**
+- [x] **1. Add an executable privacy boundary check:**
 
 ```python
 import unittest
@@ -203,8 +203,8 @@ class PrivacyTests(unittest.TestCase):
             prepare_utterances(segments, failed_redaction)
 ```
 
-- [ ] **2. Run:** `python -m unittest tests.test_transcription -v`; expect missing adapter/preparation function.
-- [ ] **3. Implement the pure boundary:**
+- [x] **2. Run:** `python -m unittest tests.test_transcription -v`; expect missing adapter/preparation function.
+- [x] **3. Implement the pure boundary:**
 
 ```python
 def prepare_utterances(segments, redact):
@@ -462,6 +462,8 @@ def sentiment_drop(previous, current):
 
 The pure helper applies these eligibility rules to already-inferred synthetic signals. Model selection/inference, probability generation, model-version provenance and live event delivery remain pending.
 - [ ] **4. Integrate one evaluated sentiment model** for utterance probabilities; compute turn and call aggregates as specified. Warm it before readiness. An unavailable sentiment model does not block deterministic policy checks; show unknown sentiment.
+
+**Step 4 substatus:** `app.sentiment_adapter.LocalSentimentAdapter` is implemented and unit-tested with a deterministic fake classifier: it verifies a local pinned model directory by SHA-256 (same helper as the transcription/audit adapters), sends only final redacted CUSTOMER utterance text, validates the returned class-probability shape and fails closed (never raises past the caller) on malformed output or inference failure, and has a `warm()` method. `compute_call_sentiment` combines it with the existing pure `sentiment_alert_times`, and returns an explicit `UNAVAILABLE`/`UNKNOWN` result rather than blocking when no model is configured or every utterance fails. `app.sentiment.customer_speech_trend` implements the spec's first/last-60-seconds-of-customer-speech call summary with duration weighting (`tests/test_live.py`); a contiguous-turn aggregate is not implemented because the spec does not define a turn boundary and one was not invented here. **Not done:** no real pinned checkpoint is selected, downloaded or evaluated (`docs/open-source-models.md`'s "Sentiment" row is unchanged); this adapter is not wired into the worker pipeline, any migration/persisted call field, the API, or the UI; model confidence remains uncalibrated per the operations guide until measured against adjudicated data.
 - [x] **5. Implement scoped post-call SSE state refresh:** migration 015 adds a tenant-local transactional sequence and a `call.updated` outbox containing only processing state and transcript revision. Intake, committed worker stages, retries, exhausted-job failures, and ACCEPT/OVERRIDE/TRIAGE review commits append in the same transaction. SSE revalidates the signed token and current server-owned membership/team scope before each event; the outbox retains at most 10,000 events per tenant, and call purge removes its events and advances the cursor floor so older clients receive `reset_required`. `GET /v1/events` resumes by `Last-Event-ID`, rejects future/invalid cursors, reads at most one row per authorized pull, and stops on disconnect. This is a post-call refresh feed only: live media, sentiment events, supervisor cards, and browser reconnect behavior are not implemented.
 - [ ] **6. Build active-call cards** with textual policy/sentiment state, evidence, acknowledgement and stale indicator. Browser test disconnects feed, expects “Reconnecting”, reconnects with previous cursor and asserts one finding after a replayed event. Backend test attempts another organisation's cursor/call and receives no data.
 - [ ] **7. Run backend checks and browser live check**, measure final-arrival-to-render latency, then commit `feat: add live supervisor monitoring`.
@@ -550,7 +552,7 @@ def precision_recall(tp, fp, fn):
 
 Undefined ratios remain null, never perfect scores. Score agreement uses only adjudicated applicable dimensions; report abstentions and excluded counts alongside it. The committed JSONL fixture is synthetic and contains a zero-positive case, a missed critical finding, an abstention and an excluded case. The strict input rejects transcript/raw-text fields. The report is deterministic and includes a dataset hash.
 - [x] **6a. Package the runtime:** pin `uvicorn`, generate `uv.lock`, provide `app.main:app` and a continuous bounded-idle worker entrypoint, and build one non-root Docker image. Compose remains PostgreSQL-only because native API/worker commands are sufficient for local development. Runtime smoke tests and a local image build verified UID/GID 10001. No models or secrets are copied into the image.
-- [ ] **6b. Add repository CI:** no remote/native CI is configured, so workflow setup, isolated PostgreSQL service checks, browser checks and secret scanning remain pending.
+- [x] **6b. Add repository CI:** `.github/workflows/ci.yml` runs the full backend/browser suite against a PostgreSQL 16 service container on every push/PR, plus a compile check and `scripts/scan_for_secrets.py` (a minimal stdlib-only credential-shape scanner; a maintained third-party scanning Action was deliberately not added because its exact release could not be verified from this workspace). Verified locally against an equivalent fresh-venv, TCP/password-auth PostgreSQL setup: 262 tests passed. See `docs/operations-and-evaluation.md`'s "Continuous integration" section for exact scope and what remains outside it (pinned-model quality/load, GPU capacity, staging drills).
 - [ ] **7. Run full operational verification:** backend suite and migration checks are runnable; browser/report suite and synthetic evaluator are available. Pinned-model contract/quality, 100-call/25-viewer load, selected-hardware percentiles, memory use and error-rate measurements remain unrun release gates.
 - [ ] **8. Perform restore/deletion drills** in staging, approve immutable-history disposition and retention, confirm role controls/redaction with QA/privacy owner, record exact licenses/artifact checksums, offline inference proof and compute cost projection, then follow staged rollout. These are not evidenced by local synthetic tests.
 - [ ] **9. Commit** `feat: qualify call audit operations` only after recording failures and resolved gates. A failing operational gate keeps production release pending; synthetic demonstration can still be complete.

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A concurrent push to the same branch cancels its superseded run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-and-browser:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: callaudit_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Isolated, disposable database for this run only; the "_test" suffix satisfies
+      # this repository's own integration-test safety check (see tests/test_ingest.py).
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/callaudit_test
+      RUN_POSTGRES_INTEGRATION: "1"
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg (unlocks the full-decode MP3 truncation check)
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,browser-test,transcription,privacy]"
+
+      - name: Install Playwright's Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Compile check
+        run: python -m compileall -q app tests
+
+      - name: Scan tracked files for well-known credential shapes
+        run: python scripts/scan_for_secrets.py
+
+      - name: Run backend and browser test suite
+        run: python -m unittest discover -s tests -v
