@@ -112,6 +112,21 @@ class ExotelWebSocketTests(unittest.TestCase):
                       "media_format": {"encoding": "raw", "sample_rate": 8000, "channels": 1, "bit_rate": 16}},
         }))
 
+    def test_sub_millisecond_frames_do_not_accumulate_timestamp_drift(self):
+        # 12 samples = 1.5 ms per frame; provider offsets follow true elapsed time (0, 1.5, 3.0 ms, floored).
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
+            with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
+                self._send_start(ws)
+                for index, offset in enumerate((0, 1, 3)):
+                    ws.send_text(json.dumps({"event": "media", "sequence_number": index + 2, "stream_sid": "stream-a",
+                                             "media": {"chunk": index + 1, "timestamp": str(offset),
+                                                       "payload": base64.b64encode(b"\x01\x00" * 12).decode()}}))
+                ws.send_text(json.dumps({"event": "stop", "sequence_number": 5, "stream_sid": "stream-a",
+                                         "stop": {"call_sid": "call-a", "account_sid": "acct-a", "reason": "callended"}}))
+                result = ws.receive()
+        self.assertEqual(result["code"], 1000)
+        self.assertEqual(intake.call_count, 1)
+
     def test_clean_synthetic_stream_submits_only_scoped_wav_to_intake(self):
         with patch("app.api.connect", return_value=self.connection), patch("app.api.accept_recording") as intake:
             result = self._stream()

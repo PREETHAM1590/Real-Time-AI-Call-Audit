@@ -870,8 +870,9 @@ def create_app(
                         if event.missing_sequences or event.missing_chunks or event.stream_offset_ms != expected_timestamp:
                             await websocket.close(code=4400)
                             return
-                        expected_timestamp += len(event.pcm) // 16
                         total_pcm_bytes += len(event.pcm)
+                        # Derive from cumulative bytes so sub-millisecond frames cannot accumulate truncation drift.
+                        expected_timestamp = total_pcm_bytes // 16
                         if expected_timestamp > ExotelSession.MAX_DURATION_MS or total_pcm_bytes > ExotelSession.MAX_STREAM_BYTES:
                             await websocket.close(code=4400)
                             return

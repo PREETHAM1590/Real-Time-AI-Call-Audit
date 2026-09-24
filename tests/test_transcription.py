@@ -186,6 +186,14 @@ class TranscriptionTests(unittest.TestCase):
             transcriber.push(b"\x00\x00" * (8000 * 4), 0)
         self.assertEqual(transcriber.buffered_bytes, 0)
 
+    def test_live_discard_while_idle_frees_buffered_audio(self):
+        transcriber = LiveWindowTranscriber(FakeModel([]), language="en", redact=lambda text: text)
+        transcriber.push(b"\x00\x00" * 800, 0)
+        self.assertEqual(transcriber.buffered_bytes, 1600)
+        transcriber.discard()
+        self.assertEqual(transcriber.buffered_bytes, 0)
+        self.assertEqual(transcriber.finish(), [])
+
     @requires_live_decode
     def test_live_malformed_model_timing_clears_audio_and_normalizes_locale(self):
         class LocaleModel:
