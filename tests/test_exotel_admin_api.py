@@ -143,18 +143,20 @@ class ExotelAdminApiTests(unittest.TestCase):
         self.state["integrations"].append((org, integration_id, "acct", "generated-user", b"salt", b"verifier", "admin"))
         self.state["active"][integration_id] = True
 
-    def test_non_admin_is_denied_before_any_database_query_on_all_admin_routes(self):
+    def test_non_admin_is_denied_before_exotel_database_access_on_all_admin_routes(self):
         with patch("app.api.connect") as connect:
             responses = (
                 self.client.post("/v1/exotel-integrations", headers=self._headers("qa"), json={"account_sid": "acct"}),
                 self.client.get("/v1/exotel-integrations", headers=self._headers("qa")),
+                self.client.get(f"/v1/exotel-integrations/{self.integration_id}/agents", headers=self._headers("qa")),
                 self.client.put(f"/v1/exotel-integrations/{self.integration_id}/agents/vendor-agent", headers=self._headers("qa"), json={"agent_id": "agent-a", "team_id": "team-a"}),
                 self.client.delete(f"/v1/exotel-integrations/{self.integration_id}", headers=self._headers("qa")),
+                self.client.delete(f"/v1/exotel-integrations/{self.integration_id}/agents/vendor-agent", headers=self._headers("qa")),
             )
-        self.assertEqual([response.status_code for response in responses], [403, 403, 403, 403])
+        self.assertEqual([response.status_code for response in responses], [403, 403, 403, 403, 403, 403])
         connect.assert_not_called()
 
-    def test_create_returns_secret_once_and_persists_only_verifier_with_audit_event(self):
+    def test_create_returns_secret_once_and_insert_parameters_keep_only_verifier(self):
         credentials = ("generated-user", "one-time-secret", b"salt", b"verifier")
         with patch("app.api.connect", return_value=self.connection), patch("app.api.integration_credentials", return_value=credentials):
             created = self.client.post("/v1/exotel-integrations", headers={**self._headers(), "X-Request-ID": "request-1"}, json={"account_sid": " acct "})
