@@ -121,6 +121,7 @@ thead th { background: #eaf0f4; font-size: .86rem; }
 .product-name { color: var(--muted); font-size: .84rem; font-weight: 450; }
 .capability { display: inline-block; margin-bottom: .28rem; padding: .12rem .38rem; border: 1px solid #627789; border-radius: 4px; font-size: .76rem; font-weight: 750; white-space: nowrap; }
 .capability.documented { border-color: #8d6100; background: #fff4d5; color: #533800; }
+.capability.implemented { border-color: #34715d; background: #e5f2ec; color: #1c4b3b; }
 .capability.pending { background: #f3f5f7; color: #374a5b; }
 .provider-table small { display: block; max-width: 23rem; color: var(--muted); }
 .coverage-note, .qualification-note { max-width: 78rem; line-height: 1.5; }
