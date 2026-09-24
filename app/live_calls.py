@@ -31,13 +31,20 @@ def activate_exotel_session(connection, organisation_id: str, integration_id: st
         row = connection.execute(
             "INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation,state,agent_id,team_id,"
             "started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at) "
-            "VALUES (%s,%s,%s,1,'LIVE',%s,%s,now(),NULL,NULL,NULL,now(),now()) "
+            "SELECT %s,%s,%s,1,'LIVE',%s,%s,now(),NULL,NULL,NULL,now(),now() "
+            "WHERE NOT EXISTS (SELECT 1 FROM calls c WHERE c.organisation_id=%s::uuid "
+            "AND c.external_ref='exotel:'||%s AND c.tombstoned_at IS NOT NULL) "
             "ON CONFLICT (organisation_id,integration_id,call_key) DO UPDATE SET "
             "generation=exotel_sessions.generation+1,state='LIVE',agent_id=EXCLUDED.agent_id,team_id=EXCLUDED.team_id,"
             "started_at=now(),draining_at=NULL,ended_at=NULL,incomplete_at=NULL,updated_at=now(),last_activity_at=now() "
+            "WHERE exotel_sessions.call_content_purged_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM calls c WHERE c.organisation_id=EXCLUDED.organisation_id "
+            "AND c.external_ref='exotel:'||EXCLUDED.call_key AND c.tombstoned_at IS NOT NULL) "
             "RETURNING generation",
-            (organisation_id, integration_id, call_key, agent_id, team_id),
+            (organisation_id, integration_id, call_key, agent_id, team_id, organisation_id, call_key),
         ).fetchone()
+        if row is None:
+            raise ValueError("Exotel call identity was tombstoned or purged")
     return int(row[0])
 
 
@@ -99,9 +106,12 @@ def read_live_calls(connection, scope: Scope) -> list[dict]:
         parameters.append(sorted(scope.team_ids))
     recover_stale_exotel_sessions(connection, scope.organisation_id)
     rows = connection.execute(
-        "SELECT call_key,agent_id,team_id,state,started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at "
+        "SELECT call_key,agent_id,team_id,state,started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at,generation "
         "FROM exotel_sessions WHERE organisation_id=%s::uuid" + predicate +
         " AND state<>'UNKNOWN' AND agent_id IS NOT NULL AND team_id IS NOT NULL "
+        " AND call_content_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM calls c "
+        "WHERE c.organisation_id=exotel_sessions.organisation_id AND c.external_ref='exotel:'||exotel_sessions.call_key "
+        "AND c.tombstoned_at IS NOT NULL) "
         " AND (state IN ('LIVE','DRAINING') OR updated_at >= now()-interval '15 minutes') "
         "ORDER BY updated_at DESC LIMIT 200",
         tuple(parameters),
@@ -123,5 +133,6 @@ def read_live_calls(connection, scope: Scope) -> list[dict]:
             "incomplete_at": row[7].astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if row[7] else None,
             "updated_at": updated.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "stale": row[3] in {"LIVE", "DRAINING"} and (now - activity).total_seconds() > 45,
+            "generation": int(row[10]),
         })
     return result

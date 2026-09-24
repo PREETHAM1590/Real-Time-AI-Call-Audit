@@ -163,6 +163,19 @@ class RetentionPostgresTests(unittest.TestCase):
                 "VALUES (%s,%s,'qa-reviewer','AUDIO_ACCESS_GRANTED','AUDIO_OBJECT',%s,'SUCCESS')",
                 (organisation_id, uuid4(), audio_id),
             )
+            integration_id, call_key = uuid4(), "a" * 64
+            connection.execute(
+                "INSERT INTO exotel_integrations(organisation_id,id,account_sid,username,password_salt,password_verifier,created_by) "
+                "VALUES (%s,%s,%s,%s,%s,%s,'synthetic-test')",
+                (organisation_id, integration_id, f"acct-{integration_id}", f"user-{integration_id}", bytes(16), bytes(32)),
+            )
+            connection.execute("UPDATE calls SET external_ref=%s WHERE organisation_id=%s AND id=%s",
+                               (f"exotel:{call_key}", organisation_id, call_id))
+            connection.execute(
+                "INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation,state,agent_id,team_id) "
+                "VALUES (%s,%s,%s,1,'LIVE','agent-private','team-private')",
+                (organisation_id, integration_id, call_key),
+            )
             requested = request_call_deletion(connection, str(organisation_id), str(call_id), "admin-user", now=datetime(2026, 9, 23, tzinfo=timezone.utc))
             self.assertEqual(requested["status"], "TOMBSTONED")
             append_call_updated(connection, str(organisation_id), str(call_id), "DELETING", 0)
@@ -176,6 +189,11 @@ class RetentionPostgresTests(unittest.TestCase):
             repeated = purge_call(connection, str(organisation_id), str(call_id), storage, now=datetime(2026, 9, 23, tzinfo=timezone.utc))
             self.assertEqual(result["status"], "PARTIAL_IMMUTABLE_HISTORY")
             self.assertEqual(repeated["status"], "ALREADY_PURGED")
+            session = connection.execute(
+                "SELECT call_content_purged_at FROM exotel_sessions WHERE organisation_id=%s AND integration_id=%s AND call_key=%s",
+                (organisation_id, integration_id, call_key),
+            ).fetchone()
+            self.assertIsNotNone(session[0])
             self.assertEqual(connection.execute("SELECT count(*) FROM events WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)).fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT oldest_sequence FROM event_counters WHERE organisation_id=%s", (organisation_id,)).fetchone()[0], 3)
             with self.assertRaises(EventCursorExpired):

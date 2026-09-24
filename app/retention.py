@@ -109,6 +109,13 @@ def purge_call(connection, organisation_id: str, call_id: str, storage, *, now: 
     org, call = _scope_ids(organisation_id, call_id)
     instant = _aware(now or datetime.now(timezone.utc))
     with connection.transaction():
+        # Exotel intake locks session before touching calls; keep the same order to avoid a purge/intake deadlock.
+        connection.execute(
+            "SELECT s.integration_id FROM exotel_sessions s JOIN calls c "
+            "ON c.organisation_id=s.organisation_id AND c.external_ref='exotel:'||s.call_key "
+            "WHERE c.organisation_id=%s AND c.id=%s ORDER BY s.integration_id,s.call_key FOR UPDATE OF s",
+            (org, call),
+        ).fetchall()
         row = connection.execute(
             "SELECT tombstoned_at,legal_hold,retention_expires_at,deletion_requested_at,content_purged_at "
             "FROM calls WHERE organisation_id=%s AND id=%s FOR UPDATE",
@@ -153,6 +160,12 @@ def purge_call(connection, organisation_id: str, call_id: str, storage, *, now: 
         # Keep the call row locked from hold verification through object deletion,
         # so a concurrent hold cannot race past this decision point.
         purge_call_events(connection, str(org), str(call))
+        connection.execute(
+            "UPDATE exotel_sessions s SET call_content_purged_at=%s FROM calls c "
+            "WHERE c.organisation_id=%s AND c.id=%s AND s.organisation_id=c.organisation_id "
+            "AND c.external_ref='exotel:'||s.call_key AND s.call_content_purged_at IS NULL",
+            (instant, org, call),
+        )
         for object_row in object_rows:
             storage.delete(object_row[0])
         connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (org, call))

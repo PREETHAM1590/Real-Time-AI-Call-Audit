@@ -1,12 +1,26 @@
 import unittest
 import logging
+import threading
 import uuid
 from unittest.mock import patch
 
-from app.worker import run_once
+from app.worker import run_forever, run_once
 
 
 class WorkerTests(unittest.TestCase):
+    def test_expired_live_transcript_sweeper_runs_during_long_worker_call(self):
+        stop_event = threading.Event()
+        swept = threading.Event()
+
+        def worker_call(*_args):
+            self.assertTrue(swept.wait(1))
+            stop_event.set()
+            return True
+
+        with patch("app.worker.sweep_live_transcripts", side_effect=swept.set), patch("app.worker.run_once", side_effect=worker_call):
+            run_forever("worker-a", {}, stop_event=stop_event)
+        self.assertTrue(swept.is_set())
+
     @patch("app.worker.defer_job", return_value=True)
     @patch("app.worker.claim_job", return_value=None)
     @patch("app.worker.connect")

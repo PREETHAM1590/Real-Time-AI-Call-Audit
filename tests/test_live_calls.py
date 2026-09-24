@@ -27,12 +27,14 @@ class _Result:
 
 
 class _Connection:
-    def __init__(self, *, rows=(), generation=5, mapping=("agent-a", "team-a"), memberships=(("team-a",),), committed=False):
+    def __init__(self, *, rows=(), generation=5, mapping=("agent-a", "team-a"), memberships=(("team-a",),), committed=False, tombstoned_call=False, content_purged=False):
         self.rows = list(rows)
         self.generation = generation
         self.mapping = mapping
         self.memberships = list(memberships)
         self.committed = committed
+        self.tombstoned_call = tombstoned_call
+        self.content_purged = content_purged
         self.queries = []
 
     def transaction(self):
@@ -51,12 +53,12 @@ class _Connection:
         if "FROM identity_memberships" in query:
             return _Result(many=self.memberships)
         if "INSERT INTO exotel_sessions" in query:
-            return _Result((self.generation,))
+            return _Result(None if self.tombstoned_call or self.content_purged else (self.generation,))
         if "UPDATE exotel_sessions" in query:
             if "SET state='INCOMPLETE'" in query:
                 return _Result(rowcount=1)
             return _Result((params[-1],))
-        if "SELECT 1 FROM calls" in query:
+        if query.startswith("SELECT 1 FROM calls"):
             return _Result((1,) if self.committed else None)
         if "SELECT call_key" in query:
             return _Result(many=[row for row in self.rows if row[3] != "UNKNOWN"])
@@ -139,6 +141,14 @@ class LiveSessionLifecycleTests(unittest.TestCase):
                                     "external-agent", "agent-a", "team-a")
         self.assertFalse(any("INSERT INTO exotel_sessions" in query for query, _ in stale_mapping.queries))
 
+    def test_activation_refuses_tombstoned_or_purged_identity(self):
+        for connection in (_Connection(tombstoned_call=True), _Connection(content_purged=True)):
+            with self.assertRaisesRegex(ValueError, "tombstoned or purged"):
+                activate_exotel_session(connection, "org-a", "integration-a", "a" * 64,
+                                        "external-agent", "agent-a", "team-a")
+            query = next(q for q, _ in connection.queries if "INSERT INTO exotel_sessions" in q)
+            self.assertIn("NOT EXISTS", query)
+
     def test_only_current_live_generation_can_transition(self):
         connection = _Connection()
         self.assertTrue(update_exotel_session(connection, "org-a", "integration-a", "a" * 64, 5, "DRAINING"))
@@ -172,6 +182,8 @@ class LiveSessionLifecycleTests(unittest.TestCase):
         migration = (Path(__file__).resolve().parent.parent / "migrations" / "018_exotel_session_lifecycle.sql").read_text(encoding="utf-8")
         self.assertIn("DEFAULT 'UNKNOWN'", migration)
         self.assertIn("SET updated_at=started_at,last_activity_at=started_at", migration)
+        live_migration = (Path(__file__).resolve().parent.parent / "migrations" / "019_live_transcript_buffer.sql").read_text(encoding="utf-8")
+        self.assertIn("call_content_purged_at", live_migration)
         now = datetime.now(timezone.utc)
         legacy = ("b" * 64, None, None, "UNKNOWN", now, None, None, None, now, now)
         self.assertEqual(read_live_calls(_Connection(rows=[legacy]), Scope("org-a", "qa-a", "QA_ANALYST", frozenset())), [])
@@ -216,7 +228,7 @@ class LiveCallsScopeTests(unittest.TestCase):
     def setUp(self):
         now = datetime.now(timezone.utc)
         self.row = ("a" * 64, "agent-a", "team-a", "LIVE", now, None, None, None,
-                    now, now - timedelta(seconds=60))
+                    now, now - timedelta(seconds=60), 5)
 
     def test_team_leader_query_is_tenant_and_authorized_team_scoped(self):
         connection = _Connection(rows=[self.row])
@@ -226,8 +238,11 @@ class LiveCallsScopeTests(unittest.TestCase):
         self.assertIn("team_id=ANY(%s)", query)
         self.assertEqual(params, ("org-a", ["team-a", "team-b"]))
         self.assertTrue(any("state<>'UNKNOWN'" in query for query, _ in connection.queries))
+        self.assertIn("call_content_purged_at IS NULL", connection.queries[-1][0])
+        self.assertIn("c.tombstoned_at IS NOT NULL", connection.queries[-1][0])
         self.assertTrue(result[0]["stale"])
         self.assertEqual(result[0]["call_key"], "a" * 64)
+        self.assertEqual(result[0]["generation"], 5)
 
     def test_agent_is_self_scoped_and_other_tenant_never_queries(self):
         connection = _Connection(rows=[self.row])

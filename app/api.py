@@ -36,6 +36,7 @@ from app.events import EventCursorError, EventCursorExpired, EventForbidden, enc
 from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
 from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
 from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, recording_intake_committed, update_exotel_session
+from app.live_transcripts import LiveTranscriptUnavailable, read_live_utterances
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -333,6 +334,18 @@ def create_app(
                 return {"items": read_live_calls(connection, scope)}
         except LiveCallsForbidden as error:
             raise HTTPException(status_code=403, detail="Role cannot view live calls") from error
+
+    @app.get("/v1/live-calls/{call_key}/utterances")
+    def get_live_utterances(call_key: str, generation: int, scope: Scope = Depends(get_scope)) -> dict:
+        try:
+            with connect() as connection:
+                return {"items": read_live_utterances(connection, scope, call_key, generation)}
+        except LiveCallsForbidden as error:
+            raise HTTPException(status_code=403, detail="Role cannot view live transcripts") from error
+        except LiveTranscriptUnavailable as error:
+            raise HTTPException(status_code=404, detail="Live transcript not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Invalid live session reference") from error
 
     @app.get("/v1/operations/summary")
     def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict[str, int]:

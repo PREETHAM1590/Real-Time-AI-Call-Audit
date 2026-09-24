@@ -43,7 +43,7 @@ class RuntimePackagingTests(unittest.TestCase):
                 return True
 
         stop_event = StopAfterWait()
-        with patch("app.worker.run_once", return_value=False) as run_once:
+        with patch("app.worker.run_once", return_value=False) as run_once, patch("app.worker.sweep_live_transcripts"):
             run_forever("test-worker", {}, idle_poll_seconds=0.5, stop_event=stop_event)
         run_once.assert_called_once_with("test-worker", {})
         self.assertEqual(stop_event.asserted_seconds, 0.5)

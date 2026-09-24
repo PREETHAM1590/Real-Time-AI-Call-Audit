@@ -16,10 +16,12 @@ from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
 from app.compliance import evaluate_rules, load_ruleset
 from app.audit import audit_call, load_pinned_text, load_rubric
+from app.live_transcripts import purge_expired_live_utterances
 
 Processor = Callable[[dict], str | dict]
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
+LIVE_TRANSCRIPT_SWEEP_SECONDS = 60
 _LOGGER = logging.getLogger(__name__)
 _KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT"})
 _KNOWN_OUTCOMES = frozenset({"WAITING_HANDLER", "LEASE_LOST", "COMMITTED", "STALE_COMMIT", "RETRY_HANDLED", "RETRY_HANDLER_FAILED"})
@@ -194,6 +196,22 @@ def drain(worker_id: str | None = None, processors: Mapping[str, Processor] | No
     return completed
 
 
+def sweep_live_transcripts() -> None:
+    try:
+        with connect() as connection:
+            removed = purge_expired_live_utterances(connection)
+        _LOGGER.info("expired live transcript sweep", extra={"event_name": "worker.live_transcript_sweep", "rows_removed": removed})
+    except Exception:
+        _LOGGER.warning("expired live transcript sweep failed", extra={"event_name": "worker.live_transcript_sweep_failed"})
+
+
+def _live_transcript_sweeper(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        sweep_live_transcripts()
+        if stop_event.wait(LIVE_TRANSCRIPT_SWEEP_SECONDS):
+            return
+
+
 def build_processors() -> dict[str, Processor]:
     """Build only locally configured handlers; absent model handlers stay parked."""
     from app.transcription import make_transcription_processor
@@ -243,9 +261,16 @@ def run_forever(
     if isinstance(idle_poll_seconds, bool) or not math.isfinite(idle_poll_seconds) or not 0.5 <= idle_poll_seconds <= 10:
         raise ValueError("idle poll interval must be between 0.5 and 10 seconds")
     stop_event = stop_event or threading.Event()
-    while not stop_event.is_set():
-        if not run_once(worker_id, processors):
-            stop_event.wait(idle_poll_seconds)
+    sweeper_stop = threading.Event()
+    sweeper = threading.Thread(target=_live_transcript_sweeper, args=(sweeper_stop,), name="live-transcript-sweeper", daemon=True)
+    sweeper.start()
+    try:
+        while not stop_event.is_set():
+            if not run_once(worker_id, processors):
+                stop_event.wait(idle_poll_seconds)
+    finally:
+        sweeper_stop.set()
+        sweeper.join(timeout=LIVE_TRANSCRIPT_SWEEP_SECONDS + 1)
 
 
 def main() -> None:
