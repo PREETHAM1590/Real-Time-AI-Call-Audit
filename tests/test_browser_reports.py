@@ -114,9 +114,10 @@ class QualityReportBrowserTests(unittest.TestCase):
             for header in ["Live audio", "Post-call recording", "Call events"]:
                 self.assertTrue(table.get_by_role("columnheader", name=header).count())
             self.assertTrue(table.get_by_role("rowheader", name="Exotel AgentStream / Programmable Voice").count())
-            self.assertIn("Exotel intake is implemented", page.locator(".page-intro").inner_text())
+            self.assertIn("Exotel Stream adapter prototype", page.locator(".page-intro").inner_text())
             exotel_live = table.get_by_role("row", name=re.compile("Exotel")).locator("td").nth(0)
-            self.assertEqual(exotel_live.locator(".capability").inner_text(), "Adapter implemented")
+            self.assertEqual(exotel_live.locator(".capability").inner_text(), "Prototype (auth unverified)")
+            self.assertIn("Basic-header compatibility with the unidirectional Stream applet", exotel_live.inner_text())
             self.assertIn("callflow behavior", exotel_live.inner_text())
             exotel_events = table.get_by_role("row", name=re.compile("Exotel")).locator("td").nth(2)
             self.assertEqual(exotel_events.locator(".capability").inner_text(), "Documented")

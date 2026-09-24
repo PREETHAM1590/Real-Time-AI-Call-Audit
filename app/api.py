@@ -36,7 +36,9 @@ from app.events import EventCursorError, EventCursorExpired, EventForbidden, enc
 from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
 from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
 from app.live_calls import LiveCallsForbidden, activate_exotel_session, read_live_calls, recording_intake_committed, update_exotel_session
-from app.live_transcripts import LiveTranscriptUnavailable, read_live_utterances
+from app.live_transcripts import (LiveTranscriptUnavailable, read_live_utterances,
+                                  store_live_utterances, update_live_transcription_state)
+from app.transcription import exotel_live_transcriber_from_environment
 from psycopg.errors import UniqueViolation
 
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -47,6 +49,8 @@ _EXOTEL_CONNECTIONS = threading.BoundedSemaphore(8)
 EXOTEL_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS = 30.0
 EXOTEL_SESSION_TIMEOUT_SECONDS = 7_230.0
+EXOTEL_LIVE_TRANSCRIPTION_DRAIN_SECONDS = 10.0
+EXOTEL_RECORDING_INTAKE_TIMEOUT_SECONDS = 30.0
 
 
 class _RequestBodyTooLarge(Exception):
@@ -339,7 +343,7 @@ def create_app(
     def get_live_utterances(call_key: str, generation: int, scope: Scope = Depends(get_scope)) -> dict:
         try:
             with connect() as connection:
-                return {"items": read_live_utterances(connection, scope, call_key, generation)}
+                return read_live_utterances(connection, scope, call_key, generation)
         except LiveCallsForbidden as error:
             raise HTTPException(status_code=403, detail="Role cannot view live transcripts") from error
         except LiveTranscriptUnavailable as error:
@@ -715,8 +719,57 @@ def create_app(
         with connect(timeout_seconds=5) as connection:
             return recording_intake_committed(connection, organisation_id, integration_id, call_key, generation, external_ref)
 
+    def set_live_transcript_state(organisation_id: str, integration_id: str, call_key: str,
+                                  generation: int, state: str) -> None:
+        with connect(timeout_seconds=5) as connection:
+            update_live_transcription_state(connection, organisation_id, integration_id, call_key, generation, state)
+
+    async def transcribe_live_queue(queue: asyncio.Queue, lifecycle_ref: tuple, transcriber_factory,
+                                    transcriber_ref: list) -> None:
+        organisation_id, integration_id, call_key, generation = lifecycle_ref
+        try:
+            transcriber = await asyncio.to_thread(transcriber_factory)
+            if transcriber is None:
+                await run_in_threadpool(set_live_transcript_state, *lifecycle_ref, "DISABLED")
+                return
+            transcriber_ref.append(transcriber)
+        except Exception:
+            try:
+                await run_in_threadpool(set_live_transcript_state, *lifecycle_ref, "DEGRADED")
+            except Exception:
+                pass
+            return
+
+        def publish(updates) -> None:
+            if not updates:
+                return
+            # Only the already-redacted model field crosses into persistence.
+            items = [{"id": item.id, "role": item.role, "start_ms": item.start_ms,
+                      "end_ms": item.end_ms, "text": item.text_redacted} for item in updates]
+            with connect(timeout_seconds=5) as connection:
+                store_live_utterances(connection, organisation_id, integration_id, call_key, generation, items)
+
+        try:
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    updates = await asyncio.to_thread(transcriber.finish)
+                    await asyncio.to_thread(publish, updates)
+                    break
+                updates = await asyncio.to_thread(transcriber.push, frame[0], frame[1])
+                await asyncio.to_thread(publish, updates)
+        except Exception:
+            try:
+                await run_in_threadpool(set_live_transcript_state, *lifecycle_ref, "DEGRADED")
+            except Exception:
+                pass
+
     @app.websocket("/v1/exotel/stream")
     async def exotel_stream(websocket: WebSocket) -> None:
+        transcription_queue: asyncio.Queue | None = None
+        transcription_task: asyncio.Task | None = None
+        transcriber_ref: list = []
+        transcription_pcm = bytearray()
         if not _EXOTEL_CONNECTIONS.acquire(blocking=False):
             await websocket.close(code=4429)
             return
@@ -781,6 +834,21 @@ def create_app(
             total_pcm_bytes = 0
             expected_timestamp = 0
             last_activity_update = loop.time()
+            transcription_chunk_start_ms: int | None = None
+            transcription_accepting = True
+            transcription_disabled = os.environ.get("EXOTEL_LIVE_TRANSCRIPTION") != "1"
+            try:
+                await run_in_threadpool(set_live_transcript_state, *lifecycle, "DISABLED" if transcription_disabled else "EMPTY")
+            except Exception:
+                # Live status storage must not become a dependency of the durable recording path.
+                pass
+            if not transcription_disabled:
+                # Fixed 100 ms blocks make this a four-second audio-time queue, independent of provider frame sizes.
+                transcription_queue = asyncio.Queue(maxsize=40)
+                transcription_task = asyncio.create_task(
+                    transcribe_live_queue(transcription_queue, lifecycle, exotel_live_transcriber_from_environment,
+                                          transcriber_ref)
+                )
             with tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024) as spool:
                 while True:
                     raw = await receive_text_before(session_deadline, EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS)
@@ -808,23 +876,56 @@ def create_app(
                             await websocket.close(code=4400)
                             return
                         spool.write(event.pcm)
+                        if (transcription_queue is not None and transcription_task is not None
+                                and transcription_accepting and not transcription_task.done()):
+                            if not transcription_pcm:
+                                transcription_chunk_start_ms = event.stream_offset_ms
+                            transcription_pcm.extend(event.pcm)
+                            while len(transcription_pcm) >= 1600:
+                                block = bytes(transcription_pcm[:1600])
+                                del transcription_pcm[:1600]
+                                try:
+                                    transcription_queue.put_nowait((block, transcription_chunk_start_ms))
+                                    transcription_chunk_start_ms += 100
+                                except asyncio.QueueFull:
+                                    transcription_task.cancel()
+                                    transcription_accepting = False
+                                    break
+                            if not transcription_accepting:
+                                try:
+                                    await run_in_threadpool(set_live_transcript_state, *lifecycle, "DEGRADED")
+                                except Exception:
+                                    pass
+                        elif transcription_queue is not None and transcription_accepting:
+                            transcription_accepting = False
+                            try:
+                                await run_in_threadpool(set_live_transcript_state, *lifecycle, "DEGRADED")
+                            except Exception:
+                                pass
                         if loop.time() - last_activity_update >= 15:
                             await run_in_threadpool(persist_exotel_state, *lifecycle, "LIVE", activity=True)
                             last_activity_update = loop.time()
                 if not total_pcm_bytes:
                     await websocket.close(code=4400)
                     return
+                if transcription_queue is not None and transcription_task is not None and not transcription_task.done():
+                    try:
+                        transcription_queue.put_nowait(None)
+                        await asyncio.wait_for(asyncio.shield(transcription_task), timeout=EXOTEL_LIVE_TRANSCRIPTION_DRAIN_SECONDS)
+                    except (asyncio.QueueFull, asyncio.TimeoutError):
+                        transcription_task.cancel()
+                        try:
+                            await run_in_threadpool(set_live_transcript_state, *lifecycle, "DEGRADED")
+                        except Exception:
+                            pass
                 spool.seek(0)
                 audio = build_wav(spool.read())
             try:
-                remaining_seconds = session_deadline - loop.time()
-                if remaining_seconds <= 0:
-                    await websocket.close(code=4408)
-                    return
+                intake_deadline = loop.time() + EXOTEL_RECORDING_INTAKE_TIMEOUT_SECONDS
                 await run_in_threadpool(
                     accept_recording, agent_scope, external_ref, audio, {"language": "und"}, idempotency_key,
                     generation_fence=(integration[1], call_key, generation, agent_ref, agent_scope.user_id, next(iter(agent_scope.team_ids))),
-                    timeout_seconds=remaining_seconds,
+                    timeout_seconds=max(0.001, intake_deadline - loop.time()),
                 )
             except Exception:
                 try:
@@ -849,6 +950,33 @@ def create_app(
             except Exception:
                 pass
         finally:
+            transcription_pcm.clear()
+            if transcription_queue is not None:
+                while True:
+                    try:
+                        transcription_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            if transcription_task is not None and not transcription_task.done():
+                transcription_task.cancel()
+            if transcription_task is not None and transcription_task.done():
+                await asyncio.gather(transcription_task, return_exceptions=True)
+            elif transcription_task is not None:
+                # A cancelled asyncio.to_thread awaiter cannot stop its worker thread. Do not
+                # let that worker hold the authenticated recording socket or intake open.
+                def consume_preview_task(task: asyncio.Task) -> None:
+                    if not task.cancelled():
+                        try:
+                            task.exception()
+                        except BaseException:
+                            pass
+
+                transcription_task.add_done_callback(consume_preview_task)
+            if transcriber_ref:
+                try:
+                    transcriber_ref[0].discard()
+                except Exception:
+                    pass
             if lifecycle is not None:
                 try:
                     await run_in_threadpool(persist_exotel_state, *lifecycle, "INCOMPLETE")

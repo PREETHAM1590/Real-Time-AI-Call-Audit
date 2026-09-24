@@ -27,6 +27,93 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 @unittest.skipIf(sync_playwright is None, "Install the optional browser-test extra and Chromium to run the browser check")
 class AnalystBrowserSmokeTests(unittest.TestCase):
+    def test_live_preview_is_redacted_stale_scoped_and_refreshes_without_replacing_row(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previews = ["Phone [REDACTED]", "Corrected redacted preview"]
+        preview_requests = []
+        preview_failure = {"value": False}
+        snapshot_status = {"value": 200}
+        call = {"call_key": "a" * 64, "agent_id": "agent-a", "team_id": "team-a", "state": "LIVE",
+                "started_at": "2026-09-24T00:00:00Z", "stale": True, "generation": 4}
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+
+                def handle_api(route):
+                    path = urlsplit(route.request.url).path
+                    if path == "/v1/reviews/queue":
+                        route.fulfill(status=200, content_type="application/json", body='{"items":[]}')
+                    elif path == "/v1/live-calls":
+                        route.fulfill(status=snapshot_status["value"],
+                                      content_type="application/json", body=json.dumps({"items": [call]}))
+                    elif path == f"/v1/live-calls/{'a' * 64}/utterances":
+                        if preview_failure["value"]:
+                            route.fulfill(status=503, content_type="application/json", body='{"detail":"unavailable"}')
+                            return
+                        index = min(len(preview_requests), len(previews) - 1)
+                        preview_requests.append(index)
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                            "status": "LIVE", "truncated": index > 0,
+                            "items": [{"id": f"{index + 1:032x}", "role": "UNKNOWN", "start_ms": 1200,
+                                       "end_ms": 1800, "text_redacted": previews[index], "is_final": False}],
+                        }))
+                    else:
+                        route.fulfill(status=404, content_type="application/json", body="{}")
+
+                page.route("**/v1/**", handle_api)
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                page.get_by_text("Phone [REDACTED]").wait_for()
+                self.assertIn("UNKNOWN", page.locator(".live-utterance").inner_text())
+                self.assertIn("STALE", page.locator(".live-session-status").inner_text())
+                self.assertIn("provisional only", page.locator(".live-transcript-status").inner_text())
+                self.assertIn("post-call transcript remains authoritative", page.locator(".live-note").inner_text())
+                self.assertNotIn("5551234567", page.locator("#live-calls-list").inner_text())
+                row = page.locator("#live-calls-list > li").first
+                row.evaluate("node => { window.liveRow = node; }")
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.get_by_text("Corrected redacted preview").wait_for()
+                self.assertIn("Older preview utterances were dropped", page.locator(".live-transcript-status").inner_text())
+                self.assertTrue(row.evaluate("node => node === window.liveRow"))
+                self.assertGreaterEqual(len(preview_requests), 2)
+                preview_failure["value"] = True
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.get_by_text("Live transcript unavailable", exact=False).wait_for()
+                self.assertEqual(page.locator(".live-utterances li").count(), 0)
+                preview_failure["value"] = False
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.get_by_text("Corrected redacted preview").wait_for()
+                snapshot_status["value"] = 503
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.locator("#live-status").get_by_text("temporarily unavailable", exact=False).wait_for()
+                self.assertEqual(page.locator(".live-utterances li").count(), 0)
+                self.assertEqual(page.locator("#live-calls-list > li.live-call").count(), 1)
+                self.assertIn("STALE", page.locator(".live-session-status").inner_text())
+                self.assertIn("Agent agent-a", page.locator("#live-calls-list").inner_text())
+                snapshot_status["value"] = 200
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.get_by_text("Corrected redacted preview").wait_for()
+                snapshot_status["value"] = 403
+                page.get_by_role("button", name="Refresh live calls").click()
+                page.get_by_text("Live sessions hidden", exact=False).wait_for()
+                self.assertEqual(page.locator("#live-calls-list > li.live-call").count(), 0)
+                self.assertNotIn("Agent agent-a", page.locator("#live-calls-list").inner_text())
+                self.assertNotIn("Call key", page.locator("#live-calls-list").inner_text())
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_upload_conflicts_show_distinct_recovery_messages(self):
         web_root = Path(__file__).resolve().parent.parent / "web"
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))

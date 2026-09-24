@@ -34,6 +34,8 @@ Schedule GPU work by stage: live STT has priority, post-call STT is queued, and 
 
 The proposed one-second live alert target begins when a final utterance arrives. Windowed Whisper may take longer to produce that final; measure audio-to-final latency separately and set an achievable service target after the pilot benchmark. If the selected local model cannot meet the required live accuracy and latency at target concurrency, select a different self-hosted open-weight model or revise the requirement with the product owner before live release. Do not route calls to a hosted AI service as an implicit fallback.
 
+The Exotel live preview runs in a background task in the API process and uses the same pinned local Faster-Whisper path only when `EXOTEL_LIVE_TRANSCRIPTION=1`. Its four-second audio queue and overlapping windows are bounded; overload or model/redaction/storage failure marks that call's preview DEGRADED while the original Exotel recording continues to durable intake. Utterances are redacted before transient persistence, remain provisional, and are not post-call audit evidence. This wiring is synthetic-test checked only; exact model weights, language accuracy, real-time factor and concurrency remain unqualified. No runtime Hub fetch or hosted inference fallback is allowed.
+
 ## Resources from the article and their status
 
 | Resource | Planned use |

@@ -30,13 +30,14 @@ def activate_exotel_session(connection, organisation_id: str, integration_id: st
             raise ValueError("Exotel mapping is no longer active")
         row = connection.execute(
             "INSERT INTO exotel_sessions(organisation_id,integration_id,call_key,generation,state,agent_id,team_id,"
-            "started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at) "
-            "SELECT %s,%s,%s,1,'LIVE',%s,%s,now(),NULL,NULL,NULL,now(),now() "
+            "started_at,draining_at,ended_at,incomplete_at,updated_at,last_activity_at,live_transcription_state,live_transcript_truncated) "
+            "SELECT %s,%s,%s,1,'LIVE',%s,%s,now(),NULL,NULL,NULL,now(),now(),'DISABLED',false "
             "WHERE NOT EXISTS (SELECT 1 FROM calls c WHERE c.organisation_id=%s::uuid "
             "AND c.external_ref='exotel:'||%s AND c.tombstoned_at IS NOT NULL) "
             "ON CONFLICT (organisation_id,integration_id,call_key) DO UPDATE SET "
             "generation=exotel_sessions.generation+1,state='LIVE',agent_id=EXCLUDED.agent_id,team_id=EXCLUDED.team_id,"
-            "started_at=now(),draining_at=NULL,ended_at=NULL,incomplete_at=NULL,updated_at=now(),last_activity_at=now() "
+            "started_at=now(),draining_at=NULL,ended_at=NULL,incomplete_at=NULL,updated_at=now(),last_activity_at=now(),"
+            "live_transcription_state='DISABLED',live_transcript_truncated=false "
             "WHERE exotel_sessions.call_content_purged_at IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM calls c WHERE c.organisation_id=EXCLUDED.organisation_id "
             "AND c.external_ref='exotel:'||EXCLUDED.call_key AND c.tombstoned_at IS NOT NULL) "

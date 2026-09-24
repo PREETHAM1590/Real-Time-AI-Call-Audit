@@ -4,6 +4,7 @@ const dimensions = ["greeting", "listening", "resolution", "compliance", "clarit
 const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false, uploadKey: null };
 let liveRefreshActive = false;
+const liveCallNodes = new Map();
 const byId = (id) => document.getElementById(id);
 
 function element(tag, text, className) {
@@ -100,31 +101,92 @@ async function loadLiveCalls() {
   status.classList.remove("error");
   try {
     const result = await request("/v1/live-calls");
-    list.replaceChildren();
-    for (const call of result.items || []) {
-      const item = element("li", undefined, `live-call live-${String(call.state).toLowerCase()}${call.stale ? " live-stale" : ""}`);
-      const stateLabel = call.stale ? "STALE · last media update is old" : ({
+    const calls = (result.items || []).slice(0, 10);
+    const currentKeys = new Set(calls.map((call) => call.call_key));
+    for (const [key, node] of liveCallNodes) {
+      if (!currentKeys.has(key)) {
+        node.remove();
+        liveCallNodes.delete(key);
+      }
+    }
+    const transcriptLoads = [];
+    for (const call of calls) {
+      let item = liveCallNodes.get(call.call_key);
+      if (!item) {
+        item = element("li", undefined, "live-call");
+        const sessionLabel = element("strong", undefined, "live-session-status");
+        const callKey = element("span");
+        const membership = element("span");
+        const started = element("span");
+        const transcriptStatus = element("span", "", "live-transcript-status");
+        const utterances = element("ol", undefined, "live-utterances");
+        item.append(sessionLabel, callKey, membership, started, transcriptStatus, utterances);
+        item._liveNodes = { sessionLabel, callKey, membership, started, transcriptStatus, utterances };
+        liveCallNodes.set(call.call_key, item);
+      }
+      item.dataset.callKey = call.call_key;
+      const nodes = item._liveNodes;
+      item.className = `live-call live-${String(call.state).toLowerCase()}${call.stale ? " live-stale" : ""}`;
+      nodes.sessionLabel.textContent = call.stale ? "STALE · last media update is old" : ({
         LIVE: "LIVE · audio session connected",
         DRAINING: "DRAINING · waiting for recording intake",
         ENDED: "ENDED · recording intake accepted",
         INCOMPLETE: "INCOMPLETE · stream ended before intake was accepted",
       }[call.state] || "UNKNOWN · session state unavailable");
-      item.append(
-        element("strong", stateLabel),
-        element("span", `Call key ${call.call_key}`),
-        element("span", `Agent ${call.agent_id} · Team ${call.team_id}`),
-        element("span", `Started ${new Date(call.started_at).toLocaleString()}`),
-      );
-      list.append(item);
+      nodes.callKey.textContent = `Call key ${call.call_key}`;
+      nodes.membership.textContent = `Agent ${call.agent_id} · Team ${call.team_id}`;
+      nodes.started.textContent = `Started ${new Date(call.started_at).toLocaleString()}`;
+      if (item.parentElement !== list) list.append(item);
+      transcriptLoads.push(loadLiveTranscript(call, nodes.transcriptStatus, nodes.utterances));
     }
-    status.textContent = `${(result.items || []).length} live or recently changed session${(result.items || []).length === 1 ? "" : "s"}.`;
+    status.textContent = `${calls.length} live or recently changed session${calls.length === 1 ? "" : "s"}${(result.items || []).length > calls.length ? `; showing the latest ${calls.length}` : ""}.`;
     if (!list.childElementCount) list.append(element("li", "No live or recently changed sessions.", "empty-state"));
+    else if (list.querySelector(".empty-state")) list.querySelector(".empty-state").remove();
+    await Promise.allSettled(transcriptLoads);
   } catch (error) {
-    list.replaceChildren();
-    status.textContent = `Live status unavailable · ${error.message}`;
+    if (error.status === 401 || error.status === 403) {
+      for (const [key, node] of liveCallNodes) {
+        node.remove();
+        liveCallNodes.delete(key);
+      }
+      list.replaceChildren(element("li", "Cached live session details were cleared.", "empty-state"));
+      status.textContent = "Live sessions hidden · sign-in or authorization is required.";
+    } else {
+      for (const node of liveCallNodes.values()) {
+        node.classList.add("live-stale");
+        node._liveNodes.sessionLabel.textContent = "STALE · live status unavailable";
+        node._liveNodes.utterances.replaceChildren();
+        node._liveNodes.transcriptStatus.textContent = "Live preview cleared · showing cached session labels only.";
+      }
+      status.textContent = `Live status temporarily unavailable · ${error.message}`;
+    }
     status.classList.add("error");
   } finally {
     liveRefreshActive = false;
+  }
+}
+
+async function loadLiveTranscript(call, status, list) {
+  const label = {
+    DISABLED: "Live transcription disabled · recording intake continues.",
+    EMPTY: "Live transcription enabled · waiting for redacted utterances.",
+    LIVE: "Redacted live preview · provisional only.",
+    DEGRADED: "Live transcription degraded · recording intake continues.",
+  };
+  try {
+    const result = await request(`/v1/live-calls/${encodeURIComponent(call.call_key)}/utterances?generation=${encodeURIComponent(call.generation)}`);
+    status.textContent = label[result.status] || "Live transcript status unavailable.";
+    if (result.truncated) status.textContent += " Older preview utterances were dropped; the post-call transcript is authoritative.";
+    list.replaceChildren();
+    for (const utterance of result.items || []) {
+      const row = element("li", undefined, "live-utterance");
+      row.append(element("time", `${timestamp(utterance.start_ms)} · ${utterance.role}`), element("span", utterance.text_redacted));
+      list.append(row);
+    }
+    if (!list.childElementCount && result.status === "LIVE") status.textContent = "Live transcript was published and has since expired from the short-lived preview.";
+  } catch {
+    status.textContent = "Live transcript unavailable · session scope, expiry, or storage may have changed.";
+    list.replaceChildren();
   }
 }
 

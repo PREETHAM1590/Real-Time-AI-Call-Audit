@@ -22,6 +22,7 @@ from app.storage import LocalPrivateStorage
 MAX_TRANSCRIPTION_WORKERS = 1
 MAX_STT_SEGMENTS = 50_000
 MAX_STT_TEXT_CHARS = 1_000_000
+# ponytail: one inference per API process bounds native decoder threads; isolate processes only if measurements justify parallelism.
 _MODEL_GATE = threading.BoundedSemaphore(MAX_TRANSCRIPTION_WORKERS)
 _MODEL_LOCK = threading.Lock()
 _MODEL: Any | None = None
@@ -63,12 +64,25 @@ class LiveWindowTranscriber:
         self._next_id = 0
         self._pending: list[dict] = []
         self._closed = False
+        self._state_lock = threading.Lock()
+        self._discard_requested = threading.Event()
 
     @property
     def buffered_bytes(self) -> int:
         return len(self._pcm)
 
     def push(self, pcm: bytes, start_ms: int) -> list[PreparedUtterance]:
+        with self._state_lock:
+            try:
+                return self._push(pcm, start_ms)
+            finally:
+                if self._discard_requested.is_set():
+                    self._clear_state()
+
+    def _push(self, pcm: bytes, start_ms: int) -> list[PreparedUtterance]:
+        if self._discard_requested.is_set():
+            self._clear_state()
+            return []
         if (self._closed or not isinstance(pcm, bytes) or not pcm or len(pcm) % 16
                 or isinstance(start_ms, bool) or not isinstance(start_ms, int) or start_ms < 0):
             raise TranscriptionError("Invalid live PCM frame")
@@ -79,6 +93,9 @@ class LiveWindowTranscriber:
             raise TranscriptionError("Live stream exceeds configured duration limit")
         self._next_input_ms += duration_ms
         self._pcm.extend(pcm)
+        if self._discard_requested.is_set():
+            self._clear_state()
+            return []
         updates: list[PreparedUtterance] = []
         window_bytes = self.WINDOW_MS * 16
         stride_bytes = (self.WINDOW_MS - self.OVERLAP_MS) * 16
@@ -100,6 +117,14 @@ class LiveWindowTranscriber:
         return updates
 
     def finish(self) -> list[PreparedUtterance]:
+        with self._state_lock:
+            try:
+                return self._finish()
+            finally:
+                if self._discard_requested.is_set():
+                    self._clear_state()
+
+    def _finish(self) -> list[PreparedUtterance]:
         if self._closed:
             return []
         self._closed = True
@@ -120,6 +145,22 @@ class LiveWindowTranscriber:
         self._pending.clear()
         self._pcm.clear()
         return updates
+
+    def discard(self) -> None:
+        """Request nonblocking cleanup; an in-flight local decode clears state when it returns."""
+        self._discard_requested.set()
+        self._closed = True
+        self._pcm.clear()
+        if self._state_lock.acquire(blocking=False):
+            try:
+                self._pending.clear()
+            finally:
+                self._state_lock.release()
+
+    def _clear_state(self) -> None:
+        self._closed = True
+        self._pcm.clear()
+        self._pending.clear()
 
     def _decode_window(self, pcm: bytes, *, final: bool) -> list[PreparedUtterance]:
         if not _MODEL_GATE.acquire(blocking=False):
@@ -154,6 +195,9 @@ class LiveWindowTranscriber:
 
         if len(bounded_segments) > self.MAX_WINDOW_SEGMENTS:
             raise TranscriptionError("Live model returned too many segments")
+        if self._discard_requested.is_set():
+            self._clear_state()
+            return []
         normalized = normalise_segments({"segments": bounded_segments}, {})
         window_duration_ms = len(pcm) // 16
         if any(segment["start_ms"] > window_duration_ms or segment["end_ms"] > window_duration_ms for segment in normalized):

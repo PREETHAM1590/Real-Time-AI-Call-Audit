@@ -17,8 +17,44 @@
       <span class="connection-state"><span aria-hidden="true" class="state-dot"></span>Provider status: Not connected</span>
     </header>
     <main class="report-layout providers-page">
-      <div class="page-intro"><h1>Provider coverage</h1><span>Exotel intake is implemented · Account qualification pending</span></div>
+      <div class="page-intro"><h1>Provider coverage</h1><span>Exotel Stream adapter prototype · WSS authentication qualification pending</span></div>
       <p class="coverage-note">This is a starting research set, not an exhaustive list of providers or a claim of project support. Vendor documentation and account entitlements need review before each adapter is qualified.</p>
+      <p id="exotel-status" class="status" role="status" aria-live="polite">Checking administrator access…</p>
+      <section id="exotel-admin" class="block exotel-admin" aria-labelledby="exotel-admin-title" hidden>
+        <h2 id="exotel-admin-title">Exotel setup <span class="capability pending">Prototype</span></h2>
+        <p class="qualification-note"><strong>Not qualified for live use.</strong> Basic-auth compatibility with Exotel’s unidirectional Stream applet is unverified. Do not configure a production callflow from this prototype.</p>
+        <form id="exotel-create-form" class="admin-form">
+          <h3>Create integration</h3>
+          <label for="exotel-account-sid">Exotel account SID</label>
+          <input id="exotel-account-sid" name="account_sid" maxlength="128" autocomplete="off" required>
+          <button type="submit">Create integration</button>
+        </form>
+        <section id="exotel-secret" class="credential-panel" aria-labelledby="credential-title" hidden>
+          <h3 id="credential-title">Save this credential now</h3>
+          <p>The password is shown once and cannot be retrieved later. Store it in your approved secret manager. It is held only in this page’s memory until you dismiss it; it is never saved in browser storage.</p>
+          <dl><div><dt>Username</dt><dd><code id="exotel-username"></code> <button type="button" data-copy="username">Copy username</button></dd></div>
+            <div><dt>Password</dt><dd><code id="exotel-password"></code> <button type="button" data-copy="password">Copy password</button></dd></div></dl>
+          <p id="exotel-copy-status" class="status" role="status" aria-live="polite"></p>
+          <button id="exotel-secret-dismiss" type="button">I’ve saved it · dismiss credential</button>
+        </section>
+        <div class="admin-form">
+          <h3>Configured integrations</h3>
+          <label for="exotel-integration-select">Integration</label>
+          <select id="exotel-integration-select"><option value="">No integrations loaded</option></select>
+          <ul id="exotel-integration-list" class="admin-list"></ul>
+        </div>
+        <section id="exotel-mappings" aria-labelledby="mapping-title" hidden>
+          <h3 id="mapping-title">Agent mappings</h3>
+          <p>Enter the exact provider agent reference and internal agent and team IDs. The server accepts a mapping only when that agent has exactly one active AGENT membership in the specified team.</p>
+          <form id="exotel-map-form" class="admin-form mapping-form">
+            <div class="admin-field"><label for="exotel-agent-ref">Exotel agent reference</label><input id="exotel-agent-ref" maxlength="128" autocomplete="off" required></div>
+            <div class="admin-field"><label for="exotel-agent-id">Internal agent ID</label><input id="exotel-agent-id" maxlength="256" autocomplete="off" required></div>
+            <div class="admin-field"><label for="exotel-team-id">Internal team ID</label><input id="exotel-team-id" maxlength="256" autocomplete="off" required></div>
+            <button type="submit">Save mapping</button>
+          </form>
+          <ul id="exotel-mapping-list" class="admin-list"></ul>
+        </section>
+      </section>
       <div class="table-scroll" role="region" aria-label="Provider capabilities" tabindex="0">
         <table class="provider-table">
           <caption>Public documentation signals and project qualification status</caption>
@@ -28,10 +64,10 @@
           <tbody>
             <tr>
               <th scope="row">Exotel<br><span class="product-name">AgentStream / Programmable Voice</span></th>
-              <td><span class="capability implemented">Adapter implemented</span><small>WSS intake handles the documented lifecycle and mono PCM stream. Tenant entitlement, callflow behavior, agent-leg coverage and role attribution remain unverified.</small></td>
+              <td><span class="capability pending">Prototype (auth unverified)</span><small>WSS intake handles the documented lifecycle and mono PCM stream; Basic-header compatibility with the unidirectional Stream applet needs an account handshake test before enablement. Tenant entitlement, callflow behavior, agent-leg coverage and role attribution remain unverified.</small></td>
               <td><span class="capability pending">Unverified</span><small>No post-call recording path qualified here.</small></td>
               <td><span class="capability documented">Documented</span><small>Official documentation describes gRPC call-leg events; project adapter and agent attribution remain unverified.</small></td>
-              <td><a href="https://docs.exotel.com/exotel-agentstream">AgentStream</a><br><a href="https://docs.exotel.com/exotel-agentstream/programmable-voice-apis-with-agentstream">Programmable Voice APIs</a></td>
+              <td><a href="https://docs.exotel.com/exotel-agentstream/stream-applet">Stream applet</a><br><a href="https://support.exotel.com/support/solutions/articles/3000108630-working-with-the-stream-and-voicebot-applet">Stream and Voicebot guide</a><br><a href="https://docs.exotel.com/exotel-agentstream/programmable-voice-apis-with-agentstream">Programmable Voice APIs</a></td>
             </tr>
             <tr>
               <th scope="row">TeleCMI<br><span class="product-name">PIOPIY AI Streaming</span></th>
@@ -101,5 +137,6 @@
       </div>
       <p class="qualification-note"><strong>Qualification required:</strong> provider authentication, media format, tenant and agent mapping, account entitlements, and end-to-end behavior must be verified before enabling intake. Audio processing remains self-hosted.</p>
     </main>
+    <script src="/analyst-assets/providers.js" defer></script>
   </body>
 </html>

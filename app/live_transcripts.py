@@ -88,8 +88,6 @@ def store_live_utterances(connection, organisation_id: str, integration_id: str,
             (organisation_id, integration_id, call_key, generation),
         ).fetchall()
         new_count = len(ids - {row[0] for row in existing})
-        if int(count) + new_count > MAX_LIVE_SESSION_UTTERANCES:
-            raise ValueError("live transcript session limit exceeded")
         for item in utterances:
             connection.execute(
                 "INSERT INTO live_transcript_utterances(organisation_id,integration_id,call_key,generation,utterance_id,"
@@ -101,10 +99,48 @@ def store_live_utterances(connection, organisation_id: str, integration_id: str,
                 (organisation_id, integration_id, call_key, generation, item["id"], item["start_ms"],
                  item["end_ms"], item["role"], item["text_redacted"], LIVE_TRANSCRIPT_TTL_MINUTES),
             )
+        total = int(count) + new_count
+        if total > MAX_LIVE_SESSION_UTTERANCES:
+            connection.execute(
+                "WITH excess AS (SELECT utterance_id FROM live_transcript_utterances "
+                "WHERE organisation_id=%s::uuid AND integration_id=%s::uuid AND call_key=%s AND generation=%s "
+                "AND expires_at>now() ORDER BY start_ms DESC,utterance_id DESC OFFSET %s) "
+                "DELETE FROM live_transcript_utterances u USING excess e WHERE u.organisation_id=%s::uuid "
+                "AND u.integration_id=%s::uuid AND u.call_key=%s AND u.generation=%s AND u.utterance_id=e.utterance_id",
+                (organisation_id, integration_id, call_key, generation, MAX_LIVE_SESSION_UTTERANCES,
+                 organisation_id, integration_id, call_key, generation),
+            )
+            connection.execute(
+                "UPDATE exotel_sessions SET live_transcript_truncated=true WHERE organisation_id=%s::uuid "
+                "AND integration_id=%s::uuid AND call_key=%s AND generation=%s AND state IN ('LIVE','DRAINING')",
+                (organisation_id, integration_id, call_key, generation),
+            )
+        connection.execute(
+            "UPDATE exotel_sessions SET live_transcription_state=CASE WHEN live_transcription_state='DEGRADED' "
+            "THEN 'DEGRADED' ELSE 'LIVE' END WHERE organisation_id=%s::uuid AND integration_id=%s::uuid "
+            "AND call_key=%s AND generation=%s AND state IN ('LIVE','DRAINING')",
+            (organisation_id, integration_id, call_key, generation),
+        )
     return len(utterances)
 
 
-def read_live_utterances(connection, scope: Scope, call_key: str, generation: int) -> list[dict]:
+def update_live_transcription_state(connection, organisation_id: str, integration_id: str, call_key: str,
+                                    generation: int, state: str) -> bool:
+    if state not in {"DISABLED", "EMPTY", "DEGRADED"} or type(generation) is not int or generation < 1:
+        raise ValueError("invalid live transcription state")
+    row = connection.execute(
+        "UPDATE exotel_sessions SET live_transcription_state=%s WHERE organisation_id=%s::uuid "
+        "AND integration_id=%s::uuid AND call_key=%s AND generation=%s AND state IN ('LIVE','DRAINING') "
+        "AND call_content_purged_at IS NULL AND NOT EXISTS (SELECT 1 FROM calls c "
+        "WHERE c.organisation_id=exotel_sessions.organisation_id AND c.external_ref='exotel:'||exotel_sessions.call_key "
+        "AND c.tombstoned_at IS NOT NULL) AND (%s<>'DISABLED' OR live_transcription_state<>'LIVE') "
+        "RETURNING generation",
+        (state, organisation_id, integration_id, call_key, generation, state),
+    ).fetchone()
+    return row is not None
+
+
+def read_live_utterances(connection, scope: Scope, call_key: str, generation: int) -> dict:
     if scope.role not in _READ_ROLES:
         raise LiveCallsForbidden("role cannot read live transcripts")
     if (not isinstance(call_key, str) or len(call_key) != 64 or any(c not in "0123456789abcdef" for c in call_key)
@@ -121,14 +157,16 @@ def read_live_utterances(connection, scope: Scope, call_key: str, generation: in
         predicate = " AND s.team_id=ANY(%s)"
         parameters.append(sorted(scope.team_ids))
     rows = connection.execute(
-        "SELECT u.utterance_id,u.role,u.start_ms,u.end_ms,u.text_redacted,s.agent_id,s.team_id "
+        "SELECT u.utterance_id,u.role,u.start_ms,u.end_ms,u.text_redacted,s.agent_id,s.team_id,"
+        "s.live_transcription_state,s.live_transcript_truncated "
         "FROM exotel_sessions s "
         "LEFT JOIN calls c ON c.organisation_id=s.organisation_id AND c.external_ref='exotel:'||s.call_key "
         "LEFT JOIN live_transcript_utterances u ON s.organisation_id=u.organisation_id "
         "AND s.integration_id=u.integration_id AND s.call_key=u.call_key AND s.generation=u.generation "
         "AND u.expires_at>now() "
         "WHERE s.organisation_id=%s::uuid AND s.call_key=%s AND s.generation=%s "
-        "AND s.state IN ('LIVE','DRAINING') AND s.call_content_purged_at IS NULL AND c.tombstoned_at IS NULL"
+        "AND s.state IN ('LIVE','DRAINING','ENDED','INCOMPLETE') "
+        "AND s.call_content_purged_at IS NULL AND c.tombstoned_at IS NULL"
         + predicate + " ORDER BY u.start_ms,u.utterance_id LIMIT 500",
         tuple(parameters),
     ).fetchall()
@@ -137,10 +175,11 @@ def read_live_utterances(connection, scope: Scope, call_key: str, generation: in
     for row in rows:
         if not can_access(scope, scope.organisation_id, row[5], row[6]):
             raise LiveTranscriptUnavailable("live transcript unavailable")
-    if rows[0][0] is None:
-        return []
-    return [{"id": row[0], "role": row[1], "start_ms": row[2], "end_ms": row[3],
-             "text_redacted": row[4], "is_final": False} for row in rows]
+    return {
+        "status": rows[0][7], "truncated": bool(rows[0][8]),
+        "items": [{"id": row[0], "role": row[1], "start_ms": row[2], "end_ms": row[3],
+                   "text_redacted": row[4], "is_final": False} for row in rows if row[0] is not None],
+    }
 
 
 def purge_expired_live_utterances(connection, *, limit: int = LIVE_TRANSCRIPT_SWEEP_BATCH) -> int:
