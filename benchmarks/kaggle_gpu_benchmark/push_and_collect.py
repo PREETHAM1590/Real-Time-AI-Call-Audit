@@ -76,12 +76,17 @@ def main() -> None:
 
     print("Polling for completion (this runs on Kaggle's queue; a GPU slot may not be immediate) ...")
     deadline = time.monotonic() + MAX_WAIT_SECONDS
-    status = None
+    terminal_statuses = {"COMPLETE", "ERROR", "CANCEL_ACKNOWLEDGED", "CANCEL_REQUESTED"}
+    status_name = None
     while time.monotonic() < deadline:
         response = api.kernels_status(kernel_id)
-        status = getattr(response, "status", None) or (response.get("status") if isinstance(response, dict) else None)
-        print(f"  status: {status}")
-        if status in {"complete", "error", "cancelled"}:
+        raw_status = getattr(response, "status", None) or (response.get("status") if isinstance(response, dict) else None)
+        # The Kaggle SDK returns a KernelWorkerStatus enum here, not a plain string; normalise
+        # via .name so the terminal-state comparison below actually matches instead of looping
+        # until MAX_WAIT_SECONDS.
+        status_name = getattr(raw_status, "name", str(raw_status)).upper()
+        print(f"  status: {raw_status}")
+        if status_name in terminal_statuses:
             break
         time.sleep(POLL_SECONDS)
     else:
@@ -93,8 +98,8 @@ def main() -> None:
     api.kernels_output(kernel_id, path=str(output_dir))
     print(f"Pulled kernel output to {output_dir}")
 
-    if status != "complete":
-        sys.exit(f"Kernel finished with status {status!r}; inspect {output_dir} and the Kaggle log before trusting any partial result.")
+    if status_name != "COMPLETE":
+        sys.exit(f"Kernel finished with status {status_name!r}; inspect {output_dir} and the Kaggle log before trusting any partial result.")
 
     result_path = output_dir / "benchmark_result.json"
     if result_path.exists():

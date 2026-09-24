@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-09-24T18:45:33Z",
+  "note": "Synthetic fixtures only; not a production capacity measurement (see README.md in this directory).",
+  "gpu_name": "Tesla T4",
+  "rubric_sha256": "26fdf17ab47a78e8bfd6c36c818a544339cceff8736cc759ec16bdeffa1ceef0",
+  "prompt_sha256": "343a382a03b49a85b036f4b378552f1142f5a8cd4bd581e40afb8d4167cc60dc",
+  "whisper": {
+    "status": "OK",
+    "engine": "faster-whisper",
+    "model_name_requested": "small",
+    "resolved_revision": "536b0662742c02347bc0e980a01041f333bce120",
+    "model_load_seconds": 6.224,
+    "audio_seconds": 30.0,
+    "decode_seconds": 1.997,
+    "real_time_factor": 0.0666,
+    "segment_count": 0,
+    "detected_language": "en",
+    "total_seconds": 17.147
+  },
+  "audit_llm": {
+    "status": "FAILED",
+    "engine": "none",
+    "vllm_error": "libcudart.so.13: cannot open shared object file: No such file or directory",
+    "fallback_error": "cannot import name '_maybe_view_chunk_cat' from 'torch._utils' (/usr/local/lib/python3.12/dist-packages/torch/_utils.py)",
+    "total_seconds": 264.905
+  }
+}
