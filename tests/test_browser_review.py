@@ -311,6 +311,107 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_call_review_sse_reconnects_and_applies_exactly_one_in_place_update(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        events_requests = []
+        call_detail = {
+            "call": {"id": "call-1", "agent_id": "agent-a", "team_id": "team-a", "processing_state": "QUEUED",
+                      "language": "en", "created_at": "2026-09-24T00:00:00Z", "transcript_revision": 0},
+            "audit": None, "transcript": [], "findings": [], "disposition": None,
+            "reviews": [], "current_review_version": 0,
+        }
+
+        def sse_frame(sequence, processing_state, transcript_revision):
+            envelope = {
+                "sequence": sequence, "schema_version": 1, "call_id": "call-1", "type": "call.updated",
+                "occurred_at": "2026-09-24T00:00:00Z",
+                "payload": {"processing_state": processing_state, "transcript_revision": transcript_revision},
+            }
+            return f"id: {sequence}\nevent: call.updated\ndata: {json.dumps(envelope)}\n\n".encode()
+
+        class EventFeedHandler(QuietHandler):
+            def _send_json(self, status, body):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                path = urlsplit(self.path).path
+                if path == "/v1/reviews/queue":
+                    self._send_json(200, json.dumps({"items": [{
+                        "call_id": "call-1", "audit_id": "audit-1", "machine_decision": "PASS", "machine_score": 3.0,
+                        "processing_state": "QUEUED", "agent_id": "agent-a", "team_id": "team-a",
+                        "created_at": "2026-09-24T00:00:00Z", "transcript_revision": 0, "audit_revision": 1,
+                    }]}).encode())
+                elif path == "/v1/calls/call-1":
+                    self._send_json(200, json.dumps(call_detail).encode())
+                elif path == "/v1/live-calls":
+                    self._send_json(200, b'{"items":[]}')
+                elif path == "/v1/events":
+                    # http.server defaults to HTTP/1.0, so the connection closes once this
+                    # handler returns. That closed connection is exactly what the client must
+                    # treat as a disconnect: a real /v1/events stream never ends on its own
+                    # while the client stays attached (app/api.py's loop only ends when the
+                    # request disconnects), so any close means "no longer current".
+                    events_requests.append(self.headers.get("Last-Event-ID"))
+                    attempt = len(events_requests)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    frame = sse_frame(5, "TRANSCRIBING", 1) if attempt == 1 else sse_frame(6, "READY", 2)
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+                    time.sleep(0.25)  # hold each connection open long enough for "Live" to be observable
+                else:
+                    super().do_GET()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(EventFeedHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                page.get_by_role("button", name="Call call-1, PASS, machine score 3").click()
+
+                # First connection: a real text state, "Live" - not a color-only cue. The first
+                # delivered event lands and is held stably while the mock server keeps the
+                # connection open (see the sleep below), so both checks land in the same window.
+                page.wait_for_function("document.querySelector('#connection-indicator')?.textContent === 'Live'")
+                page.wait_for_function("document.querySelector('#summary-processing-state')?.textContent === 'TRANSCRIBING'")
+                self.assertIsNone(events_requests[0])
+
+                # The mock server closes the connection (simulating a disconnect). The feed must
+                # never keep implying the call is current while it is down.
+                page.wait_for_function("document.querySelector('#connection-indicator')?.textContent === 'Reconnecting…'")
+                self.assertEqual(page.locator("#summary-processing-state").inner_text(), "TRANSCRIBING")
+
+                # The reconnect resumes from the cursor of the last event actually received, and
+                # the delivered update lands exactly once: the field reaches the new value with no
+                # leftover duplicate of the old one, and no duplicate summary card was inserted.
+                page.wait_for_function("document.querySelector('#connection-indicator')?.textContent === 'Live'")
+                page.wait_for_function("document.querySelector('#summary-processing-state')?.textContent === 'READY'")
+                self.assertEqual(events_requests[1], "5")
+                self.assertEqual(page.locator("#summary-transcript-revision").inner_text(), "2")
+                self.assertEqual(page.locator(".summary-card").count(), 8)
+                self.assertEqual(page.locator("#summary-processing-state").count(), 1)
+                self.assertNotIn("TRANSCRIBING", page.locator("#call-detail").inner_text())
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_queue_evidence_navigation_and_reasoned_review(self):
         web_root = Path(__file__).resolve().parent.parent / "web"
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))

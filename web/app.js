@@ -2,8 +2,14 @@
 
 const dimensions = ["greeting", "listening", "resolution", "compliance", "clarity", "objection", "closing"];
 const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
-const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false, uploadKey: null };
+const EVENTS_INITIAL_RETRY_MS = 500;
+const EVENTS_MAX_RETRY_MS = 8_000;
+const state = { queue: [], call: null, callId: null, selectedEvidence: null, audioGranted: false, uploadKey: null, lastAppliedEventSequence: 0, eventsCursor: 0 };
 let liveRefreshActive = false;
+let eventsStarted = false;
+let eventsAbortController = null;
+let eventsReconnectTimer = null;
+let eventsRetryDelayMs = EVENTS_INITIAL_RETRY_MS;
 const liveCallNodes = new Map();
 const byId = (id) => document.getElementById(id);
 
@@ -118,9 +124,11 @@ async function loadLiveCalls() {
         const callKey = element("span");
         const membership = element("span");
         const started = element("span");
+        const sentimentNote = element("span", "Sentiment: not integrated", "live-capability-note");
+        const policyNote = element("span", "Policy alerts: not evaluated live", "live-capability-note");
         const transcriptStatus = element("span", "", "live-transcript-status");
         const utterances = element("ol", undefined, "live-utterances");
-        item.append(sessionLabel, callKey, membership, started, transcriptStatus, utterances);
+        item.append(sessionLabel, callKey, membership, started, sentimentNote, policyNote, transcriptStatus, utterances);
         item._liveNodes = { sessionLabel, callKey, membership, started, transcriptStatus, utterances };
         liveCallNodes.set(call.call_key, item);
       }
@@ -276,9 +284,12 @@ function renderCall(data) {
     ["Machine decision", audit?.machine_decision ?? "Unavailable"],
     ["Reviewed score", data.reviews.length ? (data.reviews[data.reviews.length - 1].effective_score ?? "Unscored") : "Not reviewed"],
   ];
+  const summaryFieldIds = { "Processing state": "summary-processing-state", "Transcript revision": "summary-transcript-revision" };
   for (const [title, value] of summaries) {
     const card = element("div", undefined, "summary-card");
-    card.append(element("strong", title), element("span", value));
+    const valueNode = element("span", value);
+    if (summaryFieldIds[title]) valueNode.id = summaryFieldIds[title];
+    card.append(element("strong", title), valueNode);
     summary.append(card);
   }
   const workspace = element("div", undefined, "review-workspace");
@@ -486,9 +497,116 @@ function renderReviewForm(host, audit, data) {
   host.append(form);
 }
 
+function setConnectionIndicator(text, isError = false) {
+  const node = byId("connection-indicator");
+  if (!node) return;
+  node.textContent = text;
+  node.classList.toggle("error", isError);
+}
+
+// Apply an in-place refresh of only the fields the post-call state-refresh feed carries
+// (processing_state, transcript_revision) for the call currently open in the detail view.
+// This never triggers a full reload, so review-in-progress form state (draft reason text,
+// score selections) is preserved. Events are de-duplicated by sequence so a redelivered or
+// out-of-order event cannot re-apply a stale value after a newer one has already landed.
+function applyCallUpdate(envelope) {
+  if (!state.call || envelope.call_id !== state.callId) return;
+  if (typeof envelope.sequence === "number" && envelope.sequence <= state.lastAppliedEventSequence) return;
+  if (typeof envelope.sequence === "number") state.lastAppliedEventSequence = envelope.sequence;
+  const payload = envelope.payload || {};
+  if (typeof payload.processing_state === "string") {
+    state.call.call.processing_state = payload.processing_state;
+    const node = byId("summary-processing-state");
+    if (node) node.textContent = payload.processing_state;
+  }
+  if (typeof payload.transcript_revision === "number") {
+    state.call.call.transcript_revision = payload.transcript_revision;
+    const node = byId("summary-transcript-revision");
+    if (node) node.textContent = payload.transcript_revision;
+  }
+}
+
+function handleEventFrame(frame) {
+  let dataLine = null;
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue; // SSE comments and keepalives carry no data
+    if (line.startsWith("data:")) dataLine = line.slice(5).replace(/^ /, "");
+  }
+  if (!dataLine) return;
+  let envelope;
+  try { envelope = JSON.parse(dataLine); } catch { return; }
+  if (typeof envelope.sequence === "number") state.eventsCursor = envelope.sequence;
+  if (envelope.type === "reset_required") {
+    setConnectionIndicator("Feed reset, reloading…");
+    if (state.callId) loadCall(state.callId);
+    return;
+  }
+  if (envelope.type === "call.updated") applyCallUpdate(envelope);
+}
+
+function scheduleEventReconnect() {
+  // A disconnected feed must never look like it is still current: show "Reconnecting…"
+  // immediately, whether the connection failed outright or the stream simply ended (a
+  // well-behaved server never voluntarily ends this feed while the client is attached).
+  setConnectionIndicator("Reconnecting…", true);
+  if (eventsReconnectTimer) return;
+  eventsReconnectTimer = window.setTimeout(() => {
+    eventsReconnectTimer = null;
+    connectEventFeed();
+  }, eventsRetryDelayMs);
+  eventsRetryDelayMs = Math.min(eventsRetryDelayMs * 2, EVENTS_MAX_RETRY_MS);
+}
+
+async function connectEventFeed() {
+  if (eventsAbortController) return;
+  const controller = new AbortController();
+  eventsAbortController = controller;
+  const headers = new Headers({ Accept: "text/event-stream" });
+  if (state.eventsCursor > 0) headers.set("Last-Event-ID", String(state.eventsCursor));
+  let response;
+  try {
+    response = await fetch("/v1/events", { headers, credentials: "include", signal: controller.signal });
+  } catch {
+    eventsAbortController = null;
+    if (!controller.signal.aborted) scheduleEventReconnect();
+    return;
+  }
+  if (!response.ok || !response.body) {
+    eventsAbortController = null;
+    if (response.status === 401 || response.status === 403) {
+      // Retrying would just repeat the same failure; stop and say so plainly.
+      setConnectionIndicator("Disconnected", true);
+      return;
+    }
+    scheduleEventReconnect();
+    return;
+  }
+  setConnectionIndicator("Live");
+  eventsRetryDelayMs = EVENTS_INITIAL_RETRY_MS;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        handleEventFrame(buffer.slice(0, boundary));
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+  } catch { /* fall through to the reconnect below, unless this was an intentional abort */ }
+  eventsAbortController = null;
+  if (!controller.signal.aborted) scheduleEventReconnect();
+}
+
 async function loadCall(callId) {
   state.callId = callId;
   state.audioGranted = false;
+  state.lastAppliedEventSequence = 0;
   byId("call-status").classList.remove("error");
   byId("call-status").textContent = "Loading call evidence…";
   try {
@@ -504,6 +622,12 @@ async function loadCall(callId) {
       ? "This audit uses superseded transcript evidence. Scoring actions are disabled; reload the current review queue."
       : "Current final redacted evidence loaded.";
     renderQueue();
+    // The live state-refresh feed is scoped to the call open in the detail view; open it the
+    // first time a call is opened and keep the same connection for later calls the reviewer opens.
+    if (!eventsStarted) {
+      eventsStarted = true;
+      connectEventFeed();
+    }
   } catch (error) {
     byId("call-status").textContent = error.message;
     byId("call-status").classList.add("error");
