@@ -38,8 +38,11 @@ class ExotelAdapterTests(unittest.TestCase):
 
     def test_final_membership_revocation_blocks_intake_and_cleans_spooled_object(self):
         class Result:
+            def __init__(self, row=None):
+                self.row = row
+
             def fetchone(self):
-                return (4,)
+                return self.row
 
             def fetchall(self):
                 return []
@@ -61,6 +64,8 @@ class ExotelAdapterTests(unittest.TestCase):
                 self.queries.append(query)
                 if query.startswith("SET TRANSACTION") or "set_config('statement_timeout'" in query:
                     return Result()
+                if "SELECT s.generation,s.state" in query:
+                    return Result((4, "DRAINING"))
                 return Result()
 
         connection = Connection()

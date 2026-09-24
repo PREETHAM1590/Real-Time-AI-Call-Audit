@@ -346,7 +346,7 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
                 self.assertEqual(page.get_by_label("Review reason").get_attribute("required"), "")
                 self.assertIn("Human review history", page.locator("#call-detail").inner_text())
                 superseded_mode = True
-                page.get_by_role("button", name="Refresh").click()
+                page.get_by_role("button", name="Refresh", exact=True).click()
                 page.get_by_role("button", name="Call call-1, PASS, machine score 3").click()
                 page.get_by_text("This audit uses superseded transcript evidence.").wait_for()
                 self.assertEqual(page.get_by_label("Review reason").count(), 0)

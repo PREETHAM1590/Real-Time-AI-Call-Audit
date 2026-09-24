@@ -106,6 +106,7 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
     key = storage.put(audio)
     call_id, audio_id, job_id = uuid4(), uuid4(), uuid4()
     result = None
+    transaction_body_complete = False
     try:
         database_timeout = math.ceil(timeout_seconds) if timeout_seconds is not None else None
         connection_context = connect(timeout_seconds=max(1, database_timeout)) if database_timeout is not None else connect()
@@ -155,25 +156,12 @@ def accept_recording(scope: Scope, external_ref: str, audio: bytes, metadata: di
                     ).fetchone()
                     if ended is None:
                         raise IntakeError("Exotel session could not be finalized")
+                transaction_body_complete = True
     except Exception:
-        if generation_fence is None:
+        if not transaction_body_complete:
             storage.delete(key)
-        else:
-            # A commit error can be ambiguous. Preserve the object if the durable call
-            # exists; orphan cleanup handles a definitely uncommitted intake later.
-            try:
-                integration_id, call_key, generation, _, _, _ = generation_fence
-                with connect() as connection:
-                    accepted = connection.execute(
-                        "SELECT 1 FROM calls c JOIN exotel_sessions s ON s.organisation_id=c.organisation_id "
-                        "WHERE c.organisation_id=%s AND c.external_ref=%s AND s.integration_id=%s AND s.call_key=%s "
-                        "AND s.generation=%s AND s.state='ENDED' LIMIT 1",
-                        (scope.organisation_id, external_ref, integration_id, call_key, generation),
-                    ).fetchone() is not None
-                if not accepted:
-                    storage.delete(key)
-            except Exception:
-                pass
+        # ponytail: once the transaction body completes, preserve on commit errors;
+        # age-gated orphan cleanup resolves ambiguity without risking committed audio.
         raise
     if result is not None:
         storage.delete(key)

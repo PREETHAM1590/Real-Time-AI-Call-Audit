@@ -142,9 +142,11 @@ class ExotelWebSocketTests(unittest.TestCase):
             self.assertEqual(intake.call_count, 0)
             self.assertEqual(self.connection.session_states, ["INCOMPLETE"])
 
-        with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS", 1), patch("app.api.EXOTEL_SESSION_TIMEOUT_SECONDS", 0.05), patch("app.api.accept_recording") as intake:
+        self.connection.session_activated.clear()
+        with patch("app.api.connect", return_value=self.connection), patch("app.api.EXOTEL_MEDIA_IDLE_TIMEOUT_SECONDS", 2), patch("app.api.EXOTEL_SESSION_TIMEOUT_SECONDS", 1), patch("app.api.accept_recording") as intake:
             with self.client.websocket_connect("/v1/exotel/stream", headers={"Authorization": self._auth_header()}) as ws:
                 self._send_start(ws)
+                self.assertTrue(self.connection.session_activated.wait(1))
                 self.assertEqual(ws.receive()["code"], 4408)
             self.assertEqual(intake.call_count, 0)
             self.assertEqual(self.connection.session_states, ["INCOMPLETE", "INCOMPLETE"])

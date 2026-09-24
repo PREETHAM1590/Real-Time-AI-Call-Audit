@@ -64,9 +64,10 @@ class _Connection:
 
 
 class _IntakeConnection:
-    def __init__(self, *, allow_ended=True):
+    def __init__(self, *, allow_ended=True, commit_error=False):
         self.call_id = uuid4()
         self.allow_ended = allow_ended
+        self.commit_error = commit_error
         self.in_transaction = False
         self.ended_was_in_transaction = False
 
@@ -86,6 +87,8 @@ class _IntakeConnection:
 
             def __exit__(self, *args):
                 connection.in_transaction = False
+                if connection.commit_error and args[0] is None:
+                    raise RuntimeError("ambiguous commit result")
                 return False
 
         return _Transaction()
@@ -198,6 +201,15 @@ class LiveSessionLifecycleTests(unittest.TestCase):
                                  storage=storage, generation_fence=("integration-a", "a" * 64, 7, "external-agent", "agent-a", "team-a"))
         self.assertTrue(connection.ended_was_in_transaction)
         self.assertEqual(storage.deleted, ["synthetic-object"])
+
+    def test_ambiguous_commit_retains_object_for_orphan_reconciliation(self):
+        connection = _IntakeConnection(commit_error=True)
+        storage = _Storage()
+        scope = Scope("org-a", "agent-a", "AGENT", frozenset({"team-a"}))
+        with patch("app.ingest.connect", return_value=connection), patch("app.ingest.inspect_audio", return_value=("wav", 8000, 1, 100)):
+            with self.assertRaisesRegex(RuntimeError, "ambiguous commit"):
+                accept_recording(scope, "sha256:ref", b"synthetic", {}, "idem", storage=storage)
+        self.assertEqual(storage.deleted, [])
 
 
 class LiveCallsScopeTests(unittest.TestCase):
