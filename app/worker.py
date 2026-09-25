@@ -307,11 +307,22 @@ def build_processors() -> dict[str, Processor]:
             classify=transformers_classifier(sentiment_model_directory),
             adapter_version=os.environ.get("SENTIMENT_ADAPTER_VERSION", "local-sentiment-v1"),
         )
-        # Advisory and uncalibrated (AGENTS.md): warm the pipeline once here so the
-        # first real request is not the cold-start request, and never let this stage's
-        # absence or failure block the deterministic TRANSCRIBE/ANALYSE/POLICY/AUDIT stages.
-        sentiment_adapter.warm()
-        processors["SENTIMENT"] = make_sentiment_processor(sentiment_adapter)
+        # Advisory and uncalibrated (AGENTS.md). Misconfiguration above (partial env,
+        # checksum mismatch, transformers missing) still fails startup like every other
+        # stage. But a model that loads yet fails its warm-up inference must not stop the
+        # worker and so block TRANSCRIBE/ANALYSE/POLICY/AUDIT: leave SENTIMENT parked
+        # (the UI shows sentiment as not available) and say so in the log.
+        from app.sentiment_adapter import SentimentUnavailable, SentimentValidationError
+
+        try:
+            sentiment_adapter.warm()
+        except (SentimentUnavailable, SentimentValidationError):
+            _LOGGER.warning(
+                "sentiment model failed warm-up; SENTIMENT stage left unregistered",
+                extra={"event_name": "worker.sentiment_warmup_failed"},
+            )
+        else:
+            processors["SENTIMENT"] = make_sentiment_processor(sentiment_adapter)
     return processors
 
 

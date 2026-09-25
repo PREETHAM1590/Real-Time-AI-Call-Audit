@@ -114,6 +114,21 @@ class BuildProcessorsSentimentTests(TestCase):
         self.assertIn("SENTIMENT", processors)
         classifier_patch.assert_called_once()
 
+    def test_warm_up_failure_parks_sentiment_instead_of_stopping_the_worker(self):
+        # An unavailable sentiment model must not block the deterministic stages
+        # (spec: "does not block deterministic policy checks; show unknown sentiment").
+        def broken_classify(_text):
+            raise RuntimeError("model process died")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path, digest = _verified_model_directory(directory)
+            with patch.dict(os.environ, {"SENTIMENT_MODEL_PATH": path, "SENTIMENT_MODEL_SHA256": digest}, clear=True), \
+                 patch("app.sentiment_adapter.transformers_classifier", return_value=broken_classify), \
+                 self.assertLogs("app.worker", level="WARNING") as logs:
+                processors = build_processors()
+        self.assertNotIn("SENTIMENT", processors)
+        self.assertIn("warm-up", "".join(logs.output))
+
 
 @skipUnless(os.environ.get("DATABASE_URL") or os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
 class SentimentPipelineIntegrationTests(TestCase):
