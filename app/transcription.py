@@ -150,7 +150,7 @@ class LiveWindowTranscriber:
         """Request nonblocking cleanup; an in-flight local decode clears state when it returns."""
         self._discard_requested.set()
         self._closed = True
-        self._pcm.clear()
+        self._pcm.clear()  # Free raw audio now; CPython bytearray ops are atomic and the lock holder re-checks discard.
         if self._state_lock.acquire(blocking=False):
             try:
                 self._pending.clear()

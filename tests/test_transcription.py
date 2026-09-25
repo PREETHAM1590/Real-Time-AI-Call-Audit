@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import io
 import logging
 import os
@@ -101,7 +102,14 @@ class PrivacyTests(unittest.TestCase):
                 _configured_analyzer.cache_clear()
 
 
+LIVE_DECODE_AVAILABLE = all(importlib.util.find_spec(name) for name in ("av", "numpy"))
+requires_live_decode = unittest.skipUnless(
+    LIVE_DECODE_AVAILABLE, "Install the transcription extra (PyAV and NumPy) for live window resampling checks"
+)
+
+
 class TranscriptionTests(unittest.TestCase):
+    @requires_live_decode
     def test_live_windows_are_bounded_unknown_speaker_correctable_and_redacted(self):
         raw = [
             [SimpleNamespace(start=2.2, end=3.5, text="call 4155550199")],
@@ -137,6 +145,7 @@ class TranscriptionTests(unittest.TestCase):
         self.assertNotIn("4165550100", corrected[0].model_dump_json())
         self.assertLessEqual(transcriber.buffered_bytes, LiveWindowTranscriber.WINDOW_MS * 16)
 
+    @requires_live_decode
     def test_live_redaction_failure_returns_no_transcript_and_closes_processor(self):
         model = FakeModel([SimpleNamespace(start=0.2, end=3.5, text="sensitive transcript")])
         transcriber = LiveWindowTranscriber(
@@ -148,6 +157,7 @@ class TranscriptionTests(unittest.TestCase):
         with self.assertRaises(TranscriptionError):
             transcriber.push(b"\x00\x00" * 160, 4000)
 
+    @requires_live_decode
     def test_live_holds_model_gate_while_consuming_lazy_segments(self):
         class LazyModel:
             def transcribe(self, audio, **kwargs):
@@ -164,6 +174,7 @@ class TranscriptionTests(unittest.TestCase):
         transcriber = LiveWindowTranscriber(LazyModel(), language="en", redact=lambda text: text)
         self.assertEqual(len(transcriber.push(b"\x00\x00" * (8000 * 4), 0)), 1)
 
+    @requires_live_decode
     def test_live_rejects_non_millisecond_pcm_and_out_of_window_timing(self):
         transcriber = LiveWindowTranscriber(FakeModel([]), language="en", redact=lambda text: text)
         with self.assertRaises(TranscriptionError):
@@ -175,6 +186,15 @@ class TranscriptionTests(unittest.TestCase):
             transcriber.push(b"\x00\x00" * (8000 * 4), 0)
         self.assertEqual(transcriber.buffered_bytes, 0)
 
+    def test_live_discard_while_idle_frees_buffered_audio(self):
+        transcriber = LiveWindowTranscriber(FakeModel([]), language="en", redact=lambda text: text)
+        transcriber.push(b"\x00\x00" * 800, 0)
+        self.assertEqual(transcriber.buffered_bytes, 1600)
+        transcriber.discard()
+        self.assertEqual(transcriber.buffered_bytes, 0)
+        self.assertEqual(transcriber.finish(), [])
+
+    @requires_live_decode
     def test_live_malformed_model_timing_clears_audio_and_normalizes_locale(self):
         class LocaleModel:
             def transcribe(self, audio, **kwargs):

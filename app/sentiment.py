@@ -132,3 +132,53 @@ def sentiment_alert_times(signals: Sequence[SentimentSignal]) -> list[int]:
             alerts.append(alert_ms)
             last_alert_ms = alert_ms
     return alerts
+
+
+TREND_WINDOW_MS = 60_000
+
+
+def customer_speech_trend(signals: Sequence[SentimentSignal]) -> dict | None:
+    """Duration-weighted mean signed score of the first vs. last 60s of final CUSTOMER speech.
+
+    Spec section 11: "Aggregate contiguous turns with duration weights; compare the
+    first and last 60 seconds of customer speech for the call summary. Missing customer
+    speech gives null summary." This implements that first/last-60-seconds comparison,
+    weighting each qualifying utterance's contribution by its own duration; it does not
+    attempt turn-level grouping, since the spec does not define a turn boundary and
+    inventing one here would be unverified behaviour, not a measured requirement. When
+    total qualifying speech is under 120s the two windows may share utterances; that
+    overlap is expected, not an error.
+    """
+    eligible = [signal for signal in signals if isinstance(signal, Mapping) and signal.get("role") == "CUSTOMER" and signal.get("is_final") is True]
+    ordered = sorted(eligible, key=lambda signal: _validated_offset(signal.get("start_ms"), "start_ms"))
+    if not ordered:
+        return None
+
+    def _windowed_mean(items: Sequence[SentimentSignal]) -> tuple[Decimal, int]:
+        total_duration_ms = 0
+        weighted_sum = Decimal(0)
+        for signal in items:
+            start_ms, end_ms = _validated_offset(signal.get("start_ms"), "start_ms"), _validated_offset(signal.get("end_ms"), "end_ms")
+            if end_ms < start_ms:
+                raise ValueError("end_ms must not precede start_ms")
+            duration_ms = end_ms - start_ms
+            score = _validated_window([signal.get("signed_score")], "signal")[0]
+            weighted_sum += Decimal(str(score)) * Decimal(duration_ms)
+            total_duration_ms += duration_ms
+            if total_duration_ms >= TREND_WINDOW_MS:
+                break
+        if total_duration_ms == 0:
+            return Decimal(0), 0
+        return weighted_sum / Decimal(total_duration_ms), total_duration_ms
+
+    first_mean, first_duration_ms = _windowed_mean(ordered)
+    last_mean, last_duration_ms = _windowed_mean(list(reversed(ordered)))
+    if first_duration_ms == 0 or last_duration_ms == 0:
+        return None
+    return {
+        "first_60s_mean_signed_score": float(first_mean),
+        "first_60s_customer_speech_ms": first_duration_ms,
+        "last_60s_mean_signed_score": float(last_mean),
+        "last_60s_customer_speech_ms": last_duration_ms,
+        "trend_delta": float(last_mean - first_mean),
+    }

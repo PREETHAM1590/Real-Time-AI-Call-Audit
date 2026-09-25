@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from app.sentiment import sentiment_alert_times, sentiment_drop
+from app.sentiment import customer_speech_trend, sentiment_alert_times, sentiment_drop
 
 
 class SentimentDropTests(unittest.TestCase):
@@ -129,6 +129,57 @@ class SentimentAlertTests(unittest.TestCase):
         for role in ([], {}):
             with self.subTest(role=role), self.assertRaises(ValueError):
                 sentiment_alert_times([self.signal(0, 0.5, role=role)])
+
+
+class CustomerSpeechTrendTests(unittest.TestCase):
+    @staticmethod
+    def signal(start_ms, end_ms, score, *, signal_id=None, role="CUSTOMER", is_final=True, probability=0.8):
+        return {
+            "id": f"signal-{start_ms}" if signal_id is None else signal_id,
+            "role": role, "start_ms": start_ms, "end_ms": end_ms, "is_final": is_final,
+            "signed_score": score, "top_class_probability": probability,
+        }
+
+    def test_missing_customer_speech_gives_null_summary(self):
+        self.assertIsNone(customer_speech_trend([]))
+        self.assertIsNone(customer_speech_trend([self.signal(0, 1000, 0.5, role="AGENT")]))
+        self.assertIsNone(customer_speech_trend([self.signal(0, 1000, 0.5, is_final=False)]))
+
+    def test_single_short_utterance_is_both_first_and_last_window(self):
+        result = customer_speech_trend([self.signal(0, 1000, 0.6)])
+        self.assertEqual(result["first_60s_mean_signed_score"], 0.6)
+        self.assertEqual(result["last_60s_mean_signed_score"], 0.6)
+        self.assertEqual(result["first_60s_customer_speech_ms"], 1000)
+        self.assertEqual(result["trend_delta"], 0.0)
+
+    def test_duration_weighting_favours_the_longer_utterance(self):
+        # 1s at +1.0 and 9s at -1.0 in the same (only) window: weighted mean is -0.8, not the -0.0 unweighted average.
+        result = customer_speech_trend([self.signal(0, 1000, 1.0), self.signal(1000, 10_000, -1.0)])
+        self.assertAlmostEqual(result["first_60s_mean_signed_score"], -0.8)
+
+    def test_improving_trend_is_a_positive_delta_between_first_and_last_60_seconds(self):
+        # Negative for the first 60s, positive for a separate later 60s: distinct, non-overlapping windows.
+        signals = [self.signal(i * 10_000, i * 10_000 + 10_000, -0.8) for i in range(6)]
+        signals += [self.signal(120_000 + i * 10_000, 120_000 + i * 10_000 + 10_000, 0.8) for i in range(6)]
+        result = customer_speech_trend(signals)
+        self.assertAlmostEqual(result["first_60s_mean_signed_score"], -0.8)
+        self.assertAlmostEqual(result["last_60s_mean_signed_score"], 0.8)
+        self.assertAlmostEqual(result["trend_delta"], 1.6)
+
+    def test_short_total_speech_windows_overlap_rather_than_erroring(self):
+        # Only 20s of total customer speech: well under the 60s window on both sides.
+        signals = [self.signal(0, 10_000, 0.5), self.signal(10_000, 20_000, -0.5)]
+        result = customer_speech_trend(signals)
+        self.assertEqual(result["first_60s_customer_speech_ms"], 20_000)
+        self.assertEqual(result["last_60s_customer_speech_ms"], 20_000)
+        self.assertEqual(result["first_60s_mean_signed_score"], result["last_60s_mean_signed_score"])
+
+    def test_non_customer_and_partial_signals_are_excluded_from_the_window(self):
+        signals = [self.signal(0, 1000, 0.5, role="AGENT"), self.signal(1000, 2000, -1.0, is_final=False),
+                   self.signal(2000, 3000, 0.3)]
+        result = customer_speech_trend(signals)
+        self.assertEqual(result["first_60s_customer_speech_ms"], 1000)
+        self.assertEqual(result["first_60s_mean_signed_score"], 0.3)
 
 
 if __name__ == "__main__":

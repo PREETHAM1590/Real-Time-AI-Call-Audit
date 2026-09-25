@@ -14,3 +14,7 @@ models/
 *.onnx
 *.safetensors
 *.bin
+
+# Kaggle GPU benchmark: .build/ is a transient template render, never committed.
+# results/ *is* committed per-run as measurement evidence for docs/operations-and-evaluation.md.
+benchmarks/kaggle_gpu_benchmark/.build/

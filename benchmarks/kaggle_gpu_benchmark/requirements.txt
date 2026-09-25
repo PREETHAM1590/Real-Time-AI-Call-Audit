@@ -1,0 +1,3 @@
+# Local orchestrator only (push_and_collect.py). Never installed into the application's
+# own environment/pyproject.toml — this talks to the Kaggle API, nothing else.
+kaggle==2.2.4

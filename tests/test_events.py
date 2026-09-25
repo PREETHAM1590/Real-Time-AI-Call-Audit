@@ -249,6 +249,22 @@ class EventOutboxPostgresTests(unittest.TestCase):
         self.assertEqual(set(qa[0]), {"sequence", "schema_version", "call_id", "type", "occurred_at", "payload"})
         self.assertNotIn("private-ref", json.dumps(qa))
 
+    def test_cross_org_cursor_values_neither_leak_nor_confuse_organisation_bs_own_stream(self):
+        # Sequence numbers are per-organisation counters, so the same integer cursor is
+        # "valid" in both streams but means something different in each. Org A's own latest
+        # sequence (3) must be evaluated against org B's much shorter stream (1 event), not
+        # treated as though it were meaningful for org B.
+        scope_b = Scope(self.org_b, "qa", "QA_ANALYST", frozenset())
+        with self.connect() as connection:
+            with self.assertRaises(EventCursorError):
+                read_events(connection, scope_b, 3)
+            rows = read_events(connection, scope_b, 0)
+        self.assertEqual([event["sequence"] for event in rows], [1])
+        self.assertEqual([event["call_id"] for event in rows], [self.call_b])
+        self.assertNotIn(self.call_a1, [event["call_id"] for event in rows])
+        self.assertNotEqual(rows[0]["payload"], {"processing_state": "ANALYSING", "transcript_revision": 1})
+        self.assertNotIn(self.call_a1, json.dumps(rows))
+
     def test_team_and_agent_scope_excludes_other_calls_and_unknown_roles_fail(self):
         with self.connect() as connection:
             self.assertEqual(read_events(connection, Scope(self.org_a, "lead", "TEAM_LEADER", frozenset({"missing"})), 0), [])

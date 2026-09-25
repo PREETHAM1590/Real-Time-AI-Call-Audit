@@ -13,6 +13,8 @@
       <a class="brand" href="/analyst">Call Audit</a>
       <nav aria-label="Primary navigation" class="primary-nav">
         <a href="/analyst" aria-current="page">Review</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/dispositions">Dispositions</a>
         <a href="/quality">Quality</a>
         <a href="/providers">Provider coverage</a>
       </nav>
@@ -49,7 +51,13 @@
         <ol id="queue-list" class="queue-list"></ol>
       </section>
       <section id="call-panel" aria-labelledby="call-title" class="call-panel" aria-live="polite">
-        <div class="call-heading"><div><h2 id="call-title" tabindex="-1">Select a call</h2></div><p id="call-status" class="status" role="status" aria-live="polite">Choose an item in the review queue.</p></div>
+        <div class="call-heading">
+          <div><h2 id="call-title" tabindex="-1">Select a call</h2></div>
+          <div class="call-heading-meta">
+            <p id="call-status" class="status" role="status" aria-live="polite">Choose an item in the review queue.</p>
+            <p id="connection-indicator" class="status connection-feed" role="status" aria-live="polite">Disconnected</p>
+          </div>
+        </div>
         <div id="call-detail"></div>
       </section>
     </main>
