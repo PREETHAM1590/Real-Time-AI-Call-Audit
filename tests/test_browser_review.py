@@ -562,3 +562,70 @@ class AnalystBrowserSmokeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_sentiment_card_renders_trend_and_alert_then_not_available_when_null(self):
+        web_root = Path(__file__).resolve().parent.parent / "web"
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(web_root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        sentiment_state = {"value": {
+            "revision": 1, "transcript_revision": 1, "status": "OK",
+            "model_artifact": "sha256:" + "a" * 64, "adapter_version": "local-sentiment-v1",
+            "alert_offsets_ms": [60_000],
+            "trend": {"first_60s_mean_signed_score": 0.4, "first_60s_customer_speech_ms": 12_000,
+                      "last_60s_mean_signed_score": -0.3, "last_60s_customer_speech_ms": 9_000, "trend_delta": -0.7},
+            "failed_utterance_count": 0, "signal_count": 5,
+        }}
+
+        try:
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as error:
+                    if "Executable doesn't exist" in str(error):
+                        self.skipTest("Install the Playwright Chromium binary with `python -m playwright install chromium`")
+                    raise
+                page = browser.new_page()
+
+                def handle_api(route):
+                    path = urlsplit(route.request.url).path
+                    if path == "/v1/reviews/queue":
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({"items": [{
+                            "call_id": "call-1", "audit_id": "audit-1", "machine_decision": "PASS", "machine_score": 3.0,
+                            "processing_state": "READY", "agent_id": "agent-a", "team_id": "team-a",
+                            "created_at": "2026-09-24T00:00:00Z", "transcript_revision": 1, "audit_revision": 1,
+                        }]}))
+                    elif path == "/v1/calls/call-1":
+                        detail = {
+                            "call": {"id": "call-1", "agent_id": "agent-a", "team_id": "team-a", "processing_state": "READY", "language": "en", "created_at": "2026-09-24T00:00:00Z", "transcript_revision": 1},
+                            "audit": None, "transcript": [], "findings": [], "disposition": None,
+                            "sentiment": sentiment_state["value"], "reviews": [], "current_review_version": 0,
+                        }
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps(detail))
+                    elif path == "/v1/live-calls":
+                        route.fulfill(status=200, content_type="application/json", body='{"items":[]}')
+                    else:
+                        route.fulfill(status=404, content_type="application/json", body="{}")
+
+                page.route("**/v1/**", handle_api)
+                page.goto(f"http://127.0.0.1:{server.server_port}/index.html")
+                page.get_by_role("button", name="Call call-1, PASS, machine score 3").click()
+                card = page.locator(".sentiment-card")
+                card.wait_for()
+                card_text = card.inner_text()
+                self.assertIn("OK", card_text)
+                self.assertIn("0.40", card_text)
+                self.assertIn("-0.30", card_text)
+                self.assertIn("-0.70", card_text)
+                self.assertIn("Customer sentiment drop ending near 1:00", card_text)
+                self.assertIn("Advisory only", page.locator(".sentiment-disclaimer").inner_text())
+
+                sentiment_state["value"] = None
+                page.get_by_role("button", name="Refresh", exact=True).click()
+                page.get_by_role("button", name="Call call-1, PASS, machine score 3").click()
+                page.get_by_text("Not available", exact=False).wait_for()
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)

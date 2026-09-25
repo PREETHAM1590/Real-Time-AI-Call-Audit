@@ -6,13 +6,15 @@ pinned local three-class checkpoint on already-redacted final CUSTOMER utterance
 and turns its output into the typed `SentimentSignal` shape that `app.sentiment`'s pure,
 already-tested decision logic (`sentiment_alert_times`) consumes.
 
-Not in scope here, and not claimed as done: persisting sentiment on a call record, a
-worker pipeline stage, an API field, UI display, or model calibration/evaluation on
-contact-centre data. `docs/open-source-models.md` is explicit that "a Twitter-trained
-checkpoint is not assumed to generalise to calls" and that confidence stays untrusted
-until measured against adjudicated data — nothing in this module changes that. This
-adapter is unevaluated until that measurement exists; treat its output as provisional
-input to `sentiment_alert_times`, never as a release-qualified signal.
+`app.worker.make_sentiment_processor`/`build_processors` now wire this adapter into an
+advisory SENTIMENT worker stage, `app.ingest.finish_job` persists its output to
+`call_sentiments`, `app.reviews.call_detail` exposes a summary, and the analyst UI shows
+it. That wiring never changes `calls.processing_state` and never selects, downloads or
+evaluates a real checkpoint: `docs/open-source-models.md` is explicit that "a
+Twitter-trained checkpoint is not assumed to generalise to calls" and that confidence
+stays untrusted until measured against adjudicated data — nothing here changes that.
+This adapter is unevaluated until that measurement exists; treat its output as
+provisional and advisory only, never as a release-qualified or scoring signal.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from app.artifacts import verified_model_directory
@@ -69,6 +72,39 @@ def _signal_from_class_probabilities(probabilities: dict[str, float]) -> tuple[f
     signed_score = max(-1.0, min(1.0, positive - negative))
     top_class_probability = max(probabilities.values())
     return signed_score, top_class_probability
+
+
+def transformers_classifier(model_dir: str | Path) -> Callable[[str], list[dict]]:
+    """Build a `classify` callable from a verified local `transformers` checkpoint directory.
+
+    Deployment (`app.worker.build_processors`) resolves and checksum-verifies the model
+    directory before calling this; nothing here downloads or accepts an unverified path.
+    Sets the offline environment flags before importing `transformers` so no request can
+    reach the Hub at runtime. Fails closed (raises `RuntimeError`) if `transformers` is
+    not installed in the worker image, matching every other local-model stage in this
+    codebase (see `docs/operations-and-evaluation.md`'s Sentiment stage note): callers
+    must not add torch/transformers to `pyproject.toml`/`uv.lock` merely to satisfy this,
+    since only a deployment that has provisioned that runtime configures the stage at all.
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        from transformers import pipeline
+    except ImportError as error:
+        raise RuntimeError("The transformers package is required to serve the local sentiment model") from error
+    model_path = str(model_dir)
+    text_classifier = pipeline("text-classification", model=model_path, tokenizer=model_path, top_k=None)
+
+    def classify(text: str) -> list[dict]:
+        raw = text_classifier(text)
+        # Some pipeline versions wrap a single input's per-class scores in one extra
+        # batch-shaped list ([[{...}, {...}]] instead of [{...}, {...}]); unwrap exactly
+        # one such nesting level so `_validated_class_probabilities` sees a flat list.
+        if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list):
+            raw = raw[0]
+        return raw
+
+    return classify
 
 
 class LocalSentimentAdapter:

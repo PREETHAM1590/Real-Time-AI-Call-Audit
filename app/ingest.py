@@ -8,6 +8,7 @@ import tempfile
 import threading
 import wave
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from app.db import connect
@@ -19,6 +20,10 @@ from app.storage import LocalPrivateStorage
 MAX_AUDIO_BYTES = 250 * 1024 * 1024
 MAX_DURATION_MS = 120 * 60 * 1000
 MAX_JOB_ATTEMPTS = 5
+MAX_SENTIMENT_SIGNALS = 2_000
+_SENTIMENT_SIGNAL_KEYS = {"id", "start_ms", "end_ms", "signed_score", "top_class_probability"}
+_SENTIMENT_STATUSES = {"OK", "UNKNOWN", "UNAVAILABLE"}
+_SENTIMENT_TREND_KEYS = {"first_60s_mean_signed_score", "first_60s_customer_speech_ms", "last_60s_mean_signed_score", "last_60s_customer_speech_ms", "trend_delta"}
 _MP3_DECODERS = threading.BoundedSemaphore(2)
 
 
@@ -229,6 +234,10 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                         "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'POLICY',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
                         (locked[0], uuid4(), locked[1], revision),
                     )
+                    connection.execute(
+                        "INSERT INTO jobs(organisation_id,id,call_id,stage,input_revision,state) VALUES (%s,%s,%s,'SENTIMENT',%s,'QUEUED') ON CONFLICT (organisation_id,call_id,stage,input_revision) DO NOTHING",
+                        (locked[0], uuid4(), locked[1], revision),
+                    )
                 policy_flags = result.get("policy_flags", [])
                 if policy_flags:
                     persist_policy_findings(connection, locked[0], locked[1], revision, policy_flags)
@@ -265,6 +274,18 @@ def finish_job(connection, job_id: str, lease_token: str, result: dict) -> bool:
                 # Task 6 human review and later lifecycle gates are not present;
                 # an audit result therefore cannot advance a call to READY.
                 connection.execute("UPDATE calls SET processing_state='NEEDS_REVIEW' WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (locked[0], locked[1]))
+            elif "sentiment" in result:
+                if locked[4] != "SENTIMENT" or locked[5] != locked[3]:
+                    raise ValueError("stale or misrouted sentiment result")
+                sentiment = result["sentiment"]
+                required = {"transcript_revision", "model_artifact", "adapter_version", "status", "signals", "alert_offsets_ms", "trend", "failed_utterance_count"}
+                if not isinstance(sentiment, dict) or set(sentiment) != required:
+                    raise ValueError("invalid sentiment result")
+                if sentiment["transcript_revision"] != locked[3]:
+                    raise ValueError("stale sentiment transcript revision")
+                # Advisory only (AGENTS.md): sentiment never moves a call to READY and
+                # never overwrites NEEDS_REVIEW, so calls.processing_state is untouched.
+                persist_call_sentiment(connection, locked[0], locked[1], locked[3], sentiment)
             else:
                 connection.execute("UPDATE calls SET processing_state=%s WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL", (state, locked[0], locked[1]))
             current = connection.execute(
@@ -319,6 +340,68 @@ def persist_policy_findings(connection, organisation_id, call_id, transcript_rev
             "ON CONFLICT (organisation_id,call_id,transcript_revision,ruleset_hash,rule_id,evidence_fingerprint) DO UPDATE SET status=EXCLUDED.status,severity=EXCLUDED.severity,evidence_ids=EXCLUDED.evidence_ids,deadline_ms=EXCLUDED.deadline_ms,remediation=EXCLUDED.remediation,updated_at=now()",
             (organisation_id, uuid4(), call_id, transcript_revision, finding["rule_id"], finding["ruleset_version"], finding["ruleset_hash"], finding["policy_text_version"], finding["status"], finding["severity"], json.dumps(sorted(set(evidence_ids))), fingerprint, deadline, finding["remediation"]),
         )
+
+
+def _validated_sentiment_signal(signal: Any) -> dict:
+    if not isinstance(signal, dict) or set(signal) != _SENTIMENT_SIGNAL_KEYS:
+        raise ValueError("sentiment signal must contain exactly the allowed fields")
+    signal_id = signal["id"]
+    if not isinstance(signal_id, str) or not 1 <= len(signal_id) <= 128:
+        raise ValueError("invalid sentiment signal id")
+    start_ms, end_ms = signal["start_ms"], signal["end_ms"]
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (start_ms, end_ms)) or end_ms < start_ms:
+        raise ValueError("invalid sentiment signal offsets")
+    signed_score, top_class_probability = signal["signed_score"], signal["top_class_probability"]
+    if isinstance(signed_score, bool) or not isinstance(signed_score, (int, float)) or not math.isfinite(signed_score) or not -1 <= signed_score <= 1:
+        raise ValueError("invalid sentiment signed_score")
+    if isinstance(top_class_probability, bool) or not isinstance(top_class_probability, (int, float)) or not math.isfinite(top_class_probability) or not 0 <= top_class_probability <= 1:
+        raise ValueError("invalid sentiment top_class_probability")
+    return {"id": signal_id, "start_ms": start_ms, "end_ms": end_ms, "signed_score": float(signed_score), "top_class_probability": float(top_class_probability)}
+
+
+def persist_call_sentiment(connection, organisation_id, call_id, transcript_revision: int, sentiment: dict) -> None:
+    """Persist one advisory, machine-only sentiment revision for a call.
+
+    Re-validates every field even though the worker already built this payload from a
+    validated adapter result: this function is the last gate before persistence, model
+    output is untrusted, and no utterance text may ever reach this table (AGENTS.md).
+    Never touches `calls.processing_state`; callers keep sentiment fully advisory.
+    """
+    if sentiment.get("status") not in _SENTIMENT_STATUSES:
+        raise ValueError("invalid sentiment status")
+    for field in ("model_artifact", "adapter_version"):
+        value = sentiment.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 256:
+            raise ValueError("invalid sentiment provenance field")
+    signals = sentiment.get("signals")
+    if not isinstance(signals, list) or len(signals) > MAX_SENTIMENT_SIGNALS:
+        raise ValueError("invalid sentiment signal batch")
+    validated_signals = [_validated_sentiment_signal(signal) for signal in signals]
+    alert_offsets = sentiment.get("alert_offsets_ms")
+    if not isinstance(alert_offsets, list) or len(alert_offsets) > MAX_SENTIMENT_SIGNALS or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in alert_offsets):
+        raise ValueError("invalid sentiment alert offsets")
+    trend = sentiment.get("trend")
+    if trend is not None:
+        if not isinstance(trend, dict) or set(trend) != _SENTIMENT_TREND_KEYS:
+            raise ValueError("invalid sentiment trend")
+        for value in trend.values():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("invalid sentiment trend")
+    failed_utterance_count = sentiment.get("failed_utterance_count")
+    if isinstance(failed_utterance_count, bool) or not isinstance(failed_utterance_count, int) or failed_utterance_count < 0:
+        raise ValueError("invalid sentiment failure count")
+    revision = connection.execute(
+        "SELECT COALESCE(MAX(revision),0)+1 FROM call_sentiments WHERE organisation_id=%s AND call_id=%s", (organisation_id, call_id)
+    ).fetchone()[0]
+    connection.execute(
+        "INSERT INTO call_sentiments(organisation_id,id,call_id,revision,transcript_revision,model_artifact,adapter_version,status,signals_json,alert_offsets_ms,trend_json,failed_utterance_count) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s) "
+        "ON CONFLICT (organisation_id,call_id,transcript_revision,model_artifact,adapter_version) DO NOTHING",
+        (
+            organisation_id, uuid4(), call_id, revision, transcript_revision, sentiment["model_artifact"], sentiment["adapter_version"], sentiment["status"],
+            json.dumps(validated_signals), json.dumps(alert_offsets), json.dumps(trend) if trend is not None else None, failed_utterance_count,
+        ),
+    )
 
 
 def defer_job(connection, job_id: str, lease_token: str) -> bool:

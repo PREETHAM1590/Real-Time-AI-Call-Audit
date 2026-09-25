@@ -214,6 +214,12 @@ def call_detail(connection, scope: Scope, call_id: str) -> dict[str, Any]:
         "FROM dispositions WHERE organisation_id=%s AND call_id=%s AND transcript_revision=%s ORDER BY revision DESC LIMIT 1",
         (scope.organisation_id, call_id, call[7]),
     ).fetchone()
+    # Advisory only (AGENTS.md): summary fields only, never the per-utterance signals.
+    sentiment = connection.execute(
+        "SELECT revision,transcript_revision,status,model_artifact,adapter_version,alert_offsets_ms,trend_json,failed_utterance_count,jsonb_array_length(signals_json) "
+        "FROM call_sentiments WHERE organisation_id=%s AND call_id=%s AND transcript_revision=%s ORDER BY revision DESC LIMIT 1",
+        (scope.organisation_id, call_id, call[7]),
+    ).fetchone()
     reviews = []
     superseded = True
     if audit is not None:
@@ -232,6 +238,7 @@ def call_detail(connection, scope: Scope, call_id: str) -> dict[str, Any]:
         "transcript": [{"id": r[0], "role": r[1], "start_ms": r[2], "end_ms": r[3], "text_redacted": r[4], "is_final": r[5]} for r in transcript],
         "findings": [{"rule_id": r[0], "ruleset_version": r[1], "ruleset_hash": r[2].strip(), "status": r[3], "severity": r[4], "evidence_ids": r[5], "deadline_ms": r[6], "remediation": r[7]} for r in findings],
         "disposition": None if disposition is None else {"revision": disposition[0], "transcript_revision": disposition[1], "config_id": disposition[2], "config_version": disposition[3], "config_hash": disposition[4].strip(), "status": disposition[5], "code": disposition[6], "parent_code": disposition[7], "requires_review": disposition[8], "review_reason": disposition[9]},
+        "sentiment": None if sentiment is None else {"revision": sentiment[0], "transcript_revision": sentiment[1], "status": sentiment[2], "model_artifact": sentiment[3], "adapter_version": sentiment[4], "alert_offsets_ms": sentiment[5], "trend": sentiment[6], "failed_utterance_count": sentiment[7], "signal_count": sentiment[8]},
         "reviews": reviews,
         "current_review_version": reviews[-1]["version"] if reviews else 0,
     }
