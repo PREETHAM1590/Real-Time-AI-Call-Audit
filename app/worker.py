@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 
+from app.contracts import Utterance
 from app.db import connect
 from app.ingest import MAX_JOB_ATTEMPTS, claim_job, defer_job, finish_job, renew_job, retry_job
 from app.storage import LocalPrivateStorage
@@ -16,6 +17,8 @@ from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
 from app.compliance import evaluate_rules, load_ruleset
 from app.audit import audit_call, load_pinned_text, load_rubric
+from app.sentiment import customer_speech_trend
+from app.sentiment_adapter import compute_call_sentiment
 from app.live_transcripts import purge_expired_live_utterances
 
 Processor = Callable[[dict], str | dict]
@@ -23,7 +26,7 @@ LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 20
 LIVE_TRANSCRIPT_SWEEP_SECONDS = 60
 _LOGGER = logging.getLogger(__name__)
-_KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT"})
+_KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT", "SENTIMENT"})
 _KNOWN_OUTCOMES = frozenset({"WAITING_HANDLER", "LEASE_LOST", "COMMITTED", "STALE_COMMIT", "RETRY_HANDLED", "RETRY_HANDLER_FAILED"})
 
 
@@ -103,6 +106,47 @@ def make_policy_processor(ruleset):
             "call_duration_ms": call[6] or 0,
         }
         return {"findings": evaluate_rules(utterances, context, ruleset)}
+    return process
+
+
+_SENTIMENT_SIGNAL_KEYS = ("id", "start_ms", "end_ms", "signed_score", "top_class_probability")
+
+
+def make_sentiment_processor(adapter):
+    """Build the advisory SENTIMENT stage over the current final redacted transcript.
+
+    Never used to pass/fail a call: `app.ingest.finish_job`'s "sentiment" branch must
+    not change `calls.processing_state`. Only final CUSTOMER text reaches the adapter
+    (enforced by `compute_call_sentiment`); the returned payload strips every signal to
+    the five allowed numeric/id fields, so no utterance text can reach persistence.
+    """
+    def process(job: dict) -> dict:
+        with connect() as connection:
+            call = connection.execute(
+                "SELECT transcript_revision FROM calls WHERE organisation_id=%s AND id=%s AND tombstoned_at IS NULL",
+                (job["organisation_id"], job["call_id"]),
+            ).fetchone()
+            if call is None or call[0] != job["input_revision"]:
+                raise RuntimeError("sentiment transcript revision is stale or unavailable")
+            rows = connection.execute(
+                "SELECT id,role,start_ms,end_ms,text_redacted,is_final FROM transcript_utterances "
+                "WHERE organisation_id=%s AND call_id=%s AND revision=%s ORDER BY start_ms,id",
+                (job["organisation_id"], job["call_id"], job["input_revision"]),
+            ).fetchall()
+        utterances = [Utterance(id=row[0], role=row[1], start_ms=row[2], end_ms=row[3], text_redacted=row[4], is_final=row[5]) for row in rows]
+        result = compute_call_sentiment(utterances, adapter)
+        trend = customer_speech_trend(result["signals"]) if result["status"] == "OK" else None
+        signals = [{key: signal[key] for key in _SENTIMENT_SIGNAL_KEYS} for signal in result.get("signals", [])]
+        return {"sentiment": {
+            "transcript_revision": job["input_revision"],
+            "model_artifact": adapter.artifact_version,
+            "adapter_version": adapter.adapter_version,
+            "status": result["status"],
+            "signals": signals,
+            "alert_offsets_ms": result.get("alert_offsets_ms", []),
+            "trend": trend,
+            "failed_utterance_count": result.get("failed_utterance_count", 0),
+        }}
     return process
 
 
@@ -247,6 +291,25 @@ def build_processors() -> dict[str, Processor]:
         # Configuration is deployment-only and requires an immutable artifact digest.
         # Without it, ANALYSE remains parked as WAITING_HANDLER rather than using a fake.
         processors["ANALYSE"] = make_disposition_processor(LocalVllmDispositionAdapter.from_environment())
+    sentiment_path = os.environ.get("SENTIMENT_MODEL_PATH")
+    sentiment_digest = os.environ.get("SENTIMENT_MODEL_SHA256")
+    if sentiment_path or sentiment_digest:
+        if not sentiment_path or not sentiment_digest:
+            raise RuntimeError("Both SENTIMENT_MODEL_PATH and SENTIMENT_MODEL_SHA256 are required")
+        from app.artifacts import verified_model_directory
+        from app.sentiment_adapter import LocalSentimentAdapter, transformers_classifier
+
+        sentiment_model_directory = verified_model_directory(sentiment_path, sentiment_digest)
+        sentiment_adapter = LocalSentimentAdapter(
+            artifact_path=sentiment_path, artifact_sha256=sentiment_digest,
+            classify=transformers_classifier(sentiment_model_directory),
+            adapter_version=os.environ.get("SENTIMENT_ADAPTER_VERSION", "local-sentiment-v1"),
+        )
+        # Advisory and uncalibrated (AGENTS.md): warm the pipeline once here so the
+        # first real request is not the cold-start request, and never let this stage's
+        # absence or failure block the deterministic TRANSCRIBE/ANALYSE/POLICY/AUDIT stages.
+        sentiment_adapter.warm()
+        processors["SENTIMENT"] = make_sentiment_processor(sentiment_adapter)
     return processors
 
 

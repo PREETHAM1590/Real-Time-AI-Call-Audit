@@ -124,7 +124,7 @@ async function loadLiveCalls() {
         const callKey = element("span");
         const membership = element("span");
         const started = element("span");
-        const sentimentNote = element("span", "Sentiment: not integrated", "live-capability-note");
+        const sentimentNote = element("span", "Live sentiment: not available (post-call only)", "live-capability-note");
         const policyNote = element("span", "Policy alerts: not evaluated live", "live-capability-note");
         const transcriptStatus = element("span", "", "live-transcript-status");
         const utterances = element("ol", undefined, "live-utterances");
@@ -265,6 +265,43 @@ function renderDispositionCard(host, disposition) {
   host.append(block);
 }
 
+const SENTIMENT_STATUS_LABELS = { OK: "OK", UNKNOWN: "Unknown", UNAVAILABLE: "Unavailable" };
+const SENTIMENT_DISCLAIMER = "Advisory only: never used to pass or fail a call; model confidence is not calibrated.";
+
+function renderSentimentCard(host, sentiment) {
+  const block = element("section", undefined, "block");
+  block.append(element("h3", "Sentiment (advisory, uncalibrated)"));
+  if (!sentiment) {
+    block.append(element("p", "Not available — no local sentiment model configured.", "empty-state"));
+    block.append(element("p", SENTIMENT_DISCLAIMER, "sentiment-disclaimer"));
+    host.append(block);
+    return;
+  }
+  const card = element("div", undefined, "sentiment-card");
+  const addCell = (title, value) => {
+    const cell = element("div", undefined, "summary-card");
+    cell.append(element("strong", title), element("span", value));
+    card.append(cell);
+  };
+  addCell("Status", SENTIMENT_STATUS_LABELS[sentiment.status] || "Unknown");
+  if (sentiment.trend) {
+    addCell("First 60s mean", Number(sentiment.trend.first_60s_mean_signed_score).toFixed(2));
+    addCell("Last 60s mean", Number(sentiment.trend.last_60s_mean_signed_score).toFixed(2));
+    addCell("Trend (last − first)", Number(sentiment.trend.trend_delta).toFixed(2));
+  } else {
+    addCell("Trend", "Not available for this call");
+  }
+  const offsets = sentiment.alert_offsets_ms || [];
+  addCell("Alerts", offsets.length
+    ? offsets.map((ms) => `Customer sentiment drop ending near ${timestamp(ms)}`).join("; ")
+    : "No sentiment drop alerts for this call");
+  addCell("Failed utterances", sentiment.failed_utterance_count ?? "Unavailable");
+  addCell("Model artifact", sentiment.model_artifact ?? "Unavailable");
+  block.append(card);
+  block.append(element("p", SENTIMENT_DISCLAIMER, "sentiment-disclaimer"));
+  host.append(block);
+}
+
 function renderCall(data) {
   state.call = data;
   state.audioGranted = false;
@@ -299,6 +336,7 @@ function renderCall(data) {
   workspace.append(evidenceColumn, reviewRail);
   host.append(summary);
   renderDispositionCard(host, data.disposition);
+  renderSentimentCard(host, data.sentiment);
   host.append(workspace);
   const alreadyTriaged = data.reviews?.some((review) => review.action === "TRIAGE" && review.effective_decision === "NEEDS_REVIEW");
   if (audit && !audit.superseded && alreadyTriaged) {

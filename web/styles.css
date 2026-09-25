@@ -224,8 +224,9 @@ thead th { background: #eaf0f4; font-size: .86rem; }
 .rollback-form input, .rollback-form textarea { display: block; width: 100%; min-height: 2.4rem; padding: .4rem; border: 1px solid #8998a6; border-radius: 6px; }
 .rollback-form textarea { grid-column: 1 / -1; min-height: 4rem; }
 .rollback-form button { grid-column: 1 / -1; }
-.disposition-card { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0; margin: .75rem 0 0; padding: 0; border: 1px solid var(--rule); border-radius: 8px; background: #fff; overflow: hidden; }
-.disposition-card .summary-card { padding: .6rem .7rem; border-bottom: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+.disposition-card, .sentiment-card { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0; margin: .75rem 0 0; padding: 0; border: 1px solid var(--rule); border-radius: 8px; background: #fff; overflow: hidden; }
+.disposition-card .summary-card, .sentiment-card .summary-card { padding: .6rem .7rem; border-bottom: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+.sentiment-disclaimer { margin: .5rem 0 0; color: var(--muted); font-size: .84rem; }
 @media (max-width: 900px) {
   .rollback-form { grid-template-columns: 1fr; }
 }

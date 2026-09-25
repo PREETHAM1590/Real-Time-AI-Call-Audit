@@ -171,6 +171,9 @@ def purge_call(connection, organisation_id: str, call_id: str, storage, *, now: 
         connection.execute("DELETE FROM audio_objects WHERE organisation_id=%s AND call_id=%s", (org, call))
         connection.execute("DELETE FROM transcript_utterances WHERE organisation_id=%s AND call_id=%s", (org, call))
         connection.execute("DELETE FROM findings WHERE organisation_id=%s AND call_id=%s", (org, call))
+        # Advisory-only sentiment output; kept out of immutable_records_retained
+        # below since it is fully deleted here, unlike audits/reviews/dispositions.
+        connection.execute("DELETE FROM call_sentiments WHERE organisation_id=%s AND call_id=%s", (org, call))
         connection.execute("DELETE FROM jobs WHERE organisation_id=%s AND call_id=%s", (org, call))
         connection.execute(
             "UPDATE calls SET external_ref='deleted:'||id::text,idempotency_key='deleted:'||id::text,payload_sha256=repeat('0',64),"
