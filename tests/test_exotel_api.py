@@ -231,12 +231,18 @@ class ExotelWebSocketTests(unittest.TestCase):
                 self._send_start(ws)
                 self.assertTrue(self.connection.session_activated.wait(1))
                 ws.close()
-        # Bounded, not tight: this only waits as long as it takes for the background
-        # disconnect-cleanup task to actually run, so a higher ceiling never slows the
-        # normal passing case. Raised from 5s after a shared CI runner missed that
-        # window once under load (GitHub Actions run 36048260809) while every other
-        # assertion in this suite passed; 3 subsequent runs passed within the old bound.
-        self.assertTrue(self.connection.session_incomplete.wait(20))
+                # Wait for the app's disconnect-cleanup finally block *inside* this `with`,
+                # while TestClient's ASGI portal is still pumping the app's event loop. This
+                # genuinely raced twice on shared CI runners (36048260809, 36091816446) even
+                # after the wait bound was raised 5s->20s, which ruled out "just needs more
+                # time": instrumented locally, the app's INCOMPLETE update simply never ran
+                # in the failing case (no exception, no hang) - the TestClient's own
+                # portal/task-group teardown on `with` exit can race ahead of the disconnect
+                # still being processed and abandon that suspended coroutine before its
+                # `finally` gets to run. Waiting here, before the `with` exits, removes that
+                # race: reproduced clean 20/20 under synthetic heavy CPU contention that
+                # reliably reproduced the failure when this wait sat after the `with` block.
+                self.assertTrue(self.connection.session_incomplete.wait(20))
         self.assertEqual(intake.call_count, 0)
         self.assertEqual(self.connection.session_states, ["DISABLED", "INCOMPLETE"])
 
