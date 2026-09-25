@@ -32,6 +32,7 @@ from app.privacy import redact_text
 from app.reports import ReportForbidden, ReportLimitError, ReportPrivacyUnavailable, export_findings, own_scores, team_report
 from app.retention import request_call_deletion
 from app.operations import operations_summary
+from app.metrics import metrics_token_from_env, render_database_down_text, render_metrics_text, verify_metrics_bearer
 from app.events import EventCursorError, EventCursorExpired, EventForbidden, encode_sse, parse_last_event_id, read_events, reset_required_event
 from app.exotel import ExotelLifecycleEvent, ExotelProtocolError, ExotelSession
 from app.exotel_adapter import build_wav, integration_credentials, make_audio_references, parse_basic_authorization, verify_integration_secret
@@ -258,6 +259,27 @@ def create_app(
         }
         return JSONResponse(payload, status_code=200 if database_available else 503)
 
+    @app.get("/metrics", include_in_schema=False)
+    async def get_metrics(authorization: str | None = Header(default=None)) -> Response:
+        # Separate from user OIDC auth; disabled entirely unless METRICS_TOKEN is
+        # configured, and never logged. Series are aggregate/no-identifier -- see
+        # app.metrics for what is emitted and why.
+        token = metrics_token_from_env()
+        if token is None:
+            raise HTTPException(status_code=404)
+        if not verify_metrics_bearer(authorization, token):
+            raise HTTPException(status_code=401)
+
+        def render() -> str:
+            try:
+                with connect(timeout_seconds=5) as connection:
+                    return render_metrics_text(connection)
+            except Exception:
+                return render_database_down_text()
+
+        text = await run_in_threadpool(render)
+        return Response(text, media_type="text/plain; version=0.0.4; charset=utf-8")
+
     @app.get("/v1/events")
     def event_feed(request: Request, last_event_id: str | None = Header(default=None, alias="Last-Event-ID"), scope: Scope = Depends(get_scope)) -> StreamingResponse:
         try:
@@ -352,7 +374,7 @@ def create_app(
             raise HTTPException(status_code=422, detail="Invalid live session reference") from error
 
     @app.get("/v1/operations/summary")
-    def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict[str, int]:
+    def get_operations_summary(scope: Scope = Depends(get_scope)) -> dict:
         if scope.role != "ADMIN":
             raise HTTPException(status_code=403, detail="Administrator role required")
         try:

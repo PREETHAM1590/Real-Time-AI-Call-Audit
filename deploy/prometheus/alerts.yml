@@ -1,0 +1,78 @@
+# Prometheus rule file for the call-audit /metrics exporter (app/metrics.py).
+#
+# Every `expr` below references only metric names that exporter emits:
+# call_audit_database_up, call_audit_oldest_pending_job_age_seconds,
+# call_audit_worker_stage_attempts_total, call_audit_jobs. No rule here depends
+# on a metric this repository does not produce (see deploy/prometheus/README.md
+# for what is intentionally NOT covered: redaction failures, STT failure rate,
+# GPU/token/spend telemetry -- none of that is tracked yet).
+#
+# No Alertmanager receivers are configured anywhere in this repository, and
+# nothing here sends a notification on its own; wiring receivers/routes is a
+# separate, explicit operator decision. See the README in this directory.
+groups:
+  - name: call-audit-core
+    rules:
+      - alert: CallAuditDatabaseDown
+        expr: call_audit_database_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Call-audit /metrics cannot reach PostgreSQL"
+          description: >-
+            The last scrape's database queries failed, so no other call-audit
+            series is currently trustworthy. Matches the operations guide's
+            "Processing unavailable" signal.
+
+      # Matches docs/operations-and-evaluation.md's "Metrics and alerting" table:
+      # "oldest eligible job >5 minutes for 5 minutes" -> page on-call.
+      - alert: CallAuditOldestPendingJobTooOld
+        expr: max(call_audit_oldest_pending_job_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A call-audit job stage has a pending job older than 5 minutes"
+          description: >-
+            The oldest QUEUED/RETRY_WAIT/WAITING_HANDLER job for at least one
+            stage has been waiting more than 300 seconds, sustained for 5
+            minutes. Inspect worker/dependency health and lease recovery.
+
+      # Proposed default threshold, not a measured value: sustained retry/lease
+      # churn at 20% of committed volume is treated here as worth paging on.
+      # Re-tune once real traffic volume and false-positive rate are observed.
+      - alert: CallAuditWorkerRetryRateHigh
+        expr: >-
+          (
+            sum(rate(call_audit_worker_stage_attempts_total{outcome=~"RETRY_HANDLED|RETRY_HANDLER_FAILED|LEASE_LOST"}[15m]))
+            /
+            clamp_min(sum(rate(call_audit_worker_stage_attempts_total{outcome="COMMITTED"}[15m])), 1e-9)
+          ) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Call-audit worker retry/lease-loss rate is high relative to committed work"
+          description: >-
+            Over the last 15 minutes, RETRY_HANDLED + RETRY_HANDLER_FAILED +
+            LEASE_LOST attempts exceed 20% of COMMITTED attempts (proposed
+            default threshold -- re-tune from measured data). Investigate the
+            affected stage's local model/dependency before treating this as a
+            model-quality signal.
+
+      # Matches "stage has no configured handler" -- a job stuck WAITING_HANDLER
+      # for 30 minutes means an operator forgot to configure that stage's local
+      # model/ruleset, not a transient failure.
+      - alert: CallAuditStageMissingHandler
+        expr: call_audit_jobs{state="WAITING_HANDLER"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Call-audit jobs are stuck WAITING_HANDLER for over 30 minutes"
+          description: >-
+            At least one stage has jobs parked WAITING_HANDLER (no configured
+            local model/ruleset handler for that stage) for over 30 minutes.
+            Configure the missing stage's handler or confirm it is
+            intentionally parked.

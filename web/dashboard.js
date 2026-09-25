@@ -82,6 +82,37 @@ function barChart(items, { labelKey, valueKey, max }) {
   return svg;
 }
 
+function pendingByStageTable(pendingByStage) {
+  const table = element("table", undefined, "pending-by-stage-table");
+  const headRow = element("tr");
+  headRow.append(element("th", "Stage"), element("th", "Pending"), element("th", "Oldest pending age"));
+  const thead = element("thead");
+  thead.append(headRow);
+  const tbody = element("tbody");
+  for (const stage of Object.keys(pendingByStage).sort()) {
+    const row = element("tr");
+    row.append(
+      element("td", stage),
+      element("td", pendingByStage[stage].pending),
+      element("td", humanizeAge(pendingByStage[stage].oldest_pending_age_seconds)),
+    );
+    tbody.append(row);
+  }
+  table.append(thead, tbody);
+  return table;
+}
+
+function renderPendingByStage(pendingByStage) {
+  const body = byId("pending-by-stage-body");
+  body.replaceChildren();
+  const stages = Object.keys(pendingByStage || {});
+  if (!stages.length) {
+    body.append(element("p", "No pending jobs for your organisation.", "empty-state"));
+    return;
+  }
+  body.append(pendingByStageTable(pendingByStage));
+}
+
 async function loadOperationsSummary() {
   const tiles = byId("kpi-tiles");
   tiles.replaceChildren();
@@ -93,6 +124,7 @@ async function loadOperationsSummary() {
       kpiTile("Incomplete calls", summary.incomplete_calls, "Not in READY state, including failed and needs-review work."),
     );
     byId("kpi-status").textContent = "Operations summary loaded.";
+    renderPendingByStage(summary.pending_by_stage);
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
       tiles.append(forbiddenTile("Pending jobs"), forbiddenTile("Oldest pending age"), forbiddenTile("Incomplete calls"));
@@ -102,6 +134,9 @@ async function loadOperationsSummary() {
       byId("kpi-status").textContent = `Operations summary failed to load · ${error.message}`;
       byId("kpi-status").classList.add("error");
     }
+    byId("pending-by-stage-body").replaceChildren(
+      element("p", "Pending-by-stage breakdown is unavailable; this is not an all-clear.", "empty-state"),
+    );
   }
 }
 

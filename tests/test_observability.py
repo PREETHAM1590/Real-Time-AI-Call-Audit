@@ -13,16 +13,27 @@ from app.operations import operations_summary
 class OperationsSummaryTests(unittest.TestCase):
     def test_summary_is_tenant_scoped_and_clamps_queue_age(self):
         connection = MagicMock()
-        connection.execute.return_value.fetchone.return_value = (4, 50_000_000, 3)
+        connection.execute.return_value.fetchone.return_value = (
+            4, 50_000_000, 3,
+            {"TRANSCRIBE": {"pending": 4, "oldest_pending_age_seconds": 50_000_000}, "SOMETHING_NEW": {"pending": 1, "oldest_pending_age_seconds": 5}},
+        )
 
         result = operations_summary(connection, "org-a")
 
         self.assertEqual(
             result,
-            {"pending_jobs": 4, "oldest_pending_age_seconds": 31_536_000, "incomplete_calls": 3},
+            {
+                "pending_jobs": 4,
+                "oldest_pending_age_seconds": 31_536_000,
+                "incomplete_calls": 3,
+                "pending_by_stage": {
+                    "TRANSCRIBE": {"pending": 4, "oldest_pending_age_seconds": 31_536_000},
+                    "UNKNOWN": {"pending": 1, "oldest_pending_age_seconds": 5},
+                },
+            },
         )
-        self.assertEqual(connection.execute.call_args.args[1], ("org-a", 31_536_000))
-        self.assertEqual(set(result), {"pending_jobs", "oldest_pending_age_seconds", "incomplete_calls"})
+        self.assertEqual(connection.execute.call_args.args[1], ("org-a", 31_536_000, 31_536_000))
+        self.assertEqual(set(result), {"pending_jobs", "oldest_pending_age_seconds", "incomplete_calls", "pending_by_stage"})
 
 
 @unittest.skipUnless(os.environ.get("RUN_POSTGRES_INTEGRATION") == "1", "Set RUN_POSTGRES_INTEGRATION=1 to require PostgreSQL integration")
@@ -72,6 +83,7 @@ class OperationsSummaryPostgresTests(unittest.TestCase):
         self.assertEqual(result["pending_jobs"], 1)
         self.assertEqual(result["oldest_pending_age_seconds"], 31_536_000)
         self.assertEqual(result["incomplete_calls"], 2)
+        self.assertEqual(result["pending_by_stage"], {"TRANSCRIBE": {"pending": 1, "oldest_pending_age_seconds": 31_536_000}})
 
 
 if __name__ == "__main__":

@@ -58,7 +58,9 @@ class DashboardBrowserSmokeTests(unittest.TestCase):
             path = urlsplit(route.request.url).path
             if path == "/v1/operations/summary":
                 route.fulfill(status=200, content_type="application/json",
-                              body=json.dumps({"pending_jobs": 3, "oldest_pending_age_seconds": 125, "incomplete_calls": 7}))
+                              body=json.dumps({"pending_jobs": 3, "oldest_pending_age_seconds": 125, "incomplete_calls": 7,
+                                                "pending_by_stage": {"TRANSCRIBE": {"pending": 2, "oldest_pending_age_seconds": 125},
+                                                                     "AUDIT": {"pending": 1, "oldest_pending_age_seconds": 30}}}))
             elif path == "/v1/reviews/queue":
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({"items": [
                     {"call_id": "call-1", "audit_id": "audit-1", "machine_decision": "NEEDS_REVIEW", "machine_score": None,
@@ -89,6 +91,9 @@ class DashboardBrowserSmokeTests(unittest.TestCase):
             kpi_text = page.locator("#kpi-tiles").inner_text()
             self.assertIn("3", kpi_text)
             self.assertIn("7", kpi_text)
+            stage_text = page.locator("#pending-by-stage-body").inner_text()
+            self.assertIn("TRANSCRIBE", stage_text)
+            self.assertIn("AUDIT", stage_text)
             page.get_by_text("call awaiting review", exact=False).wait_for()
             self.assertIn("call-1", page.locator("#queue-panel-body").inner_text())
             page.get_by_text("live or recently changed session", exact=False).wait_for()
@@ -122,6 +127,32 @@ class DashboardBrowserSmokeTests(unittest.TestCase):
             self.assertIn("Unavailable", kpi_text)
             self.assertNotIn(">0<", kpi_text)
             self.assertEqual(page.locator(".kpi-failed").count(), 3)
+            stage_text = page.locator("#pending-by-stage-body").inner_text()
+            self.assertIn("unavailable", stage_text)
+            self.assertNotIn("No pending jobs", stage_text)
+
+    def test_pending_by_stage_shows_empty_state_with_no_pending_jobs(self):
+        def handle(route):
+            path = urlsplit(route.request.url).path
+            if path == "/v1/operations/summary":
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"pending_jobs": 0, "oldest_pending_age_seconds": 0, "incomplete_calls": 0,
+                                                "pending_by_stage": {}}))
+            elif path == "/v1/reviews/queue":
+                route.fulfill(status=200, content_type="application/json", body='{"items":[]}')
+            elif path == "/v1/live-calls":
+                route.fulfill(status=200, content_type="application/json", body='{"items":[]}')
+            elif path == "/v1/disposition-configs":
+                route.fulfill(status=200, content_type="application/json", body='{"versions":[]}')
+            elif path == "/v1/me/scores":
+                route.fulfill(status=200, content_type="application/json", body='{"items":[]}')
+            else:
+                route.fulfill(status=404, content_type="application/json", body="{}")
+
+        with self.run_dashboard(handle) as page:
+            page.get_by_text("Operations summary loaded.").wait_for()
+            stage_text = page.locator("#pending-by-stage-body").inner_text()
+            self.assertIn("No pending jobs", stage_text)
 
     def test_forbidden_panel_shows_role_message(self):
         def handle(route):

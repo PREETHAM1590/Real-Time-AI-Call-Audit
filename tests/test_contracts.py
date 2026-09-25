@@ -209,11 +209,17 @@ class ApiContractTests(unittest.TestCase):
         admin_headers = {"Authorization": f"Bearer {self.token(subject='admin-user')}"}
         with patch("app.api.connect") as connect:
             connection = connect.return_value.__enter__.return_value
-            connection.execute.return_value.fetchone.return_value = (2, 35, 4)
+            connection.execute.return_value.fetchone.return_value = (2, 35, 4, {"TRANSCRIBE": {"pending": 2, "oldest_pending_age_seconds": 35}})
             response = self.client.get("/v1/operations/summary", headers=admin_headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"pending_jobs": 2, "oldest_pending_age_seconds": 35, "incomplete_calls": 4})
-        self.assertEqual(connection.execute.call_args.args[1], ("org-a", 31_536_000))
+        self.assertEqual(
+            response.json(),
+            {
+                "pending_jobs": 2, "oldest_pending_age_seconds": 35, "incomplete_calls": 4,
+                "pending_by_stage": {"TRANSCRIBE": {"pending": 2, "oldest_pending_age_seconds": 35}},
+            },
+        )
+        self.assertEqual(connection.execute.call_args.args[1], ("org-a", 31_536_000, 31_536_000))
 
     def test_call_deletion_requires_admin_and_returns_tombstone_status(self):
         qa_headers = {"Authorization": f"Bearer {self.token(subject='qa-user')}"}

@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 
 from app.db import connect
 from app.ingest import MAX_JOB_ATTEMPTS, claim_job, defer_job, finish_job, renew_job, retry_job
+from app.metrics import record_stage_counter
 from app.storage import LocalPrivateStorage
 from app.disposition_config import compile_disposition_config
 from app.disposition import classify_disposition
@@ -43,6 +44,7 @@ def _log_stage_outcome(stage, attempt, outcome, started_at: float) -> None:
             "duration_ms": duration_ms,
         },
     )
+    record_stage_counter(safe_stage, safe_outcome, duration_ms)
 
 
 def make_disposition_processor(adapter):
