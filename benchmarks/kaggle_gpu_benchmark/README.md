@@ -21,10 +21,18 @@ decision has a number behind it instead of a guess.
   sent to it. The application's own adapters (`app/transcription.py`, `app/audit.py`) stay
   bound to loopback-only, self-hosted endpoints regardless of what this benchmark measures.
 - **Not identical to the production path for the LLM.** The app's `LocalVllmAuditAdapter`
-  targets a vLLM OpenAI-compatible server. This benchmark tries the same vLLM offline `LLM`
-  engine first, and falls back to `transformers` + 4-bit quantisation only if vLLM fails to
-  load on the Kaggle image (single T4/P100, 16 GB) — the output JSON always records which
-  engine actually ran, so a vLLM number is never reported as if it were the fallback's.
+  targets a vLLM OpenAI-compatible server. This benchmark uses vLLM's offline `LLM` engine
+  only if it is already importable on the image — it never `pip install`s vLLM by default,
+  because a fresh vLLM wheel is tightly coupled to a specific CUDA runtime ABI and an
+  unpinned install can require a newer CUDA than the image ships (the first run of this
+  benchmark hit exactly that: a build needing `libcudart.so.13` on an image without it),
+  and pip's resolver can then also replace the image's already-working preinstalled `torch`
+  while chasing vLLM's requirements — breaking the `transformers` fallback too, even though
+  vLLM itself never loaded. Set `BENCHMARK_TRY_VLLM=1` to opt into an explicit, pinned vLLM
+  install instead, once you have separately confirmed it matches this image's CUDA version.
+  The fallback path (`transformers` + 4-bit quantisation) never installs or upgrades `torch`
+  either, for the same reason. The output JSON always records which engine actually ran, so
+  a vLLM number is never reported as if it were the fallback's.
 - **Not a substitute for the golden-set protocol.** It runs on synthetic fixtures generated
   in the script itself (a silent WAV, a short synthetic transcript). It measures throughput
   and output-schema validity, not word-error-rate or rubric agreement.

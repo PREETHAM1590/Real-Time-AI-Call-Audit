@@ -10,6 +10,7 @@ README.md in this directory for what this is and is not.
 import base64
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -144,17 +145,36 @@ def benchmark_audit_llm(rubric_json: str, prompt_text: str) -> dict:
     transcript = synthetic_transcript()
     messages = _audit_request_messages(rubric_json, prompt_text, transcript)
 
+    # vLLM's wheels are tightly coupled to a specific CUDA runtime ABI. A blind
+    # `pip install vllm` on someone else's managed notebook image can pull a build that
+    # needs a newer CUDA than the image ships (this benchmark hit exactly that: a build
+    # needing libcudart.so.13 on an image without it) - and pip's dependency resolver can
+    # then also replace the image's already-working, preinstalled `torch` while chasing
+    # vLLM's requirements, breaking the fallback path too even though vLLM itself never
+    # loaded. So: only ever use vLLM if it is already importable in the base image
+    # (never install it), and never install or upgrade `torch` at all - every path below
+    # uses whatever torch the image already has. Set BENCHMARK_TRY_VLLM=1 to attempt an
+    # explicit, pinned vLLM install instead, once you have separately confirmed it
+    # matches this image's CUDA version; that is a deliberate opt-in, not the default.
+    vllm_error: str | None = None
+    engine = engine_name = load_seconds = None
     try:
-        pip_install("vllm")
+        if os.environ.get("BENCHMARK_TRY_VLLM") == "1":
+            pip_install("vllm==0.11.0")  # Pinned only for this explicit opt-in path; verify CUDA match first.
         from vllm import LLM, SamplingParams
 
         load_started = time.monotonic()
         engine = LLM(model="Qwen/Qwen3-8B", gpu_memory_utilization=0.85, max_model_len=8192, dtype="float16")
         load_seconds = time.monotonic() - load_started
         engine_name = "vllm"
-    except Exception as vllm_error:
+    except Exception as error:
+        vllm_error = str(error)
+    if engine_name is None:
         try:
-            pip_install("transformers", "accelerate", "bitsandbytes")
+            # Deliberately no `torch` in this list: use the image's own preinstalled build.
+            # transformers/accelerate/bitsandbytes each accept a floor, not an exact pin, on
+            # torch, so installing them alone should not trigger pip to touch torch at all.
+            pip_install("transformers==4.57.1", "accelerate==1.11.0", "bitsandbytes==0.48.2")
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -168,7 +188,7 @@ def benchmark_audit_llm(rubric_json: str, prompt_text: str) -> dict:
             engine, engine_name = ("transformers-4bit", tokenizer, model), "transformers-4bit"
         except Exception as fallback_error:
             return {
-                "status": "FAILED", "engine": "none", "vllm_error": str(vllm_error),
+                "status": "FAILED", "engine": "none", "vllm_error": vllm_error or "vllm not preinstalled and BENCHMARK_TRY_VLLM was not set",
                 "fallback_error": str(fallback_error), "total_seconds": round(time.monotonic() - started, 3),
             }
 
