@@ -231,7 +231,12 @@ class ExotelWebSocketTests(unittest.TestCase):
                 self._send_start(ws)
                 self.assertTrue(self.connection.session_activated.wait(1))
                 ws.close()
-        self.assertTrue(self.connection.session_incomplete.wait(5))
+        # Bounded, not tight: this only waits as long as it takes for the background
+        # disconnect-cleanup task to actually run, so a higher ceiling never slows the
+        # normal passing case. Raised from 5s after a shared CI runner missed that
+        # window once under load (GitHub Actions run 36048260809) while every other
+        # assertion in this suite passed; 3 subsequent runs passed within the old bound.
+        self.assertTrue(self.connection.session_incomplete.wait(20))
         self.assertEqual(intake.call_count, 0)
         self.assertEqual(self.connection.session_states, ["DISABLED", "INCOMPLETE"])
 
