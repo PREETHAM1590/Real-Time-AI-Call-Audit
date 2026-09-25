@@ -27,17 +27,26 @@ groups:
 
       # Matches docs/operations-and-evaluation.md's "Metrics and alerting" table:
       # "oldest eligible job >5 minutes for 5 minutes" -> page on-call.
+      # "Eligible" = a worker is actually serving that stage. Workers only claim
+      # stages they have a configured handler for, so jobs for an intentionally
+      # unconfigured stage (e.g. ANALYSE before a disposition model is provisioned)
+      # sit QUEUED forever; paging on max() over every stage would page
+      # permanently in any partially configured deployment. Restrict to stages
+      # with worker activity in the last hour; the rule below covers the rest.
       - alert: CallAuditOldestPendingJobTooOld
-        expr: max(call_audit_oldest_pending_job_age_seconds) > 300
+        expr: >-
+          max by (stage) (call_audit_oldest_pending_job_age_seconds) > 300
+          and on (stage)
+          sum by (stage) (increase(call_audit_worker_stage_attempts_total[1h])) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "A call-audit job stage has a pending job older than 5 minutes"
+          summary: "Call-audit stage {{ $labels.stage }} is falling behind"
           description: >-
-            The oldest QUEUED/RETRY_WAIT/WAITING_HANDLER job for at least one
-            stage has been waiting more than 300 seconds, sustained for 5
-            minutes. Inspect worker/dependency health and lease recovery.
+            A stage that workers have served within the last hour has a pending
+            job older than 300 seconds, sustained for 5 minutes. Inspect
+            worker/dependency health and lease recovery.
 
       # Proposed default threshold, not a measured value: sustained retry/lease
       # churn at 20% of committed volume is treated here as worth paging on.
@@ -61,18 +70,25 @@ groups:
             affected stage's local model/dependency before treating this as a
             model-quality signal.
 
-      # Matches "stage has no configured handler" -- a job stuck WAITING_HANDLER
-      # for 30 minutes means an operator forgot to configure that stage's local
-      # model/ruleset, not a transient failure.
-      - alert: CallAuditStageMissingHandler
-        expr: call_audit_jobs{state="WAITING_HANDLER"} > 0
-        for: 30m
+      # A stage with old pending work that no worker has attempted in 30 minutes.
+      # Workers never claim a stage they have no handler for, so unconfigured-stage
+      # jobs stay QUEUED (not WAITING_HANDLER, which only the legacy unfiltered
+      # claim path produces) -- detect "not being served" from the absence of
+      # attempts instead. This cannot distinguish "intentionally parked, model not
+      # provisioned yet" from "every worker serving this stage is down", so it is
+      # a warning; raise it to critical once every stage you expect is configured.
+      - alert: CallAuditStageNotBeingServed
+        expr: >-
+          max by (stage) (call_audit_oldest_pending_job_age_seconds) > 1800
+          unless on (stage)
+          sum by (stage) (increase(call_audit_worker_stage_attempts_total[30m])) > 0
+        for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Call-audit jobs are stuck WAITING_HANDLER for over 30 minutes"
+          summary: "No worker is serving call-audit stage {{ $labels.stage }}"
           description: >-
-            At least one stage has jobs parked WAITING_HANDLER (no configured
-            local model/ruleset handler for that stage) for over 30 minutes.
-            Configure the missing stage's handler or confirm it is
-            intentionally parked.
+            Stage {{ $labels.stage }} has a pending job older than 30 minutes and
+            no worker attempts in the last 30 minutes: either no worker has a
+            handler configured for it (intentionally parked or misconfigured), or
+            all workers serving it are down.

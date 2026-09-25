@@ -6,7 +6,7 @@ MAX_QUEUE_AGE_SECONDS = 31_536_000
 # Kept separately from app.worker._KNOWN_STAGES (not imported, to avoid coupling
 # this module's import graph to worker stage registration) -- update both when a
 # stage is added. Any other stage value is folded into "UNKNOWN".
-_KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT"})
+_KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT", "SENTIMENT"})
 
 
 def operations_summary(connection, organisation_id: str) -> dict:

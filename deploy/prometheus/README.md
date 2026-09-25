@@ -39,11 +39,18 @@ secrets, readable only by the Prometheus process.
 
 Load this file as a Prometheus rule file (`rule_files:` in `prometheus.yml`).
 Every `expr` in it references only a metric name `app/metrics.py` actually
-emits -- `call_audit_database_up`, `call_audit_oldest_pending_job_age_seconds`,
-`call_audit_worker_stage_attempts_total`, and `call_audit_jobs`. The retry-rate
-threshold (20%) is stated in the rule file as a proposed default, not a
-measured value; re-tune it once real traffic and false-positive rates are
-observed.
+emits -- `call_audit_database_up`, `call_audit_oldest_pending_job_age_seconds`
+and `call_audit_worker_stage_attempts_total`. The retry-rate threshold (20%) is
+stated in the rule file as a proposed default, not a measured value; re-tune it
+once real traffic and false-positive rates are observed.
+
+Workers only claim stages they have a configured handler for, so jobs for a
+stage with no local model/ruleset yet stay `QUEUED` indefinitely by design. The
+"falling behind" page is therefore restricted to stages with worker activity in
+the last hour, and a separate warning (`CallAuditStageNotBeingServed`) fires for
+a stage with old pending work and no attempts in 30 minutes. That warning cannot
+tell "intentionally parked" from "every worker for this stage is down"; raise it
+to critical once every stage you expect is configured.
 
 **No Alertmanager receivers are configured anywhere in this repository, and
 this repository sends no notifications of any kind.** These rules only ever

@@ -227,6 +227,13 @@ class MetricsTokenTests(unittest.TestCase):
         token = "synthetic-test-metrics-token-32c"
         self.assertTrue(verify_metrics_bearer(f"Bearer {token}", token))
 
+    def test_verify_bearer_rejects_non_ascii_credential_instead_of_raising(self):
+        # hmac.compare_digest raises TypeError on non-ASCII str; Starlette decodes
+        # headers as latin-1, so a crafted header must be a clean False, not a 500.
+        token = "synthetic-test-metrics-token-32c"
+        self.assertFalse(verify_metrics_bearer("Bearer café", token))
+        self.assertFalse(verify_metrics_bearer("Bearer ÿ" * 40, token))
+
 
 class MetricsEndpointTests(unittest.TestCase):
     def _client(self):
@@ -267,6 +274,8 @@ class MetricsEndpointTests(unittest.TestCase):
             self.assertEqual(client.get("/metrics").status_code, 401)
             self.assertEqual(client.get("/metrics", headers={"Authorization": "Bearer nope"}).status_code, 401)
             self.assertEqual(client.get("/metrics", headers={"Authorization": token}).status_code, 401)
+            # Raw latin-1 byte in the header: must be a 401, not an unhandled TypeError/500.
+            self.assertEqual(client.get("/metrics", headers={"Authorization": b"Bearer caf\xe9"}).status_code, 401)
 
     def test_returns_200_with_correct_token_and_content_type_and_is_hidden_from_schema(self):
         client = self._client()

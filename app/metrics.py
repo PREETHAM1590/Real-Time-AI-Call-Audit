@@ -24,7 +24,7 @@ MAX_ATTEMPT_DURATION_MS = 3_600_000
 # This exporter's own bounded label allowlists. Kept separately from
 # app.worker._KNOWN_STAGES (not imported, to avoid coupling this module's import
 # graph to worker stage registration) -- update both when a stage is added.
-KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT"})
+KNOWN_STAGES = frozenset({"TRANSCRIBE", "ANALYSE", "POLICY", "AUDIT", "SENTIMENT"})
 KNOWN_JOB_STATES = frozenset({"QUEUED", "RUNNING", "WAITING_HANDLER", "DONE", "RETRY_WAIT", "FAILED"})
 KNOWN_CALL_STATES = frozenset({
     "QUEUED", "TRANSCRIBING", "ANALYSING", "AUDITING", "READY",
@@ -85,7 +85,9 @@ def verify_metrics_bearer(authorization_header: str | None, expected_token: str)
     scheme, _, credential = authorization_header.partition(" ")
     if scheme.lower() != "bearer" or not credential:
         return False
-    return hmac.compare_digest(credential, expected_token)
+    # Compare bytes: hmac.compare_digest raises TypeError on non-ASCII str, and
+    # Starlette decodes headers as latin-1, so a crafted header would otherwise 500.
+    return hmac.compare_digest(credential.encode("utf-8"), expected_token.encode("utf-8"))
 
 
 def _bounded(value, known: frozenset) -> str:
